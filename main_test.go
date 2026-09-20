@@ -903,6 +903,24 @@ func TestCollectOptionsRejectsMissingPresetEncoderEarly(t *testing.T) {
 	}
 }
 
+// The compressed-source prompt can switch the job to ProRes — encoder
+// availability must be checked against the final preset, not the one the
+// user originally selected.
+func TestCompressedPromptPresetSwitchRevalidatesEncoder(t *testing.T) {
+	old := stdinReader
+	defer func() { stdinReader = old }()
+	stdinReader = bufio.NewReader(strings.NewReader("3\n"))
+	e := &Engine{
+		caps: Capabilities{HasXvid: true, HasLibXvid: true},
+		enc:  map[string]bool{"libxvid": true},
+	}
+	infos := []MediaInfo{{Path: "clip.mp4", Codec: "h264", PixelFormat: "yuv420p", BitDepth: 8, Chroma: "4:2:0"}}
+	_, err := collectOptions(cliConfig{preset: "share"}, theme{}, e, infos)
+	if err == nil || !strings.Contains(err.Error(), "prores_ks") {
+		t.Fatalf("switching to ProRes without prores_ks should fail early, got %v", err)
+	}
+}
+
 // --no-native-xvid must hide the native backend from availability checks and
 // plan text so libxvid becomes the only accepted Xvid path.
 func TestNoNativeXvidMasksAvailability(t *testing.T) {
@@ -914,6 +932,9 @@ func TestNoNativeXvidMasksAvailability(t *testing.T) {
 	masked := nativeXvidCaps(caps, true)
 	if ok, missing := xvidAvailableForInputs(masked, infos, false); ok || len(missing) != 1 {
 		t.Fatalf("--no-native-xvid should require libxvid: ok=%v missing=%v", ok, missing)
+	}
+	if masked.HasXvid {
+		t.Fatal("HasXvid aggregate must collapse to libxvid when native is masked")
 	}
 	masked.HasLibXvid = true
 	if ok, _ := xvidAvailableForInputs(masked, infos, false); !ok {
@@ -972,6 +993,15 @@ func TestSafeConsoleTextStripsControlBytes(t *testing.T) {
 	}
 	if want := "evil[2K]0;pwnedname\nsecond line"; got != want {
 		t.Fatalf("got %q want %q", got, want)
+	}
+	// SGR survives: reporters receive pre-styled theme output, and a
+	// color-only sequence cannot move the cursor or rewrite output.
+	styled := "\x1b[32mVERIFIED\x1b[0m \x1b[2mdone\x1b[0m"
+	if got := safeConsoleText(styled); got != styled {
+		t.Fatalf("SGR styling must be preserved, got %q", got)
+	}
+	if got := safeConsoleText("\x1b[2J\x1b[H\x1b]0;t\x07x"); got != "[2J[H]0;tx" {
+		t.Fatalf("non-SGR escapes should drop their ESC byte, got %q", got)
 	}
 }
 

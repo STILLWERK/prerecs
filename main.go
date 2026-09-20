@@ -545,7 +545,7 @@ func printHeader(ui theme, caps Capabilities, noNativeXvid bool) {
 	fmt.Println(ui.dim("  ------------------------------------------------"))
 	fmt.Println()
 	xvid := ui.red("no")
-	if caps.HasXvid {
+	if caps.HasLibXvid || (caps.HasNativeXvid && !noNativeXvid) {
 		xvid = ui.green("yes")
 	}
 	prores := ui.red("no")
@@ -933,9 +933,6 @@ func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (Conv
 			return opts, chooseErr
 		}
 	}
-	if err := presetEncoderAvailable(e.caps, e.enc, opts.Preset); err != nil {
-		return opts, err
-	}
 	if strings.HasPrefix(opts.Preset, "xvid") {
 		compressed := compressedInputs(infos)
 		if len(compressed) > 0 && !opts.ForceXvid {
@@ -966,6 +963,11 @@ func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (Conv
 				fmt.Println()
 			}
 		}
+	}
+	// After the compressed-source prompt: it can switch the job to ProRes, so
+	// encoder availability must be checked against the final preset.
+	if err := presetEncoderAvailable(e.caps, e.enc, opts.Preset); err != nil {
+		return opts, err
 	}
 	if err := validatePresetInputs(opts.Preset, infos); err != nil {
 		return opts, err
@@ -1191,6 +1193,10 @@ func nativeXvidCaps(caps Capabilities, noNative bool) Capabilities {
 	if noNative {
 		caps.HasNativeXvid = false
 		caps.XvidEncRaw = ""
+		// HasXvid aggregates both backends; with native masked off it must
+		// collapse to the libxvid bit, or callers advertise Xvid that no
+		// remaining backend can serve.
+		caps.HasXvid = caps.HasLibXvid
 	}
 	return caps
 }
@@ -1495,14 +1501,15 @@ type itemReporter struct {
 }
 
 func sequentialReporter(ui theme) itemReporter {
+	plainMax := 0
 	return itemReporter{
 		line: func(s string) {
 			for _, line := range strings.Split(safeConsoleText(s), "\n") {
 				fmt.Println("      " + line)
 			}
 		},
-		progress: func(p progressInfo) { drawProgress(ui, p) },
-		finish:   func() { finishProgress(ui) },
+		progress: func(p progressInfo) { drawProgress(ui, p, &plainMax) },
+		finish:   func() { finishProgress(ui, &plainMax) },
 	}
 }
 
@@ -2241,7 +2248,7 @@ type progressInfo struct {
 	Stage       string
 }
 
-func drawProgress(ui theme, p progressInfo) {
+func drawProgress(ui theme, p progressInfo, plainMax *int) {
 	width := 28
 	filled := int(math.Round(p.Percent * float64(width)))
 	if filled < 0 {
@@ -2284,11 +2291,14 @@ func drawProgress(ui theme, p progressInfo) {
 	if ui.enabled {
 		fmt.Print("\r\x1b[2K" + line)
 	} else {
-		// No erase-in-sequence on dumb terminals: pad every redraw to a fixed
-		// width so a shorter line never leaves the tail of a longer one
-		// behind, and finishProgress's lone \r lands the next print on spaces.
-		if pad := 100 - len(line); pad > 0 {
+		// No erase-in-sequence on dumb terminals: pad every redraw to the
+		// longest line this progress display has emitted so a shorter one
+		// never leaves a tail behind; plainMax resets on finishProgress.
+		if pad := *plainMax - len(line); pad > 0 {
 			line += strings.Repeat(" ", pad)
+		}
+		if len(line) > *plainMax {
+			*plainMax = len(line)
 		}
 		fmt.Print("\r" + line)
 	}
@@ -2338,11 +2348,12 @@ func exactFrameProgress(p progressInfo, totalFrames int64, started time.Time) pr
 	}
 	return p
 }
-func finishProgress(ui theme) {
+func finishProgress(ui theme, plainMax *int) {
 	if ui.enabled {
 		fmt.Print("\r\x1b[2K")
 	} else {
-		fmt.Print("\r")
+		fmt.Print("\r" + strings.Repeat(" ", *plainMax) + "\r")
+		*plainMax = 0
 	}
 }
 
@@ -2405,15 +2416,35 @@ func askYesNo(label string, def bool) (bool, error) {
 }
 
 // safeConsoleText strips terminal control bytes from untrusted strings —
-// filenames, FFmpeg/ffprobe messages — before they are printed, so hostile
-// input cannot inject escape sequences or rewrite earlier output.
+// filenames, FFmpeg/ffprobe messages — while preserving SGR (ESC[...m)
+// sequences: callers hand the console sinks pre-styled theme output, and
+// foreign SGR can only change colors. Erase, cursor, and OSC sequences lose
+// their ESC and print as inert text.
 func safeConsoleText(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r == '\n' || unicode.IsPrint(r) {
-			return r
+	var b strings.Builder
+	b.Grow(len(s))
+	rs := []rune(s)
+	for i := 0; i < len(rs); i++ {
+		r := rs[i]
+		if r == '\x1b' {
+			if j := i + 1; j < len(rs) && rs[j] == '[' {
+				k := j + 1
+				for k < len(rs) && (rs[k] == ';' || (rs[k] >= '0' && rs[k] <= '9')) {
+					k++
+				}
+				if k < len(rs) && rs[k] == 'm' {
+					b.WriteString(string(rs[i : k+1]))
+					i = k
+					continue
+				}
+			}
+			continue
 		}
-		return -1
-	}, s)
+		if r == '\n' || unicode.IsPrint(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func clipName(s string, n int) string {
@@ -3301,13 +3332,17 @@ func (e *Engine) runFFmpeg(ctx context.Context, args []string, expectedDur float
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		// ReadString has no per-line cap: a pathological overlong line must not
-		// kill the drain and let a full stderr pipe block the encoder forever.
+		// ReadSlice drains in bounded fragments: a pathological overlong line
+		// can neither stall the pipe nor land in memory whole, and the error
+		// buffer keeps only the first 32 KiB.
 		r := bufio.NewReader(stderr)
 		for {
-			line, rerr := r.ReadString('\n')
-			if errBuf.Len() <= 32000 {
-				errBuf.WriteString(line)
+			frag, rerr := r.ReadSlice('\n')
+			if remain := 32000 - errBuf.Len(); remain > 0 {
+				if len(frag) > remain {
+					frag = frag[:remain]
+				}
+				errBuf.Write(frag)
 			}
 			if rerr != nil {
 				return
