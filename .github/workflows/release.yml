@@ -31,29 +31,33 @@ jobs:
           $env:GOARCH = 'amd64'
           go build -trimpath -ldflags='-s -w' -o dist/PreRecs.exe .
 
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v(?<version>\d+\.\d+\.\d+)$') {
+            throw "Release tag must use vMAJOR.MINOR.PATCH, got: $tag"
+          }
+          $version = $Matches.version
+          $expectedVersion = "PreRecs $version"
           $reported = (& dist/PreRecs.exe --version).Trim()
-          if ($reported -ne 'PreRecs 1.0.0') {
-            throw "Unexpected version: $reported"
+          if ($reported -ne $expectedVersion) {
+            throw "Expected $expectedVersion, got: $reported"
           }
 
           Copy-Item dist/PreRecs.exe dist/package/PreRecs.exe
-          Copy-Item README.md, LICENSE, CHANGELOG.md dist/package/
-          $artifact = "PreRecs-$env:GITHUB_REF_NAME-windows-amd64.zip"
+          Copy-Item README.md, LICENSE, CHANGELOG.md, LICENSING.md, RESEARCH_NOTES.md, TESTED.md dist/package/
+          $artifact = "PreRecs-$tag-windows-amd64.zip"
           Compress-Archive -Path dist/package/* -DestinationPath "dist/$artifact"
-          $hash = (Get-FileHash "dist/$artifact" -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $artifact" | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+          $zipHash = (Get-FileHash "dist/$artifact" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $exeHash = (Get-FileHash dist/PreRecs.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          @(
+            "$zipHash  $artifact"
+            "$exeHash  PreRecs.exe"
+          ) | Set-Content -Encoding ascii dist/SHA256SUMS.txt
 
       - name: Create GitHub release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $artifact = "dist/PreRecs-$env:GITHUB_REF_NAME-windows-amd64.zip"
-          $notes = @"
-          PreRecs $env:GITHUB_REF_NAME is the first public release.
-
-          The release includes the tuned SHARE / Xvid Q2 path, the separate Xvid Q2 Efficient preset, ProRes LT/422/HQ/4444, MagicYUV, Ut Video, verified native-Xvid/FFmpeg fallback behavior, and full decoded-output verification.
-
-          FFmpeg and optional codec installations are not bundled. See the included README for runtime requirements.
-          "@
-          gh release create "$env:GITHUB_REF_NAME" $artifact dist/SHA256SUMS.txt --repo "$env:GITHUB_REPOSITORY" --title "PreRecs $env:GITHUB_REF_NAME" --notes $notes
+          $tag = $env:GITHUB_REF_NAME
+          $artifact = "dist/PreRecs-$tag-windows-amd64.zip"
+          gh release create $tag $artifact dist/SHA256SUMS.txt --repo "$env:GITHUB_REPOSITORY" --title "PreRecs $tag" --generate-notes
