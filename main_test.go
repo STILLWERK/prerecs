@@ -1141,6 +1141,17 @@ func TestSameStemDefaultOutputReservationIsAtomic(t *testing.T) {
 	}
 }
 
+func TestOutputReservationCanBeReleasedOnCancellation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reserved.avi")
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	releaseOutputReservation(path)
+	if fileExists(path) {
+		t.Fatal("released output reservation still exists")
+	}
+}
+
 func TestEfficientOutputSuffix(t *testing.T) {
 	d := t.TempDir()
 	src := filepath.Join(d, "clip.avi")
@@ -1490,6 +1501,10 @@ func TestVulkanProResEligibility(t *testing.T) {
 	rgb := MediaInfo{PixelFormat: "gbrap", ColorSpace: "gbr", ColorRange: "pc"}
 	if e.canUseVulkanProRes(rgb, req) {
 		t.Fatal("RGB/full-range source should stay on conservative CPU path")
+	}
+	grayAlpha := MediaInfo{PixelFormat: "ya8", HasAlpha: true}
+	if e.canUseVulkanProRes(grayAlpha, ConvertOptions{Preset: "prores_4444"}) {
+		t.Fatal("gray+alpha source must stay on CPU alpha-preservation path")
 	}
 }
 

@@ -1323,6 +1323,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 				rep.finish()
 				if decodeErr != nil {
 					if errors.Is(decodeErr, context.Canceled) {
+						releaseOutputReservation(out)
 						item.Status = "cancelled"
 						return item
 					}
@@ -2461,6 +2462,9 @@ func (e *Engine) canUseVulkanProRes(info MediaInfo, req ConvertOptions) bool {
 		return false
 	}
 	if info.HasAlpha && req.Preset != "prores_4444" {
+		return false
+	}
+	if isGrayAlphaPixelFormat(info.PixelFormat) {
 		return false
 	}
 	if isRGBPixelFormat(info.PixelFormat) || strings.EqualFold(info.ColorSpace, "gbr") || strings.EqualFold(info.ColorRange, "pc") {
