@@ -60,4 +60,4 @@ jobs:
         run: |
           $tag = $env:GITHUB_REF_NAME
           $artifact = "dist/PreRecs-$tag-windows-amd64.zip"
-          gh release create $tag $artifact dist/SHA256SUMS.txt --repo "$env:GITHUB_REPOSITORY" --title "PreRecs $tag" --generate-notes
+          gh release create $tag $artifact dist/PreRecs.exe dist/SHA256SUMS.txt --repo "$env:GITHUB_REPOSITORY" --title "PreRecs $tag" --generate-notes
