@@ -620,6 +620,22 @@ func TestHeadlessExitCodeOnCancellation(t *testing.T) {
 	}
 }
 
+func TestProcessErrorStatusDistinguishesCancellation(t *testing.T) {
+	if got := processErrorStatus(context.Canceled); got != "cancelled" {
+		t.Fatalf("context cancellation status=%q, want cancelled", got)
+	}
+	if got := processErrorStatus(errors.New("verification failed")); got != "failed" {
+		t.Fatalf("ordinary error status=%q, want failed", got)
+	}
+}
+
+func TestConciseErrorNormalizesMultilineMessages(t *testing.T) {
+	got := conciseError("first line\nsecond\tline\r\nthird line", 80)
+	if got != "first line second line third line" {
+		t.Fatalf("concise error=%q", got)
+	}
+}
+
 func TestAnalyzeInputsTracksPartialProbeFailures(t *testing.T) {
 	caps, _, err := detectCapabilities()
 	if err != nil {
@@ -651,6 +667,81 @@ func TestMetadataFrameCountTrust(t *testing.T) {
 	for _, codec := range untrusted {
 		if metadataFrameCountTrusted(codec) {
 			t.Fatalf("%s metadata frame count must be treated as estimated", codec)
+		}
+	}
+}
+
+func TestDeriveBitDepthCommonPixelFormats(t *testing.T) {
+	cases := map[string]int{
+		"rgb24":       8,
+		"bgr24":       8,
+		"rgb48le":     16,
+		"rgb48be":     16,
+		"bgr48le":     16,
+		"bgr48be":     16,
+		"rgba":        8,
+		"bgra":        8,
+		"argb":        8,
+		"abgr":        8,
+		"rgba64le":    16,
+		"rgba64be":    16,
+		"bgra64le":    16,
+		"bgra64be":    16,
+		"yuv420p":     8,
+		"yuv420p9le":  9,
+		"yuv420p9be":  9,
+		"yuv444p10le": 10,
+		"yuv422p14le": 14,
+		"gbrp":        8,
+		"gbrp9le":     9,
+		"gbrp12le":    12,
+		"gbrp16le":    16,
+		"gray":        8,
+		"gray16le":    16,
+		"ya8":         8,
+		"ya16le":      16,
+		"ya16be":      16,
+	}
+	for pixFmt, want := range cases {
+		if got := deriveBitDepth(pixFmt); got != want {
+			t.Errorf("deriveBitDepth(%q)=%d, want %d", pixFmt, got, want)
+		}
+	}
+	for _, pixFmt := range []string{"mysteryfmt", "rgbunknown", "yuv420pfoo"} {
+		if got := deriveBitDepth(pixFmt); got != 0 {
+			t.Errorf("deriveBitDepth(%q)=%d, want unknown 0", pixFmt, got)
+		}
+	}
+}
+
+func TestUnknownBitDepthCannotPassLossless8BitGate(t *testing.T) {
+	for _, codec := range []string{"MagicYUV", "Ut Video"} {
+		if _, err := lossless8BitPixFmt(MediaInfo{PixelFormat: "mysteryfmt", BitDepth: 0, Chroma: "4:2:0"}, codec); err == nil {
+			t.Fatalf("%s accepted unknown bit depth", codec)
+		}
+	}
+}
+
+func TestIntegrationUnreportedHighBitDepthFailsLosslessGate(t *testing.T) {
+	caps, _, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	td := t.TempDir()
+	src := filepath.Join(td, "rgb48.nut")
+	if b, err := exec.Command(caps.FFmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=32x32:rate=1", "-frames:v", "1", "-pix_fmt", "rgb48le", "-c:v", "rawvideo", src).CombinedOutput(); err != nil {
+		t.Fatalf("source: %v %s", err, b)
+	}
+	info, err := probeMedia(caps.FFprobe, src, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.BitDepth != 16 {
+		t.Fatalf("rgb48le probe bit depth=%d, want 16", info.BitDepth)
+	}
+	for _, codec := range []string{"MagicYUV", "Ut Video"} {
+		if err := validatePresetInputs(map[string]string{"MagicYUV": "magicyuv_lossless", "Ut Video": "utvideo_lossless"}[codec], []MediaInfo{info}); err == nil {
+			t.Fatalf("%s gate accepted unreported high-bit-depth source", codec)
 		}
 	}
 }
@@ -752,7 +843,7 @@ func TestCollectOptionsRejectsUnsupportedXvidInputEarly(t *testing.T) {
 }
 
 func TestHasAlphaRecognizesPackedARGBFormats(t *testing.T) {
-	for _, pixFmt := range []string{"rgba", "bgra", "argb", "abgr", "yuva420p", "yuva444p", "gbrap"} {
+	for _, pixFmt := range []string{"rgba", "bgra", "argb", "abgr", "yuva420p", "yuva444p", "gbrap", "ya8", "ya16le", "ya16be"} {
 		if !hasAlpha(pixFmt) {
 			t.Fatalf("hasAlpha(%q)=false, want true", pixFmt)
 		}
@@ -964,16 +1055,15 @@ func TestExactFrameProgressUsesFramesAndWallClockFPS(t *testing.T) {
 
 func TestAudioModes(t *testing.T) {
 	e := &Engine{enc: map[string]bool{}}
-	info := MediaInfo{Audio: []AudioInfo{{Index: 1, Codec: "aac", Channels: 2, SampleRate: 48000}}}
-	keep := strings.Join(e.audioArgs(info, ConvertOptions{}, nil, nil, false), " ")
+	keep := strings.Join(e.audioArgs(ConvertOptions{}), " ")
 	if !strings.Contains(keep, "-c:a copy") || strings.Contains(keep, "-an") {
 		t.Fatalf("normal timing should copy audio unchanged, got %q", keep)
 	}
-	strip := strings.Join(e.audioArgs(info, ConvertOptions{StripAudio: true}, nil, nil, false), " ")
+	strip := strings.Join(e.audioArgs(ConvertOptions{StripAudio: true}), " ")
 	if strip != "-an" {
 		t.Fatalf("strip audio = %q", strip)
 	}
-	conform := strings.Join(e.audioArgs(info, ConvertOptions{Conform: true}, big.NewRat(30, 1), big.NewRat(300, 1), false), " ")
+	conform := strings.Join(e.audioArgs(ConvertOptions{Conform: true}), " ")
 	if conform != "-an" {
 		t.Fatalf("conform default should strip audio, got %q", conform)
 	}
@@ -1048,6 +1138,17 @@ func TestSameStemDefaultOutputReservationIsAtomic(t *testing.T) {
 		if !fileExists(result.path) {
 			t.Fatalf("reservation did not hold final target %q", result.path)
 		}
+	}
+}
+
+func TestOutputReservationCanBeReleasedOnCancellation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reserved.avi")
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	releaseOutputReservation(path)
+	if fileExists(path) {
+		t.Fatal("released output reservation still exists")
 	}
 }
 
@@ -1315,6 +1416,56 @@ func TestIntegrationProResPackedRGBAlphaRoundTrip(t *testing.T) {
 	}
 }
 
+func TestIntegrationProResGrayAlphaRoundTrip(t *testing.T) {
+	caps, enc, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	if !enc["prores_ks"] || !enc["ffv1"] {
+		t.Skip("prores_ks/ffv1 unavailable")
+	}
+	td := t.TempDir()
+	src := filepath.Join(td, "gray-alpha.nut")
+	out := filepath.Join(td, "gray-alpha.mov")
+	filter := "[0:v]format=gray[base];[1:v]format=gray[a];[base][a]alphamerge,format=ya8"
+	if b, err := exec.Command(caps.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30",
+		"-f", "lavfi", "-i", "nullsrc=size=160x90:rate=30,format=gray,geq=lum=X/W*255",
+		"-filter_complex", filter, "-frames:v", "8", "-c:v", "rawvideo", "-pix_fmt", "ya8", src,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("source: %v %s", err, b)
+	}
+	info, err := probeMedia(caps.FFprobe, src, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(info.PixelFormat, "ya8") || !info.HasAlpha {
+		t.Fatalf("source format/alpha=%s/%t", info.PixelFormat, info.HasAlpha)
+	}
+	if err := validatePresetInputs("prores_lt", []MediaInfo{info}); err == nil {
+		t.Fatal("ProRes LT accepted gray+alpha input")
+	}
+	e := &Engine{caps: caps, enc: enc}
+	args, _, _, err := e.buildCommand(info, ConvertOptions{Preset: "prores_4444", StripAudio: true}, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, err := exec.Command(caps.FFmpeg, args...).CombinedOutput(); err != nil {
+		t.Fatalf("encode: %v %s", err, b)
+	}
+	alphaMD5 := func(path string) string {
+		b, err := exec.Command(caps.FFmpeg, "-hide_banner", "-loglevel", "error", "-i", path, "-vf", "alphaextract,format=gray", "-f", "md5", "-").CombinedOutput()
+		if err != nil {
+			t.Fatalf("alpha md5 %s: %v %s", path, err, b)
+		}
+		return strings.TrimSpace(string(b))
+	}
+	if source, output := alphaMD5(src), alphaMD5(out); source != output {
+		t.Fatalf("gray alpha changed: source=%s output=%s", source, output)
+	}
+}
+
 func TestBatchWorkerCountBounds(t *testing.T) {
 	infos := make([]MediaInfo, 10)
 	for i := range infos {
@@ -1350,6 +1501,10 @@ func TestVulkanProResEligibility(t *testing.T) {
 	rgb := MediaInfo{PixelFormat: "gbrap", ColorSpace: "gbr", ColorRange: "pc"}
 	if e.canUseVulkanProRes(rgb, req) {
 		t.Fatal("RGB/full-range source should stay on conservative CPU path")
+	}
+	grayAlpha := MediaInfo{PixelFormat: "ya8", HasAlpha: true}
+	if e.canUseVulkanProRes(grayAlpha, ConvertOptions{Preset: "prores_4444"}) {
+		t.Fatal("gray+alpha source must stay on CPU alpha-preservation path")
 	}
 }
 

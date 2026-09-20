@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.1 — Hardening patch
+
+- Hardened fallback bit-depth detection for packed RGB, planar YUV/GBR, grayscale, and gray+alpha pixel formats when FFprobe does not report `bits_per_raw_sample`.
+- Rejects unsafe non-4444 ProRes alpha conversions and preserves supported gray+alpha through the ProRes 4444 path.
+- Classifies cancellation consistently during source scan, encode, and verification; concise batch summaries now normalize multiline errors.
+- Removed dead progress/audio helper state and made CI derive its version check from the application source.
+
 ## v1.0.0 — Initial public release
 
 This is the first public release of PreRecs. The source was developed and benchmarked before publication; the internal development numbering is intentionally not presented as a public release sequence.

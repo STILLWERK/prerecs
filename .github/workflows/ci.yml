@@ -60,7 +60,17 @@ jobs:
           $env:GOOS = 'windows'
           $env:GOARCH = 'amd64'
           go build -trimpath -ldflags='-s -w' -o dist/PreRecs.exe .
+          $source = Get-Content main.go -Raw
+          $versionMatch = [regex]::Match($source, 'const version = "(?<version>[^"\r\n]+)"')
+          if (-not $versionMatch.Success) {
+            throw 'Could not find the source application version'
+          }
+          $version = $versionMatch.Groups['version'].Value
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Invalid source application version: $version"
+          }
+          $expected = "PreRecs $version"
           $reported = (& dist/PreRecs.exe --version).Trim()
-          if ($reported -ne 'PreRecs 1.0.0') {
+          if ($reported -ne $expected) {
             throw "Unexpected version: $reported"
           }

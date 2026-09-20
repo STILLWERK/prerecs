@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-const version = "1.0.0"
+const version = "1.0.1"
 
 var supportedExt = map[string]bool{
 	".avi": true, ".mp4": true, ".m4v": true, ".mov": true, ".mkv": true,
@@ -307,6 +307,13 @@ func headlessExitCode(result BatchResult, cancelled error) int {
 		return 1
 	}
 	return 0
+}
+
+func processErrorStatus(err error) string {
+	if errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	return "failed"
 }
 
 func analyzeInputs(ffprobe string, paths []string, ui theme) ([]MediaInfo, int) {
@@ -880,6 +887,13 @@ func validatePresetInputs(preset string, infos []MediaInfo) error {
 			}
 		}
 		return nil
+	case "prores_4444":
+		for _, in := range infos {
+			if isGrayAlphaPixelFormat(in.PixelFormat) && in.BitDepth > 8 {
+				return fmt.Errorf("%s: %s gray+alpha is not safely supported by the ProRes 4444 path; use an RGB/RGBA or supported YUVA source", filepath.Base(in.Path), in.PixelFormat)
+			}
+		}
+		return nil
 	case "magicyuv_lossless":
 		codec = "MagicYUV"
 	case "utvideo_lossless":
@@ -1246,9 +1260,13 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		})
 		rep.finish()
 		if scanErr != nil {
-			item.Status = "failed"
+			item.Status = processErrorStatus(scanErr)
 			item.Message = scanErr.Error()
-			rep.line(ui.red("SOURCE SCAN FAILED"))
+			if item.Status == "cancelled" {
+				rep.line(ui.yellow("SOURCE SCAN CANCELLED"))
+			} else {
+				rep.line(ui.red("SOURCE SCAN FAILED"))
+			}
 			rep.line(indentError(scanErr.Error(), 2))
 			return item
 		}
@@ -1304,6 +1322,11 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 				})
 				rep.finish()
 				if decodeErr != nil {
+					if errors.Is(decodeErr, context.Canceled) {
+						releaseOutputReservation(out)
+						item.Status = "cancelled"
+						return item
+					}
 					rep.line(ui.dim("Rejected: full decode check failed: " + decodeErr.Error()))
 					continue
 				}
@@ -1473,9 +1496,13 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	})
 	rep.finish()
 	if err != nil {
-		item.Status = "failed"
+		item.Status = processErrorStatus(err)
 		item.Message = err.Error()
-		rep.line(ui.red("VERIFY DECODE FAILED"))
+		if item.Status == "cancelled" {
+			rep.line(ui.yellow("VERIFY DECODE CANCELLED"))
+		} else {
+			rep.line(ui.red("VERIFY DECODE FAILED"))
+		}
 		rep.line(indentError(err.Error(), 2))
 		return item
 	}
@@ -1723,7 +1750,7 @@ func printBatchSummary(ui theme, result BatchResult, cancelled error) {
 		case "skipped":
 			fmt.Printf("  %s %-28s  %s\n", ui.yellow("SKIP"), clipName(name, 28), item.Message)
 		case "failed":
-			fmt.Printf("  %s %-28s  %s\n", ui.red("FAIL"), clipName(name, 28), clipName(item.Message, 70))
+			fmt.Printf("  %s %-28s  %s\n", ui.red("FAIL"), clipName(name, 28), conciseError(item.Message, 70))
 		}
 	}
 	fmt.Println()
@@ -1783,7 +1810,6 @@ type progressInfo struct {
 	Speed       string
 	Frame       string
 	Time        float64
-	Total       float64
 	TotalFrames int64
 	Bytes       int64
 	ETA         time.Duration
@@ -1940,6 +1966,10 @@ func clipName(s string, n int) string {
 		return s[:n]
 	}
 	return s[:n-3] + "..."
+}
+
+func conciseError(s string, n int) string {
+	return clipName(strings.Join(strings.Fields(s), " "), n)
 }
 func indentError(s string, n int) string {
 	pad := strings.Repeat(" ", n)
@@ -2183,20 +2213,78 @@ func probeMedia(ffprobe, path string, count bool) (MediaInfo, error) {
 }
 
 func deriveBitDepth(p string) int {
-	low := strings.ToLower(p)
-	for _, n := range []int{16, 14, 12, 10} {
-		if strings.Contains(low, strconv.Itoa(n)) {
-			return n
+	low := strings.ToLower(strings.TrimSpace(p))
+	if low == "" {
+		return 0
+	}
+
+	for _, prefix := range []string{
+		"yuva420p", "yuva422p", "yuva444p",
+		"yuv420p", "yuv422p", "yuv444p", "yuv440p", "yuv411p", "yuv410p",
+		"gbrap", "gbrp", "gray", "ya",
+	} {
+		if !strings.HasPrefix(low, prefix) {
+			continue
+		}
+		rest := low[len(prefix):]
+		if rest == "" {
+			return 8
+		}
+		if rest[0] < '0' || rest[0] > '9' {
+			return 0
+		}
+		end := 0
+		for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+			end++
+		}
+		depth, err := strconv.Atoi(rest[:end])
+		if err != nil || depth <= 0 {
+			return 0
+		}
+		return depth
+	}
+
+	for _, prefix := range []string{"rgb48", "bgr48", "rgba64", "bgra64", "argb64", "abgr64"} {
+		if strings.HasPrefix(low, prefix) && validPackedSuffix(low[len(prefix):]) {
+			return 16
 		}
 	}
-	if low != "" {
-		return 8
+	for _, prefix := range []string{"rgb24", "bgr24"} {
+		if strings.HasPrefix(low, prefix) && validPackedSuffix(low[len(prefix):]) {
+			return 8
+		}
+	}
+	for _, prefix := range []string{"rgba", "bgra", "argb", "abgr"} {
+		if low == prefix {
+			return 8
+		}
+	}
+	for _, prefix := range []string{"p010", "p016"} {
+		if strings.HasPrefix(low, prefix) && validPackedSuffix(low[len(prefix):]) {
+			if prefix == "p010" {
+				return 10
+			}
+			return 16
+		}
+	}
+	for _, pixFmt := range []string{"nv12", "nv21", "uyvy422", "yuyv422", "yuv422p"} {
+		if low == pixFmt {
+			return 8
+		}
 	}
 	return 0
 }
+
+func validPackedSuffix(suffix string) bool {
+	return suffix == "" || suffix == "le" || suffix == "be"
+}
 func hasAlpha(p string) bool {
 	low := strings.ToLower(p)
-	return strings.HasPrefix(low, "rgba") || strings.HasPrefix(low, "bgra") || strings.HasPrefix(low, "argb") || strings.HasPrefix(low, "abgr") || strings.Contains(low, "yuva") || strings.Contains(low, "gbrap")
+	return strings.HasPrefix(low, "rgba") || strings.HasPrefix(low, "bgra") || strings.HasPrefix(low, "argb") || strings.HasPrefix(low, "abgr") || strings.HasPrefix(low, "yuva") || strings.Contains(low, "gbrap") || isGrayAlphaPixelFormat(low)
+}
+func isGrayAlphaPixelFormat(p string) bool {
+	low := strings.ToLower(strings.TrimSpace(p))
+	return strings.HasPrefix(low, "ya8") || strings.HasPrefix(low, "ya16")
 }
 func isRGBPixelFormat(p string) bool {
 	low := strings.ToLower(strings.TrimSpace(p))
@@ -2217,10 +2305,16 @@ func chroma(p string) string {
 }
 
 func lossless8BitPixFmt(info MediaInfo, codec string) (string, error) {
+	if info.BitDepth <= 0 {
+		return "", fmt.Errorf("%s cannot establish the source bit depth for pixel format %s; refusing an unsafe 8-bit lossless conversion", codec, info.PixelFormat)
+	}
 	if info.BitDepth > 8 {
 		return "", fmt.Errorf("%s through this FFmpeg build supports only the tested 8-bit pixel formats; source is %d-bit. Use ProRes 422/4444 instead", codec, info.BitDepth)
 	}
 	if info.HasAlpha {
+		if isGrayAlphaPixelFormat(info.PixelFormat) {
+			return "", fmt.Errorf("%s cannot preserve gray+alpha source pixel format %s; use ProRes 4444 instead", codec, info.PixelFormat)
+		}
 		if isRGBPixelFormat(info.PixelFormat) {
 			return "gbrap", nil
 		}
@@ -2331,7 +2425,17 @@ func proresPixelFormat(info MediaInfo, preset string) string {
 }
 
 func proresRGBConversionFilters(info MediaInfo, preset string) []string {
-	if !isProResPreset(preset) || !(isRGBPixelFormat(info.PixelFormat) || strings.EqualFold(info.ColorSpace, "gbr")) {
+	if !isProResPreset(preset) {
+		return nil
+	}
+	if preset == "prores_4444" && isGrayAlphaPixelFormat(info.PixelFormat) {
+		// Gray+alpha has no colour planes for the RGB conversion branch, but its
+		// alpha plane still must bypass the gray-to-YUV conversion unchanged.
+		return []string{
+			"split=2[c][a];[c]format=gray,format=yuv444p10le[c10];[a]alphaextract,format=gray[a8];[c10][a8]alphamerge",
+		}
+	}
+	if !(isRGBPixelFormat(info.PixelFormat) || strings.EqualFold(info.ColorSpace, "gbr")) {
 		return nil
 	}
 	pix := proresPixelFormat(info, preset)
@@ -2360,6 +2464,9 @@ func (e *Engine) canUseVulkanProRes(info MediaInfo, req ConvertOptions) bool {
 	if info.HasAlpha && req.Preset != "prores_4444" {
 		return false
 	}
+	if isGrayAlphaPixelFormat(info.PixelFormat) {
+		return false
+	}
 	if isRGBPixelFormat(info.PixelFormat) || strings.EqualFold(info.ColorSpace, "gbr") || strings.EqualFold(info.ColorRange, "pc") {
 		return false
 	}
@@ -2377,7 +2484,7 @@ func (e *Engine) buildProResVulkanCommand(info MediaInfo, req ConvertOptions, ou
 		return nil, nil, 0, fmt.Errorf("preset %q is not ProRes", req.Preset)
 	}
 
-	sourceFPS, target, expectedDur, err := expectedTiming(info, req)
+	_, target, expectedDur, err := expectedTiming(info, req)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -2416,7 +2523,7 @@ func (e *Engine) buildProResVulkanCommand(info MediaInfo, req ConvertOptions, ou
 		args = append(args, "-fps_mode", "passthrough")
 	}
 	args = append(args, "-c:v", "prores_ks_vulkan", "-profile:v", profile, "-quant_mat", "auto", "-alpha_bits", alphaBits, "-async_depth", "4")
-	args = append(args, e.audioArgs(info, req, sourceFPS, target, false)...)
+	args = append(args, e.audioArgs(req)...)
 	args = append(args, "-movflags", "+write_colr")
 	args = append(args, colorOutputArgs(info, req.Preset)...)
 	args = append(args, "-progress", "pipe:1", "-stats_period", "0.25", "-nostats", out)
@@ -2433,7 +2540,7 @@ func (e *Engine) buildCommand(info MediaInfo, req ConvertOptions, out string) ([
 		filters = append(filters, cf)
 	}
 	filters = append(filters, proresRGBConversionFilters(info, req.Preset)...)
-	sourceFPS, target, expectedDur, err := expectedTiming(info, req)
+	_, target, expectedDur, err := expectedTiming(info, req)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -2473,7 +2580,7 @@ func (e *Engine) buildCommand(info MediaInfo, req ConvertOptions, out string) ([
 			mbd = "rd"
 		}
 		args = append(args, "-c:v", "libxvid", "-qscale:v", q, "-g", "240", "-bf", "0", "-flags", "+mv4+aic", "-trellis", "1", "-me_quality", "4", "-mbd", mbd, "-gmc", "0", "-pix_fmt", "yuv420p")
-		args = append(args, e.audioArgs(info, req, sourceFPS, target, true)...)
+		args = append(args, e.audioArgs(req)...)
 		args = append(args, "-vtag", "XVID")
 	case "prores_lt", "prores_422", "prores_hq", "prores_4444":
 		if !e.enc["prores_ks"] {
@@ -2485,7 +2592,7 @@ func (e *Engine) buildCommand(info MediaInfo, req ConvertOptions, out string) ([
 		if req.Preset == "prores_4444" && info.HasAlpha {
 			args = append(args, "-alpha_bits", strconv.Itoa(proresAlphaBits(info)))
 		}
-		args = append(args, e.audioArgs(info, req, sourceFPS, target, false)...)
+		args = append(args, e.audioArgs(req)...)
 		args = append(args, "-movflags", "+write_colr")
 	case "magicyuv_lossless":
 		if !e.enc["magicyuv"] {
@@ -2499,7 +2606,7 @@ func (e *Engine) buildCommand(info MediaInfo, req ConvertOptions, out string) ([
 			return nil, nil, 0, err
 		}
 		args = append(args, "-c:v", "magicyuv", "-pred", "gradient", "-pix_fmt", pix)
-		args = append(args, e.audioArgs(info, req, sourceFPS, target, false)...)
+		args = append(args, e.audioArgs(req)...)
 	case "utvideo_lossless":
 		if !e.enc["utvideo"] {
 			return nil, nil, 0, errors.New("FFmpeg build does not include utvideo")
@@ -2512,7 +2619,7 @@ func (e *Engine) buildCommand(info MediaInfo, req ConvertOptions, out string) ([
 			return nil, nil, 0, fmt.Errorf("ut video cannot preserve source pixel format %s with this FFmpeg build", info.PixelFormat)
 		}
 		args = append(args, "-c:v", "utvideo", "-pred", "left", "-pix_fmt", pix)
-		args = append(args, e.audioArgs(info, req, sourceFPS, target, false)...)
+		args = append(args, e.audioArgs(req)...)
 	default:
 		return nil, nil, 0, fmt.Errorf("unknown preset %q", req.Preset)
 	}
@@ -2521,17 +2628,14 @@ func (e *Engine) buildCommand(info MediaInfo, req ConvertOptions, out string) ([
 	return args, target, expectedDur, nil
 }
 
-func (e *Engine) audioArgs(info MediaInfo, req ConvertOptions, source, target *big.Rat, compact bool) []string {
+func (e *Engine) audioArgs(req ConvertOptions) []string {
 	if req.StripAudio {
 		return []string{"-an"}
 	}
 	if req.Conform {
 		return []string{"-an"}
 	}
-	if !req.Conform {
-		return []string{"-map", "0:a?", "-c:a", "copy"}
-	}
-	return []string{"-an"}
+	return []string{"-map", "0:a?", "-c:a", "copy"}
 }
 
 func colorFilter(i MediaInfo) string {
@@ -2613,7 +2717,7 @@ func (e *Engine) runFFmpeg(ctx context.Context, args []string, expectedDur float
 	}()
 
 	started := time.Now()
-	pi := progressInfo{Total: expectedDur}
+	pi := progressInfo{}
 	sc := bufio.NewScanner(stdout)
 	for sc.Scan() {
 		line := sc.Text()
@@ -2871,7 +2975,7 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 	_ = os.Remove(tmpVideo)
 	defer os.Remove(tmpVideo)
 
-	progress(progressInfo{Percent: 0, Total: expectedDur, TotalFrames: info.FrameCount, Stage: "ENCODE"})
+	progress(progressInfo{Percent: 0, TotalFrames: info.FrameCount, Stage: "ENCODE"})
 	xargs := nativeXvidArgs(info, req, tmpVideo, target)
 	cmd := exec.CommandContext(ctx, e.caps.XvidEncRaw, xargs...)
 	var stdout, stderr strings.Builder
@@ -2910,7 +3014,7 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 				if elapsed > 0 && frames > 0 {
 					fps = fmt.Sprintf("%.2f", float64(frames)/elapsed)
 				}
-				progress(progressInfo{Percent: pct, FPS: fps, Frame: strconv.FormatInt(frames, 10), TotalFrames: info.FrameCount, Total: expectedDur, ETA: etaFromProgress(started, pct), Stage: "ENCODE"})
+				progress(progressInfo{Percent: pct, FPS: fps, Frame: strconv.FormatInt(frames, 10), TotalFrames: info.FrameCount, ETA: etaFromProgress(started, pct), Stage: "ENCODE"})
 			}
 		case <-ticker.C:
 			frames, pollErr := counter.poll(tmpVideo)
@@ -2927,7 +3031,7 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 			if elapsed > 0 && frames > 0 {
 				fps = fmt.Sprintf("%.2f", float64(frames)/elapsed)
 			}
-			progress(progressInfo{Percent: pct, FPS: fps, Frame: strconv.FormatInt(frames, 10), TotalFrames: info.FrameCount, Total: expectedDur, ETA: etaFromProgress(started, pct), Stage: "ENCODE"})
+			progress(progressInfo{Percent: pct, FPS: fps, Frame: strconv.FormatInt(frames, 10), TotalFrames: info.FrameCount, ETA: etaFromProgress(started, pct), Stage: "ENCODE"})
 		}
 	}
 	if ctx.Err() != nil {
@@ -2947,7 +3051,7 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 	if info.FrameCount > 0 && finalFrames != info.FrameCount {
 		return nil, 0, fmt.Errorf("native Xvid wrote %d VOP frames; expected %d", finalFrames, info.FrameCount)
 	}
-	progress(progressInfo{Percent: 1, FPS: fmt.Sprintf("%.2f", float64(max64(finalFrames, info.FrameCount))/math.Max(.001, time.Since(started).Seconds())), Frame: strconv.FormatInt(max64(finalFrames, info.FrameCount), 10), TotalFrames: info.FrameCount, Total: expectedDur, Stage: "ENCODE"})
+	progress(progressInfo{Percent: 1, FPS: fmt.Sprintf("%.2f", float64(max64(finalFrames, info.FrameCount))/math.Max(.001, time.Since(started).Seconds())), Frame: strconv.FormatInt(max64(finalFrames, info.FrameCount), 10), TotalFrames: info.FrameCount, Stage: "ENCODE"})
 
 	needAudio := len(info.Audio) > 0 && !req.StripAudio && !req.Conform
 	remux := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-r", formatFPSFloat(target), "-f", "m4v", "-i", tmpVideo}

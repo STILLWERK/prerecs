@@ -1,6 +1,6 @@
 # PreRecs
 
-PreRecs is a Windows console application for preparing high-frame-rate game captures and other prerequisite video for editing workflows. The first public release is **v1.0.0**.
+PreRecs is a Windows console application for preparing high-frame-rate game captures and other prerequisite video for editing workflows. The current source version is **v1.0.1**; v1.0.0 remains frozen.
 
 It has two complementary jobs:
 
@@ -180,7 +180,7 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
   go build -trimpath -ldflags='-s -w' -o PreRecs.exe .
 ```
 
-Run the resulting executable on Windows and confirm it reports `PreRecs 1.0.0`.
+Run the resulting executable on Windows and confirm it reports `PreRecs 1.0.1`.
 
 On Windows, `build_windows.ps1` runs the unit tests and vet before producing `PreRecs.exe`. The GitHub Actions CI also checks formatting, tests, vet, race tests, and a Windows amd64 CGO-disabled build. Tags beginning with `v` use the release workflow to build a Windows ZIP and SHA-256 checksum file.
 
