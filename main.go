@@ -1854,14 +1854,14 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 			item.InputInfo = info
 			if _, fps, dur, terr := expectedTiming(info, opts); terr == nil {
 				expectedFPS, expectedDur = fps, dur
+				problems = verifyOutput(info, outInfo, opts, expectedFPS, expectedDur)
 			} else {
-				// Timing can't be recomputed from the reconciled metadata
-				// (e.g. conform mode without a usable rate): drop the
-				// pre-rescan expectations too instead of verifying against
-				// values derived from the stale table.
-				expectedFPS, expectedDur = nil, 0
+				// The output was encoded with now-impeached timing (e.g. a
+				// conform built on the stale rate) and the expectations can
+				// no longer be recomputed — the timeline cannot be verified,
+				// so the rescue must fail rather than weaken the checks.
+				problems = append(problems, "timing cannot be verified after correcting stale metadata: "+terr.Error())
 			}
-			problems = verifyOutput(info, outInfo, opts, expectedFPS, expectedDur)
 		}
 	}
 	if len(problems) > 0 {
@@ -3539,8 +3539,12 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 		return nil, 0, errors.New("native Xvid did not create an output stream")
 	}
 	finalFrames, _ := counter.poll(tmpVideo)
-	if info.FrameCount > 0 && finalFrames != info.FrameCount {
-		return nil, 0, fmt.Errorf("native Xvid wrote %d VOP frames; expected %d", finalFrames, info.FrameCount)
+	// The VOP count is only a meaningful integrity check against a verified
+	// count (frameBound). An unverified container claim may itself be stale —
+	// a mismatch would reject a complete encode before the post-encode source
+	// rescan can establish the authoritative count.
+	if frameBound > 0 && finalFrames != frameBound {
+		return nil, 0, fmt.Errorf("native Xvid wrote %d VOP frames; expected %d", finalFrames, frameBound)
 	}
 	progress(progressInfo{Percent: 1, FPS: fmt.Sprintf("%.2f", float64(max64(finalFrames, info.FrameCount))/math.Max(.001, time.Since(started).Seconds())), Frame: strconv.FormatInt(max64(finalFrames, info.FrameCount), 10), TotalFrames: info.FrameCount, Stage: "ENCODE"})
 
