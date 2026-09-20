@@ -112,6 +112,7 @@ type ItemResult struct {
 type BatchResult struct {
 	Successes     int
 	Failures      int
+	InputFailures int
 	Skipped       int
 	Items         []ItemResult
 	LastOutputDir string
@@ -225,19 +226,7 @@ func main() {
 			return
 		}
 
-		infos := make([]MediaInfo, 0, len(paths))
-		fmt.Println(ui.bold("ANALYZING") + ui.dim("  metadata only"))
-		for i, p := range paths {
-			fmt.Printf("  [%d/%d] %s ... ", i+1, len(paths), filepath.Base(p))
-			info, err := probeMedia(caps.FFprobe, p, false)
-			if err != nil {
-				fmt.Println(ui.red("FAILED"))
-				fmt.Println("      " + err.Error())
-				continue
-			}
-			infos = append(infos, info)
-			fmt.Println(ui.green("OK"))
-		}
+		infos, inputFailures := analyzeInputs(caps.FFprobe, paths, ui)
 		if len(infos) == 0 {
 			fmt.Fprintln(os.Stderr, ui.red("No readable video files."))
 			if cfg.yes {
@@ -273,6 +262,7 @@ func main() {
 
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		result := runBatch(ctx, ui, engine, infos, opts)
+		result.InputFailures = inputFailures
 		cancelled := ctx.Err()
 		stop()
 		printBatchSummary(ui, result, cancelled)
@@ -313,10 +303,29 @@ func headlessExitCode(result BatchResult, cancelled error) int {
 	if cancelled != nil {
 		return 130
 	}
-	if result.Failures > 0 {
+	if result.Failures > 0 || result.InputFailures > 0 {
 		return 1
 	}
 	return 0
+}
+
+func analyzeInputs(ffprobe string, paths []string, ui theme) ([]MediaInfo, int) {
+	infos := make([]MediaInfo, 0, len(paths))
+	inputFailures := 0
+	fmt.Println(ui.bold("ANALYZING") + ui.dim("  metadata only"))
+	for i, p := range paths {
+		fmt.Printf("  [%d/%d] %s ... ", i+1, len(paths), filepath.Base(p))
+		info, err := probeMedia(ffprobe, p, false)
+		if err != nil {
+			inputFailures++
+			fmt.Println(ui.red("FAILED"))
+			fmt.Println("      " + err.Error())
+			continue
+		}
+		infos = append(infos, info)
+		fmt.Println(ui.green("OK"))
+	}
+	return infos, inputFailures
 }
 
 func resetInteractiveJob(c cliConfig) cliConfig {
@@ -629,33 +638,22 @@ func printRecommendation(ui theme, infos []MediaInfo, caps Capabilities) {
 	case compressed == len(infos):
 		fmt.Println("  These files are already distribution-compressed.")
 		fmt.Println("  For editing, convert them to an intraframe/lossless intermediate instead of Xvid again.")
-		if caps.HasMagicYUV && caps.MagicInstalled {
+		if recommendedProResPreset(infos) == "prores_4444" {
+			fmt.Println(ui.dim("  These sources contain alpha; ProRes 4444 is required to preserve it."))
+		} else if caps.HasMagicYUV && caps.MagicInstalled {
 			fmt.Println(ui.dim("  ProRes 422 LT is the broad edit-ready choice; MagicYUV is the fast lossless choice when installed."))
 		} else {
 			fmt.Println(ui.dim("  ProRes 422 LT is the broad edit-ready choice."))
 		}
 		fmt.Println(ui.dim("  Transcoding cannot restore detail already lost to H.264/HEVC/Xvid/AV1 and the intermediate will usually be much larger."))
 	case masters == len(infos):
-		backend := "FFmpeg Xvid"
-		if available, missing := xvidAvailableForInputs(caps, infos, false); !available {
-			backend = "Xvid unavailable for " + strings.Join(missing, ", ") + "; use ProRes or install FFmpeg libxvid"
-		} else if caps.HasNativeXvid {
-			nativeEligible := 0
-			for _, in := range infos {
-				if nativeXvidEligible(in) {
-					nativeEligible++
-				}
-			}
-			switch {
-			case nativeEligible == len(infos):
-				backend = "native Xvid when the VfW preflight passes, with verified FFmpeg fallback"
-			case nativeEligible > 0:
-				backend = "native Xvid where eligible, with verified FFmpeg fallback for the rest"
-			default:
-				backend = "FFmpeg Xvid fallback"
-			}
+		backend := xvidBackendDescription(caps, infos)
+		editPreset := recommendedProResPreset(infos)
+		editRecommendation := "ProRes 422 LT is the edit-ready default"
+		if editPreset == "prores_4444" {
+			editRecommendation = "ProRes 4444 is required to preserve source alpha"
 		}
-		fmt.Printf("  Master/intermediate sources detected. Share/Xvid Q2 will use %s; ProRes 422 LT is the edit-ready default.\n", backend)
+		fmt.Printf("  Master/intermediate sources detected. Share/Xvid Q2 will use %s; %s.\n", backend, editRecommendation)
 		all4208 := true
 		for _, in := range infos {
 			if in.Chroma != "4:2:0" || in.BitDepth > 8 {
@@ -681,6 +679,15 @@ func compressedInputs(infos []MediaInfo) []MediaInfo {
 		}
 	}
 	return out
+}
+
+func recommendedProResPreset(infos []MediaInfo) string {
+	for _, in := range infos {
+		if in.HasAlpha {
+			return "prores_4444"
+		}
+	}
+	return "prores_lt"
 }
 
 func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (ConvertOptions, error) {
@@ -905,11 +912,40 @@ func xvidAvailableForInputs(caps Capabilities, infos []MediaInfo, skipCompressed
 	return len(missing) == 0, missing
 }
 
+func xvidBackendDescription(caps Capabilities, infos []MediaInfo) string {
+	if ok, missing := xvidAvailableForInputs(caps, infos, false); !ok {
+		return "Xvid unavailable for " + strings.Join(missing, ", ") + "; use ProRes or install FFmpeg libxvid"
+	}
+	if caps.HasNativeXvid {
+		nativeEligible := 0
+		for _, in := range infos {
+			if nativeXvidEligible(in) {
+				nativeEligible++
+			}
+		}
+		if nativeEligible == len(infos) {
+			if caps.HasLibXvid {
+				return "native Xvid when the VfW preflight passes, with verified FFmpeg fallback"
+			}
+			return "native Xvid when the VfW preflight passes; FFmpeg libxvid is not installed"
+		}
+		return "native Xvid where eligible, with verified FFmpeg fallback for the rest"
+	}
+	if caps.HasLibXvid {
+		return "FFmpeg Xvid fallback"
+	}
+	return "Xvid unavailable; use ProRes or install FFmpeg libxvid"
+}
+
 func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 	for {
 		fmt.Println(ui.bold("PRESET"))
 		fmt.Println("  1. SHARE        Xvid Q2       " + ui.green("tuned VHQ4/B2 default"))
-		fmt.Println("  2. EDIT-READY   ProRes 422 LT " + ui.green("recommended"))
+		if recommendedProResPreset(infos) == "prores_4444" {
+			fmt.Println("  2. EDIT-READY   ProRes 422 LT " + ui.yellow("alpha sources require ProRes 4444"))
+		} else {
+			fmt.Println("  2. EDIT-READY   ProRes 422 LT " + ui.green("recommended"))
+		}
 		magicPrimary := "MagicYUV"
 		magicCompatible := validatePresetInputs("magicyuv_lossless", infos) == nil
 		if !(e.caps.HasMagicYUV && e.caps.MagicInstalled && magicCompatible) {
@@ -925,7 +961,7 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 				fmt.Println()
 				continue
 			}
-			if ok, missing := xvidAvailableForInputs(e.caps, infos, false); !ok {
+			if ok, missing := xvidAvailableForInputs(e.caps, infos, true); !ok {
 				return "", fmt.Errorf("SHARE/Xvid is unavailable for %s: install FFmpeg libxvid or choose ProRes", strings.Join(missing, ", "))
 			}
 			return "xvid_max_q2", nil
@@ -936,7 +972,9 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 				continue
 			}
 			if err := validatePresetInputs("prores_lt", infos); err != nil {
-				return "", err
+				fmt.Println(ui.yellow("  " + err.Error()))
+				fmt.Println()
+				continue
 			}
 			return "prores_lt", nil
 		case "3":
@@ -970,7 +1008,9 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 			case "1":
 				if e.caps.HasProRes {
 					if err := validatePresetInputs("prores_422", infos); err != nil {
-						return "", err
+						fmt.Println(ui.yellow("  " + err.Error()))
+						fmt.Println()
+						continue
 					}
 					return "prores_422", nil
 				}
@@ -979,7 +1019,9 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 			case "2":
 				if e.caps.HasProRes {
 					if err := validatePresetInputs("prores_hq", infos); err != nil {
-						return "", err
+						fmt.Println(ui.yellow("  " + err.Error()))
+						fmt.Println()
+						continue
 					}
 					return "prores_hq", nil
 				}
@@ -987,7 +1029,7 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 				fmt.Println()
 			case "3":
 				if e.caps.HasXvid {
-					if ok, missing := xvidAvailableForInputs(e.caps, infos, false); ok {
+					if ok, missing := xvidAvailableForInputs(e.caps, infos, true); ok {
 						return "xvid_efficient_q2", nil
 					} else {
 						return "", fmt.Errorf("xvid is unavailable for %s: install FFmpeg libxvid or choose ProRes", strings.Join(missing, ", "))
@@ -997,7 +1039,7 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 				fmt.Println()
 			case "4":
 				if e.caps.HasXvid {
-					if ok, missing := xvidAvailableForInputs(e.caps, infos, false); ok {
+					if ok, missing := xvidAvailableForInputs(e.caps, infos, true); ok {
 						return "xvid_compact", nil
 					} else {
 						return "", fmt.Errorf("xvid is unavailable for %s: install FFmpeg libxvid or choose ProRes", strings.Join(missing, ", "))
@@ -1007,7 +1049,7 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 				fmt.Println()
 			case "5":
 				if e.caps.HasXvid {
-					if ok, missing := xvidAvailableForInputs(e.caps, infos, false); ok {
+					if ok, missing := xvidAvailableForInputs(e.caps, infos, true); ok {
 						return "xvid_small", nil
 					} else {
 						return "", fmt.Errorf("xvid is unavailable for %s: install FFmpeg libxvid or choose ProRes", strings.Join(missing, ", "))
@@ -1017,7 +1059,7 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 				fmt.Println()
 			case "6":
 				if e.caps.HasXvid {
-					if ok, missing := xvidAvailableForInputs(e.caps, infos, false); ok {
+					if ok, missing := xvidAvailableForInputs(e.caps, infos, true); ok {
 						return "xvid_max", nil
 					} else {
 						return "", fmt.Errorf("xvid is unavailable for %s: install FFmpeg libxvid or choose ProRes", strings.Join(missing, ", "))
@@ -1692,9 +1734,14 @@ func printBatchSummary(ui theme, result BatchResult, cancelled error) {
 	if result.Failures > 0 {
 		fmt.Printf("   %s %d failed", ui.red("FAIL"), result.Failures)
 	}
+	if result.InputFailures > 0 {
+		fmt.Printf("   %s %d input(s) failed analysis", ui.red("FAIL"), result.InputFailures)
+	}
 	fmt.Println()
 	if cancelled != nil {
 		fmt.Println("  " + ui.yellow("Conversion cancelled."))
+	} else if result.InputFailures > 0 {
+		fmt.Println("  " + ui.yellow("Some requested inputs failed analysis; only the successfully analyzed inputs are included above."))
 	} else if result.Failures == 0 && result.Successes > 0 {
 		fmt.Println("  " + ui.green("All outputs passed decoded-frame and timing verification."))
 	} else if result.Failures == 0 && result.Successes == 0 && result.Skipped > 0 {
@@ -2153,11 +2200,11 @@ func hasAlpha(p string) bool {
 }
 func isRGBPixelFormat(p string) bool {
 	low := strings.ToLower(strings.TrimSpace(p))
-	return strings.HasPrefix(low, "rgb") || strings.HasPrefix(low, "bgr") || strings.HasPrefix(low, "gbr")
+	return strings.HasPrefix(low, "rgb") || strings.HasPrefix(low, "bgr") || strings.HasPrefix(low, "gbr") || strings.HasPrefix(low, "argb") || strings.HasPrefix(low, "abgr")
 }
 func chroma(p string) string {
 	low := strings.ToLower(p)
-	if strings.Contains(low, "444") || strings.HasPrefix(low, "rgb") || strings.HasPrefix(low, "gbr") {
+	if strings.Contains(low, "444") || isRGBPixelFormat(p) {
 		return "4:4:4"
 	}
 	if strings.Contains(low, "422") {

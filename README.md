@@ -155,6 +155,8 @@ ProRes verification also checks the encoded profile and pixel format: LT/422/HQ 
 
 When a matching output already exists, PreRecs decodes and verifies it first. A current valid output is reused. A stale, truncated, wrong-codec, or otherwise invalid output is preserved and the new conversion receives the next numbered filename.
 
+Output allocation atomically reserves the final target to prevent parallel same-stem collisions. An abrupt process termination can therefore leave a zero-byte placeholder; the next run preserves/rejects that invalid candidate and safely chooses a numbered replacement.
+
 For a timing conform, PreRecs assigns frame-number timestamps in the target timebase and strips audio to avoid desynchronization. It does not use optical-flow interpolation or create new pictures.
 
 ## Build from source

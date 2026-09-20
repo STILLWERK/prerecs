@@ -615,6 +615,29 @@ func TestHeadlessExitCodeOnCancellation(t *testing.T) {
 	if got := headlessExitCode(BatchResult{Successes: 1}, nil); got != 0 {
 		t.Fatalf("successful headless job exit code=%d, want 0", got)
 	}
+	if got := headlessExitCode(BatchResult{InputFailures: 1}, nil); got != 1 {
+		t.Fatalf("partial-probe headless job exit code=%d, want 1", got)
+	}
+}
+
+func TestAnalyzeInputsTracksPartialProbeFailures(t *testing.T) {
+	caps, _, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	td := t.TempDir()
+	valid := filepath.Join(td, "valid.mp4")
+	corrupt := filepath.Join(td, "corrupt.mp4")
+	if b, err := exec.Command(caps.FFmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10", "-frames:v", "3", "-c:v", "mpeg4", "-an", valid).CombinedOutput(); err != nil {
+		t.Fatalf("valid source: %v %s", err, b)
+	}
+	if err := os.WriteFile(corrupt, []byte("not a video"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	infos, failures := analyzeInputs(caps.FFprobe, []string{valid, corrupt}, theme{})
+	if len(infos) != 1 || failures != 1 {
+		t.Fatalf("analyzeInputs returned %d infos and %d failures", len(infos), failures)
+	}
 }
 
 func TestMetadataFrameCountTrust(t *testing.T) {
@@ -649,6 +672,65 @@ func TestXvidAvailabilityUsesSourceEligibility(t *testing.T) {
 	}
 }
 
+func TestXvidRecommendationDoesNotPromiseMissingFallback(t *testing.T) {
+	eligible := []MediaInfo{{Path: `C:\clips\master.avi`, Codec: "lagarith"}}
+	nonEligible := []MediaInfo{{Path: `C:\clips\master.mkv`, Codec: "ffv1"}}
+
+	nativeOnly := Capabilities{HasXvid: true, HasNativeXvid: true, HasLibXvid: false}
+	if got := xvidBackendDescription(nativeOnly, eligible); strings.Contains(strings.ToLower(got), "fallback") {
+		t.Fatalf("native-only recommendation promised a fallback: %q", got)
+	}
+	if got := xvidBackendDescription(nativeOnly, nonEligible); !strings.Contains(strings.ToLower(got), "unavailable") {
+		t.Fatalf("native-only non-eligible recommendation=%q, want unavailable", got)
+	}
+
+	withFallback := Capabilities{HasXvid: true, HasNativeXvid: true, HasLibXvid: true}
+	if got := xvidBackendDescription(withFallback, eligible); !strings.Contains(strings.ToLower(got), "fallback") {
+		t.Fatalf("native+libxvid recommendation=%q, want fallback", got)
+	}
+}
+
+func TestInteractiveNativeOnlyXvidCanSkipCompressedInputs(t *testing.T) {
+	old := stdinReader
+	defer func() { stdinReader = old }()
+	e := &Engine{
+		caps: Capabilities{HasXvid: true, HasNativeXvid: true, HasLibXvid: false},
+		enc:  map[string]bool{},
+	}
+	infos := []MediaInfo{
+		{Path: `C:\clips\master.avi`, Codec: "lagarith"},
+		{Path: `C:\clips\download.mp4`, Codec: "h264"},
+	}
+	stdinReader = bufio.NewReader(strings.NewReader("1\n1\nn\n"))
+	opts, err := collectOptions(cliConfig{outputDir: t.TempDir()}, theme{}, e, infos)
+	if err != nil {
+		t.Fatalf("interactive native-only mixed batch was rejected before skip choice: %v", err)
+	}
+	if opts.Preset != "xvid_max_q2" || !opts.SkipCompressed {
+		t.Fatalf("options=%+v, want SHARE with compressed input skipped", opts)
+	}
+}
+
+func TestAlphaInteractivePresetStaysInMenuForProRes4444(t *testing.T) {
+	old := stdinReader
+	defer func() { stdinReader = old }()
+	e := &Engine{caps: Capabilities{HasProRes: true}}
+	stdinReader = bufio.NewReader(strings.NewReader("2\n4\n7\n"))
+	got, err := choosePreset(theme{}, e, []MediaInfo{{Path: "alpha.mkv", HasAlpha: true}})
+	if err != nil || got != "prores_4444" {
+		t.Fatalf("alpha interactive selection=%q err=%v, want ProRes 4444 after staying in menu", got, err)
+	}
+}
+
+func TestAlphaRecommendationUsesProRes4444(t *testing.T) {
+	if got := recommendedProResPreset([]MediaInfo{{Path: "alpha.mkv", HasAlpha: true}}); got != "prores_4444" {
+		t.Fatalf("alpha recommendation=%q, want prores_4444", got)
+	}
+	if got := recommendedProResPreset([]MediaInfo{{Path: "master.avi"}}); got != "prores_lt" {
+		t.Fatalf("normal recommendation=%q, want prores_lt", got)
+	}
+}
+
 func TestCollectOptionsRejectsUnsupportedXvidInputEarly(t *testing.T) {
 	e := &Engine{
 		caps: Capabilities{HasXvid: true, HasNativeXvid: true, HasLibXvid: false},
@@ -658,6 +740,14 @@ func TestCollectOptionsRejectsUnsupportedXvidInputEarly(t *testing.T) {
 	_, err := collectOptions(cliConfig{preset: "share", yes: true, forceXvid: true}, theme{}, e, []MediaInfo{info})
 	if err == nil || !strings.Contains(err.Error(), "libxvid") {
 		t.Fatalf("unsupported native-only Xvid input was not rejected early: %v", err)
+	}
+	mixed := []MediaInfo{
+		{Path: `C:\clips\master.avi`, Codec: "lagarith"},
+		{Path: `C:\clips\download.mp4`, Codec: "h264"},
+	}
+	_, err = collectOptions(cliConfig{preset: "share", yes: true, forceXvid: true}, theme{}, e, mixed)
+	if err == nil || !strings.Contains(err.Error(), "libxvid") {
+		t.Fatalf("force-Xvid mixed batch was not rejected early: %v", err)
 	}
 }
 
@@ -670,6 +760,17 @@ func TestHasAlphaRecognizesPackedARGBFormats(t *testing.T) {
 	for _, pixFmt := range []string{"rgb24", "bgr24", "yuv420p", "yuv444p"} {
 		if hasAlpha(pixFmt) {
 			t.Fatalf("hasAlpha(%q)=true, want false", pixFmt)
+		}
+	}
+}
+
+func TestPackedRGBFormatsUseRGBConversionClassification(t *testing.T) {
+	for _, pixFmt := range []string{"argb", "abgr", "rgba", "bgra", "gbrap"} {
+		if !isRGBPixelFormat(pixFmt) {
+			t.Fatalf("isRGBPixelFormat(%q)=false, want true", pixFmt)
+		}
+		if got := chroma(pixFmt); got != "4:4:4" {
+			t.Fatalf("chroma(%q)=%q, want 4:4:4", pixFmt, got)
 		}
 	}
 }
@@ -1160,6 +1261,57 @@ func TestIntegrationProResRGBAlphaRoundTrip(t *testing.T) {
 	}
 	if a, b := alphaMD5(src), alphaMD5(out); a != b {
 		t.Fatalf("alpha changed: src=%s out=%s", a, b)
+	}
+}
+
+func TestIntegrationProResPackedRGBAlphaRoundTrip(t *testing.T) {
+	caps, enc, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	if !enc["prores_ks"] || !enc["ffv1"] {
+		t.Skip("prores_ks/ffv1 unavailable")
+	}
+	td := t.TempDir()
+	for _, pixFmt := range []string{"argb", "abgr"} {
+		t.Run(pixFmt, func(t *testing.T) {
+			src := filepath.Join(td, pixFmt+".nut")
+			out := filepath.Join(td, pixFmt+".mov")
+			filter := fmt.Sprintf("[0:v]format=rgb24[base];[1:v]format=gray[a];[base][a]alphamerge,format=%s", pixFmt)
+			if b, err := exec.Command(caps.FFmpeg,
+				"-hide_banner", "-loglevel", "error", "-y",
+				"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30",
+				"-f", "lavfi", "-i", "nullsrc=size=160x90:rate=30,format=gray,geq=lum=X/W*255",
+				"-filter_complex", filter, "-frames:v", "8", "-c:v", "rawvideo", "-pix_fmt", pixFmt, src,
+			).CombinedOutput(); err != nil {
+				t.Fatalf("source: %v %s", err, b)
+			}
+			info, err := probeMedia(caps.FFprobe, src, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.EqualFold(info.PixelFormat, pixFmt) || !info.HasAlpha {
+				t.Fatalf("source format/alpha=%s/%t", info.PixelFormat, info.HasAlpha)
+			}
+			e := &Engine{caps: caps, enc: enc}
+			args, _, _, err := e.buildCommand(info, ConvertOptions{Preset: "prores_4444", StripAudio: true}, out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if b, err := exec.Command(caps.FFmpeg, args...).CombinedOutput(); err != nil {
+				t.Fatalf("encode: %v %s", err, b)
+			}
+			alphaMD5 := func(path string) string {
+				b, err := exec.Command(caps.FFmpeg, "-hide_banner", "-loglevel", "error", "-i", path, "-vf", "alphaextract,format=gray", "-f", "md5", "-").CombinedOutput()
+				if err != nil {
+					t.Fatalf("alpha md5 %s: %v %s", path, err, b)
+				}
+				return strings.TrimSpace(string(b))
+			}
+			if source, output := alphaMD5(src), alphaMD5(out); source != output {
+				t.Fatalf("alpha changed: source=%s output=%s", source, output)
+			}
+		})
 	}
 }
 
