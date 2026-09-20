@@ -1,0 +1,56 @@
+# Compiled and packaged artifacts
+PreRecs.exe
+*.exe
+*.dll
+dist/
+release/
+*.zip
+*.7z
+
+# Go build and test output
+*.test
+*.out
+coverage.out
+coverage.html
+coverprofile.*
+
+# PreRecs runtime tools and generated media
+tools/
+converted_prerecs/
+*.avi
+*.mov
+*.mp4
+*.m4v
+*.mkv
+*.webm
+*.wmv
+*.mpg
+*.mpeg
+*.m2ts
+*.ts
+*.m4v.video.tmp
+*.m4v.video.tmp.*
+
+# Local configuration, credentials, and environment files
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.credentials
+credentials.json
+secrets.*
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

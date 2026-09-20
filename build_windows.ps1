@@ -1,0 +1,6 @@
+$ErrorActionPreference = 'Stop'
+Set-Location $PSScriptRoot
+go test ./...
+go vet ./...
+go build -trimpath -ldflags="-s -w" -o "$PSScriptRoot\PreRecs.exe" .
+Write-Host "Built $PSScriptRoot\PreRecs.exe"

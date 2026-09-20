@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    name: Windows amd64 release
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: go.mod
+
+      - name: Build, package, and checksum
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist, dist/package | Out-Null
+          $env:CGO_ENABLED = '0'
+          $env:GOOS = 'windows'
+          $env:GOARCH = 'amd64'
+          go build -trimpath -ldflags='-s -w' -o dist/PreRecs.exe .
+
+          $reported = (& dist/PreRecs.exe --version).Trim()
+          if ($reported -ne 'PreRecs 1.0.0') {
+            throw "Unexpected version: $reported"
+          }
+
+          Copy-Item dist/PreRecs.exe dist/package/PreRecs.exe
+          Copy-Item README.md, LICENSE, CHANGELOG.md dist/package/
+          $artifact = "PreRecs-$env:GITHUB_REF_NAME-windows-amd64.zip"
+          Compress-Archive -Path dist/package/* -DestinationPath "dist/$artifact"
+          $hash = (Get-FileHash "dist/$artifact" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $artifact" | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $artifact = "dist/PreRecs-$env:GITHUB_REF_NAME-windows-amd64.zip"
+          $notes = @"
+          PreRecs $env:GITHUB_REF_NAME is the first public release.
+
+          The release includes the tuned SHARE / Xvid Q2 path, the separate Xvid Q2 Efficient preset, ProRes LT/422/HQ/4444, MagicYUV, Ut Video, verified native-Xvid/FFmpeg fallback behavior, and full decoded-output verification.
+
+          FFmpeg and optional codec installations are not bundled. See the included README for runtime requirements.
+          "@
+          gh release create "$env:GITHUB_REF_NAME" $artifact dist/SHA256SUMS.txt --repo "$env:GITHUB_REPOSITORY" --title "PreRecs $env:GITHUB_REF_NAME" --notes $notes
