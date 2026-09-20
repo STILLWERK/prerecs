@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"math"
@@ -307,17 +308,6 @@ func TestNativeXvidEligibility(t *testing.T) {
 	}
 	if nativeXvidEligible(MediaInfo{Path: `C:\clips\download.avi`, Codec: "h264"}) {
 		t.Fatal("distribution-compressed AVI should not use native Xvid direct path")
-	}
-}
-
-func TestParseXvidProgressLine(t *testing.T) {
-	line := "     321 frames( 53%) encoded,  26.10 fps, Average Bitrate = 12345kbps"
-	frames, pct, fps, ok := parseXvidProgressLine(line)
-	if !ok {
-		t.Fatal("progress line was not parsed")
-	}
-	if frames != 321 || math.Abs(pct-0.53) > 1e-9 || fps != "26.10" {
-		t.Fatalf("got frames=%d pct=%v fps=%q", frames, pct, fps)
 	}
 }
 
@@ -2477,6 +2467,21 @@ func TestSelectFrameRate(t *testing.T) {
 	if s, r := selectFrameRate("0/0", "30/1", 106200, 3600.0); s != "" || r != nil {
 		t.Fatalf("long-clip drift must be rejected: %s %v", s, r)
 	}
+	// avg_frame_rate is corroborated by the same trusted evidence: a stale
+	// avg inconsistent with frames/duration is impeached and the consistent
+	// r_frame_rate wins instead.
+	if s, r := selectFrameRate("60/1", "30/1", 300, 10.0); s != "30/1" || r == nil {
+		t.Fatalf("stale avg must fall back to consistent r: %s %v", s, r)
+	}
+	// Both rates impeached by trusted count/duration → no rate at all; the
+	// caller must preserve timing rather than pick a liar.
+	if s, r := selectFrameRate("60/1", "30/1", 300, 20.0); s != "" || r != nil {
+		t.Fatalf("both rates inconsistent must reject: %s %v", s, r)
+	}
+	// Honest VFR: avg reflects the real average so it stays preferred.
+	if s, r := selectFrameRate("30/1", "60/1", 300, 10.0); s != "30/1" || r == nil {
+		t.Fatalf("consistent avg still preferred: %s %v", s, r)
+	}
 }
 
 func TestProbeProResVulkanTimeout(t *testing.T) {
@@ -2532,6 +2537,9 @@ func TestParseFlagsHelp(t *testing.T) {
 		{"unknown option after help", []string{"-h", "-bogus"}, "err"},
 		{"bad bool value before help", []string{"-yes=bad", "-h"}, "err"},
 		{"missing option value", []string{"--output"}, "err"},
+		{"missing value after help token", []string{"-h", "--preset"}, "err"},
+		{"negated help still shows help", []string{"-h=false"}, "help"},
+		{"triple dash long help is not help", []string{"---help"}, "err"},
 		{"no help", []string{"file.avi", "--yes"}, "ok"},
 		{"empty", nil, "ok"},
 	} {
@@ -2547,6 +2555,49 @@ func TestParseFlagsHelp(t *testing.T) {
 				t.Fatalf("parseFlags(%v) outcome=%q (err=%v), want %q", tc.in, got, err, tc.want)
 			}
 		})
+	}
+}
+
+// The reorderArgs classification tables must stay in exact sync with the
+// flag set: a flag missing from them reads as "unknown option", a bool
+// mis-tabled as value-taking would swallow the next token, and registering
+// h/help would silently kill the ErrHelp path. This test fails on any drift.
+func TestFlagTablesMatchRegistration(t *testing.T) {
+	var c cliConfig
+	fs := newFlagSet(&c)
+	fs.VisitAll(func(f *flag.Flag) {
+		g, ok := f.Value.(flag.Getter)
+		if !ok {
+			t.Fatalf("flag %q does not implement flag.Getter", f.Name)
+		}
+		switch g.Get().(type) {
+		case bool:
+			if !flagBool[f.Name] || flagNeedsValue[f.Name] {
+				t.Fatalf("bool flag %q misclassified in reorder tables", f.Name)
+			}
+		case string:
+			if !flagNeedsValue[f.Name] || flagBool[f.Name] {
+				t.Fatalf("string flag %q misclassified in reorder tables", f.Name)
+			}
+		default:
+			t.Fatalf("flag %q has unexpected value type %T", f.Name, g.Get())
+		}
+	})
+	for name := range flagNeedsValue {
+		if fs.Lookup(name) == nil {
+			t.Fatalf("flagNeedsValue lists %q but no such flag is registered", name)
+		}
+	}
+	for name := range flagBool {
+		if name == "h" || name == "help" {
+			continue // intentional unregistered sentinels driving ErrHelp
+		}
+		if fs.Lookup(name) == nil {
+			t.Fatalf("flagBool lists %q but no such flag is registered", name)
+		}
+	}
+	if fs.Lookup("h") != nil || fs.Lookup("help") != nil {
+		t.Fatal("h/help must stay unregistered so flag.Parse yields ErrHelp")
 	}
 }
 
@@ -2850,6 +2901,61 @@ func TestProcessItemStaleDurationPreservesTiming(t *testing.T) {
 	outInfo, err := probeMedia(caps.FFprobe, item.Output, false)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if math.Abs(outInfo.Duration-1.0) > 0.2 {
+		t.Fatalf("output duration %.3fs — timing was not preserved (~1.0s expected)", outInfo.Duration)
+	}
+}
+
+// For trusted-codec containers like AVI, nb_frames is itself a header field —
+// a stale table can claim more frames than the stream holds while staying
+// internally consistent, so no pre-encode scan runs and the claimed count
+// survives to verification. When the output's real decoded count disagrees,
+// PreRecs must rescan the source once and re-verify against decoded truth
+// rather than fail an honest conversion.
+func TestProcessItemStaleFrameCountRescansAndVerifies(t *testing.T) {
+	caps, enc, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	if !enc["libxvid"] {
+		t.Skip("libxvid unavailable")
+	}
+	td := t.TempDir()
+	src := filepath.Join(td, "clip.avi")
+	if b, err := exec.Command(caps.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30",
+		"-frames:v", "30", "-c:v", "ffv1", src,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("fixture: %v %s", err, b)
+	}
+	// Claim 90 frames in the header while the stream really holds 30. FFV1 is
+	// a trusted codec, so the claim is accepted as exact without a scan.
+	patchStrhLength(t, src, 90)
+	info, err := probeMedia(caps.FFprobe, src, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.FrameCount != 90 || !info.FrameCountExact {
+		t.Fatalf("fixture did not produce a stale trusted count: %+v", info)
+	}
+	outDir := filepath.Join(td, "out")
+	rep, _ := captureReporter()
+	item := processItem(context.Background(), theme{}, &Engine{caps: caps, enc: enc}, info,
+		ConvertOptions{Preset: "xvid_compact", OutputDir: outDir, StripAudio: true}, rep)
+	if item.Status != "ok" {
+		t.Fatalf("stale-count source failed instead of rescanning: status=%q msg=%q", item.Status, item.Message)
+	}
+	if item.InputInfo.FrameCount != 30 {
+		t.Fatalf("rescan did not replace the stale count: %d", item.InputInfo.FrameCount)
+	}
+	outInfo, err := probeMedia(caps.FFprobe, item.Output, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outInfo.FrameCount != 30 {
+		t.Fatalf("output frames=%d, want 30", outInfo.FrameCount)
 	}
 	if math.Abs(outInfo.Duration-1.0) > 0.2 {
 		t.Fatalf("output duration %.3fs — timing was not preserved (~1.0s expected)", outInfo.Duration)

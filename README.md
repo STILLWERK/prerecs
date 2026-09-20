@@ -138,6 +138,7 @@ Useful options:
 --cpu-prores          Disable the experimental Vulkan ProRes path.
 --plain               Disable ANSI styling.
 --version             Print the application version.
+-h, --help            Show usage.
 ```
 
 ## Conversion and verification behavior

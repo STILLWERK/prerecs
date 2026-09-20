@@ -354,8 +354,14 @@ func headlessExitCode(result BatchResult, cancelled error) int {
 	return 0
 }
 
+// isCtxErr reports whether err means the context was cancelled or its
+// deadline elapsed — both are user/timeout cancellations, not job failures.
+func isCtxErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 func processErrorStatus(err error) string {
-	if errors.Is(err, context.Canceled) {
+	if isCtxErr(err) {
 		return "cancelled"
 	}
 	return "failed"
@@ -460,10 +466,13 @@ func reorderArgs(args []string) ([]string, error) {
 // them).
 var errShowHelp = errors.New("help requested")
 
-func parseFlags(args []string) (cliConfig, []string, error) {
+// newFlagSet builds the flag set parseFlags uses. Registration lives in one
+// place so tests can assert the reorderArgs classification tables stay in sync
+// with it (a mis-tabled flag would corrupt the reorder, e.g. leak a value into
+// the flags region or kill the ErrHelp path for -h).
+func newFlagSet(c *cliConfig) *flag.FlagSet {
 	fs := flag.NewFlagSet("prerecs", flag.ContinueOnError)
 	fs.SetOutput(io.Discard) // help/errors are reported by the caller, not flag
-	var c cliConfig
 	fs.StringVar(&c.preset, "preset", "", "share|compact|xvid|xvid-q2|xvid-efficient|xvid-fast|edit|lossless|prores|hq|xvid-max-q2|xvid-small|xvid-max|4444|magicyuv|utvideo")
 	fs.StringVar(&c.timescale, "timescale", "", "game timescale, e.g. 0.1")
 	fs.StringVar(&c.captureFPS, "capture-fps", "", "capture FPS override, e.g. 30 or 60000/1001")
@@ -474,6 +483,14 @@ func parseFlags(args []string) (cliConfig, []string, error) {
 	fs.BoolVar(&c.cpuProRes, "cpu-prores", false, "disable experimental Vulkan ProRes fast path and force CPU prores_ks")
 	fs.BoolVar(&c.plain, "plain", false, "disable ANSI colors/progress styling")
 	fs.BoolVar(&c.showVersion, "version", false, "print version")
+	// h/help are intentionally NOT registered: flag.Parse returns ErrHelp for
+	// undefined h/help, which parseFlags maps to errShowHelp.
+	return fs
+}
+
+func parseFlags(args []string) (cliConfig, []string, error) {
+	var c cliConfig
+	fs := newFlagSet(&c)
 	reordered, err := reorderArgs(args)
 	if err != nil {
 		return c, nil, err
@@ -505,6 +522,7 @@ Options:
   --cpu-prores             force CPU ProRes; disable Vulkan fast path
   --plain                  disable ANSI styling
   --version                print version
+  -h, --help               show this usage
 
 Examples:
   PreRecs.exe "clip.mp4"
@@ -1454,6 +1472,35 @@ func addBatchItem(result *BatchResult, item ItemResult) {
 	}
 }
 
+// reconcileScannedInput records a trusted decoded frame count and re-evaluates
+// the selected container rate against it before the rate can drive the
+// constant-rate timeline rebuild. This covers avg_frame_rate too: on the
+// containers scanned here it is header-derived, the same stale-metadata class
+// as the untrusted frame tables — a stale header rate would silently retime
+// the output while verification still passes against the same wrong value.
+// A rate that disagrees with the decoded stream is discarded so passthrough
+// preserves real timing instead of inventing one.
+func reconcileScannedInput(info *MediaInfo, count int64, ui theme, rep itemReporter) {
+	info.FrameCount = count
+	info.FrameCountExact = true
+	if _, rat := selectFrameRate("", info.FPS, count, info.Duration); rat == nil && info.FPS != "" {
+		rep.line(ui.yellow(fmt.Sprintf("Container frame rate %s does not match the decoded stream; preserving source timing.", info.FPS)))
+		// Disagreement proves the metadata is inconsistent but not which field
+		// is stale — Duration could be the liar just as well. Keep it and
+		// verification would compare honest passthrough timing against a
+		// possibly-stale expected duration. Clear both: passthrough carries
+		// real timestamps by construction and the exact frame count remains
+		// the integrity gate. (A source with no rate at all skips this branch
+		// — its duration was never contradicted and still gates verification.)
+		info.FPS, info.FPSFloat = "", 0
+		info.Duration = 0
+	}
+	info.FPSFromFallback = false
+	if info.FPSFloat > 0 {
+		info.Duration = float64(count) / info.FPSFloat
+	}
+}
+
 func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts ConvertOptions, rep itemReporter) ItemResult {
 	item := ItemResult{Source: info.Path, InputInfo: info}
 	if ctx.Err() != nil {
@@ -1469,6 +1516,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		return item
 	}
 
+	inputScanned := false
 	if nativeXvidNeedsExactFrameScan(info) {
 		info.FrameCountExact = false
 		rep.line("Lossless AVI metadata does not agree with its duration; doing one exact decode scan before native Xvid.")
@@ -1481,6 +1529,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 			rep.progress(p)
 		})
 		rep.finish()
+		inputScanned = true
 		if scanErr != nil {
 			item.Status = processErrorStatus(scanErr)
 			item.Message = scanErr.Error()
@@ -1492,44 +1541,9 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 			rep.line(indentError(scanErr.Error(), 2))
 			return item
 		}
-		info.FrameCount = count
-		info.FrameCountExact = true
-		oldDuration := info.Duration
-		// The scan produced a trusted frame count; re-evaluate the selected
-		// container rate against it before it can drive the constant-rate
-		// timeline rebuild below. This covers avg_frame_rate too: on the
-		// compressed containers scanned here it is header-derived, the same
-		// stale-metadata class as the untrusted frame tables — a stale header
-		// rate would silently retime the output while verification still
-		// passes against the same wrong value. A rate that disagrees with the
-		// decoded stream is discarded so passthrough preserves real timing
-		// instead of inventing one.
-		if _, rat := selectFrameRate("", info.FPS, count, info.Duration); rat == nil {
-			if info.FPS != "" {
-				rep.line(ui.yellow(fmt.Sprintf("Container frame rate %s does not match the decoded stream; preserving source timing.", info.FPS)))
-			}
-			// Disagreement proves the metadata is inconsistent but not which
-			// field is stale — Duration could be the liar just as well. Keep it
-			// and verification would compare honest passthrough timing against a
-			// possibly-stale expected duration. Clear both: passthrough carries
-			// real timestamps by construction and the exact frame count remains
-			// the integrity gate.
-			info.FPS, info.FPSFloat = "", 0
-			info.Duration = 0
-		}
-		info.FPSFromFallback = false
-		if info.FPSFloat > 0 {
-			info.Duration = float64(count) / info.FPSFloat
-		}
+		reconcileScannedInput(&info, count, ui, rep)
 		item.InputInfo = info
 		rep.line(fmt.Sprintf("Exact source frames: %d", count))
-		tol := .01
-		if info.FPSFloat > 0 {
-			tol = math.Max(tol, 2.5/info.FPSFloat)
-		}
-		if oldDuration > 0 && info.Duration > 0 && math.Abs(oldDuration-info.Duration) > tol {
-			rep.line(fmt.Sprintf("Normalized source timeline: %.4fs -> %.4fs (%d frames @ %.3f fps)", oldDuration, info.Duration, count, info.FPSFloat))
-		}
 	}
 
 	existing, out, err := outputCandidates(info.Path, opts.OutputDir, opts.Preset)
@@ -1567,7 +1581,9 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 				})
 				rep.finish()
 				if decodeErr != nil {
-					if errors.Is(decodeErr, context.Canceled) {
+					if isCtxErr(decodeErr) {
+						rep.line(ui.yellow("OUTPUT CHECK CANCELLED"))
+						rep.line(indentError(decodeErr.Error(), 2))
 						if relErr := releaseOutputReservation(out); relErr != nil {
 							rep.line(ui.yellow("WARNING: could not release reserved output name: " + relErr.Error()))
 						}
@@ -1597,8 +1613,8 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 				}
 				rep.line(ui.dim("Rejected: " + strings.Join(problems, "; ")))
 			}
+			rep.line(ui.yellow("Existing output was stale or did not validate; preserving it and writing a numbered copy."))
 		}
-		rep.line(ui.yellow("Existing output was stale or did not validate; preserving it and writing a numbered copy."))
 	}
 	item.Output = out
 
@@ -1622,7 +1638,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	var expectedFPS *big.Rat
 	var expectedDur float64
 
-	usedNative := isXvidPreset(opts.Preset) && e.caps.HasNativeXvid && nativeXvidEligible(info)
+	usedNative := isXvidPreset(opts.Preset) && e.caps.HasNativeXvid && nativeXvidEligible(info) && info.FPS != ""
 	if usedNative && info.FrameCountExact && info.FrameCount > 0 {
 		ok, preflightErr := vfwCanDecodeFrame(info.Path, info.FrameCount-1)
 		if preflightErr != nil {
@@ -1738,8 +1754,10 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 
 	if err != nil {
 		item.Elapsed = time.Since(started)
-		if errors.Is(err, context.Canceled) {
+		if isCtxErr(err) {
 			item.Status = "cancelled"
+			rep.line(ui.yellow("ENCODE CANCELLED"))
+			rep.line(indentError(err.Error(), 2))
 			removeOut()
 			return item
 		}
@@ -1792,6 +1810,44 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	outInfo.FrameCountExact = true
 	item.OutputInfo = outInfo
 	problems := verifyOutput(info, outInfo, opts, expectedFPS, expectedDur)
+	if len(problems) > 0 && !inputScanned {
+		// The input's frame count came from container tables trusted without
+		// a decode scan — but for trusted-codec containers like AVI that count
+		// is itself a header field that can lie exactly like the compressed
+		// tables do. If the output's real decoded count disagrees, the claim
+		// may be the stale field: rescan the source once and re-verify against
+		// the decoded truth instead of failing an honest conversion.
+		rep.line("Source frame count was container-claimed; doing one exact decode scan to check whether the table was stale...")
+		rescanStarted := time.Now()
+		count, scanErr := e.countDecodedFrames(ctx, info, func(p progressInfo) {
+			p.Stage = "RESCAN"
+			p = exactFrameProgress(p, info.FrameCount, rescanStarted)
+			rep.progress(p)
+		})
+		rep.finish()
+		switch {
+		case scanErr != nil && isCtxErr(scanErr):
+			// The encoded output is complete but unverified; keep it so a
+			// later run can re-check and reuse it, matching the verify-decode
+			// cancellation path.
+			item.Status = "cancelled"
+			item.Elapsed = time.Since(started)
+			item.Message = scanErr.Error()
+			rep.line(ui.yellow("SOURCE RESCAN CANCELLED"))
+			rep.line(indentError(scanErr.Error(), 2))
+			return item
+		case scanErr != nil:
+			rep.line(ui.dim("Source rescan failed: " + scanErr.Error()))
+		case count != info.FrameCount:
+			rep.line(ui.yellow(fmt.Sprintf("Container frame count %d was stale; the source actually decodes %d frames — re-verifying against the decoded count.", info.FrameCount, count)))
+			reconcileScannedInput(&info, count, ui, rep)
+			item.InputInfo = info
+			if _, fps, dur, terr := expectedTiming(info, opts); terr == nil {
+				expectedFPS, expectedDur = fps, dur
+			}
+			problems = verifyOutput(info, outInfo, opts, expectedFPS, expectedDur)
+		}
+	}
 	if len(problems) > 0 {
 		item.Elapsed = time.Since(started)
 		item.Status = "failed"
@@ -1924,7 +1980,13 @@ func hasDuplicateOutputStems(customDir string, infos []MediaInfo) bool {
 			dir = filepath.Join(filepath.Dir(in.Path), "converted_prerecs")
 		}
 		stem := strings.ToLower(strings.TrimSuffix(filepath.Base(in.Path), filepath.Ext(in.Path)))
-		key := filepath.Clean(dir) + "|" + stem
+		dirKey := filepath.Clean(dir)
+		if runtime.GOOS == "windows" {
+			// NTFS is case-insensitive: fold the directory so differently
+			// spelled paths to the same folder still serialize together.
+			dirKey = strings.ToLower(dirKey)
+		}
+		key := dirKey + "|" + stem
 		if seen[key] {
 			return true
 		}
@@ -2460,6 +2522,13 @@ func parseRat(v string) (*big.Rat, error) {
 	}
 	return r, nil
 }
+
+// validRate reports whether v parses to a positive rational frame rate.
+func validRate(v string) bool {
+	r, err := parseRatAllowZero(v)
+	return err == nil && r != nil
+}
+
 func parseRatAllowZero(v string) (*big.Rat, error) {
 	if v == "" || v == "0/0" || v == "N/A" {
 		return nil, nil
@@ -2480,36 +2549,34 @@ func parseInt64(v string) int64   { n, _ := strconv.ParseInt(v, 10, 64); return 
 func parseInt(v string) int       { n, _ := strconv.Atoi(v); return n }
 
 // selectFrameRate picks the best available container frame rate. avg_frame_rate
-// is preferred because it reflects the realised stream; when it is missing or
-// 0/0 (common on elementary streams and odd containers) r_frame_rate is a
-// lower-trust fallback. r_frame_rate is a nominal/guessed rate that can diverge
-// from the true average on VFR material, and the compressed-source path
-// rebuilds a constant-rate timeline from whatever rate is chosen — a wrong
-// guess would silently change playback speed while verification still passes.
-// The fallback is therefore trusted only when it agrees with the container's
-// own frame count/duration, or when no corroborating metadata exists at all
-// (e.g. raw elementary streams where r_frame_rate is the only rate available).
+// is preferred because it reflects the realised stream; r_frame_rate is a
+// nominal/guessed fallback that can diverge from the true average on VFR
+// material. Either field can carry a stale header value, so when a trusted
+// frame count and duration exist, each candidate must agree with them: a rate
+// that disagrees is impeached rather than allowed to drive the constant-rate
+// timeline rebuild (which would silently retime content while verification
+// passes against the same wrong value). Rates are trusted unconditionally only
+// when no corroborating metadata exists at all (e.g. raw elementary streams).
 // The exact decode scan still governs frame counts and output verification.
 func selectFrameRate(avg, r string, frames int64, dur float64) (string, *big.Rat) {
-	if v, err := parseRatAllowZero(avg); err == nil && v != nil {
-		return avg, v
-	}
-	rv, err := parseRatAllowZero(r)
-	if err != nil || rv == nil {
-		return "", nil
-	}
-	if frames > 0 && dur > 0 {
-		// Frame-quantum duration tolerance: permits container/timestamp
-		// rounding (~2.5 frames) but does not let a rate disagreement scale
-		// with clip length — a relative % would let a long clip drift by
-		// minutes, silently retiming it.
-		fps := ratFloat(rv)
-		candidateDur := float64(frames) / fps
-		if math.Abs(candidateDur-dur) > math.Max(0.01, 2.5/fps) {
-			return "", nil
+	for _, cand := range []string{avg, r} {
+		v, err := parseRatAllowZero(cand)
+		if err != nil || v == nil {
+			continue
 		}
+		if frames > 0 && dur > 0 {
+			// Frame-quantum duration tolerance: permits container/timestamp
+			// rounding (~2.5 frames) but does not let a rate disagreement
+			// scale with clip length — a relative % would let a long clip
+			// drift by minutes, silently retiming it.
+			fps := ratFloat(v)
+			if math.Abs(float64(frames)/fps-dur) > math.Max(0.01, 2.5/fps) {
+				continue
+			}
+		}
+		return cand, v
 	}
-	return r, rv
+	return "", nil
 }
 
 func metadataFrameCountTrusted(codec string) bool {
@@ -2569,6 +2636,13 @@ func probeMedia(ffprobe, path string, count bool) (MediaInfo, error) {
 		framesForCorrob = 0
 	}
 	fpsStr, fpsRat := selectFrameRate(sv.AvgFrameRate, sv.RFrameRate, framesForCorrob, dur)
+	if fpsRat == nil && framesForCorrob > 0 && dur > 0 && (validRate(sv.AvgFrameRate) || validRate(sv.RFrameRate)) {
+		// A rate existed but trusted count/duration impeached it — the
+		// metadata is inconsistent without saying which field lied, so the
+		// duration is suspect too. Clearing it keeps verification from
+		// comparing honest passthrough timing against a stale expectation.
+		dur = 0
+	}
 	fpsFloat := 0.0
 	if fpsRat != nil {
 		fpsFloat = ratFloat(fpsRat)
@@ -3283,16 +3357,6 @@ func nativeXvidArgs(info MediaInfo, req ConvertOptions, tmpVideo string, target 
 	return xargs
 }
 
-func parseXvidProgressLine(line string) (frames int64, percent float64, fps string, ok bool) {
-	var n int64
-	var pct int
-	var rate float64
-	if _, err := fmt.Sscanf(strings.TrimSpace(line), "%d frames(%d%%) encoded, %f fps,", &n, &pct, &rate); err != nil {
-		return 0, 0, "", false
-	}
-	return n, math.Max(0, math.Min(1, float64(pct)/100)), fmt.Sprintf("%.2f", rate), true
-}
-
 type mpeg4VOPCounter struct {
 	offset int64
 	carry  []byte
@@ -3694,7 +3758,7 @@ func verifyOutput(in, out MediaInfo, opts ConvertOptions, expected *big.Rat, exp
 
 func verify(in, out MediaInfo, expected *big.Rat, expectedDur float64) []string {
 	p := []string{}
-	if in.FrameCount > 0 && out.FrameCount > 0 && in.FrameCount != out.FrameCount {
+	if in.FrameCount > 0 && in.FrameCount != out.FrameCount {
 		p = append(p, fmt.Sprintf("frame count mismatch: %d input vs %d output", in.FrameCount, out.FrameCount))
 	}
 	if expected != nil && out.FPSFloat > 0 {
