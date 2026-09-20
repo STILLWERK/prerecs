@@ -2415,11 +2415,14 @@ func askYesNo(label string, def bool) (bool, error) {
 	}
 }
 
+// consoleSGR lists every SGR sequence the theme emits. Anything else carrying
+// ESC into a console sink came from untrusted text.
+var consoleSGR = []string{"\x1b[0m", "\x1b[1m", "\x1b[2m", "\x1b[31m", "\x1b[32m", "\x1b[33m", "\x1b[36m"}
+
 // safeConsoleText strips terminal control bytes from untrusted strings —
-// filenames, FFmpeg/ffprobe messages — while preserving SGR (ESC[...m)
-// sequences: callers hand the console sinks pre-styled theme output, and
-// foreign SGR can only change colors. Erase, cursor, and OSC sequences lose
-// their ESC and print as inert text.
+// filenames, FFmpeg/ffprobe messages — while preserving the theme's own SGR
+// styling. Foreign attributes (conceal, blink, 256-color) and every other
+// escape sequence lose their ESC and print as inert text.
 func safeConsoleText(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -2427,15 +2430,12 @@ func safeConsoleText(s string) string {
 	for i := 0; i < len(rs); i++ {
 		r := rs[i]
 		if r == '\x1b' {
-			if j := i + 1; j < len(rs) && rs[j] == '[' {
-				k := j + 1
-				for k < len(rs) && (rs[k] == ';' || (rs[k] >= '0' && rs[k] <= '9')) {
-					k++
-				}
-				if k < len(rs) && rs[k] == 'm' {
-					b.WriteString(string(rs[i : k+1]))
-					i = k
-					continue
+			rest := string(rs[i:])
+			for _, sgr := range consoleSGR {
+				if strings.HasPrefix(rest, sgr) {
+					b.WriteString(sgr)
+					i += len(sgr) - 1 // ASCII-only: rune count == byte count
+					break
 				}
 			}
 			continue

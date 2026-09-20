@@ -994,11 +994,15 @@ func TestSafeConsoleTextStripsControlBytes(t *testing.T) {
 	if want := "evil[2K]0;pwnedname\nsecond line"; got != want {
 		t.Fatalf("got %q want %q", got, want)
 	}
-	// SGR survives: reporters receive pre-styled theme output, and a
-	// color-only sequence cannot move the cursor or rewrite output.
+	// The theme's own SGR survives: reporters receive pre-styled output, and
+	// these codes can only change colors.
 	styled := "\x1b[32mVERIFIED\x1b[0m \x1b[2mdone\x1b[0m"
 	if got := safeConsoleText(styled); got != styled {
 		t.Fatalf("SGR styling must be preserved, got %q", got)
+	}
+	// Foreign SGR — conceal, blink, 256-color — and non-SGR escapes drop.
+	if got := safeConsoleText("pre\x1b[8mconcealed\x1b[5mblink\x1b[38;5;9mred"); got != "pre[8mconcealed[5mblink[38;5;9mred" {
+		t.Fatalf("foreign SGR should be inert, got %q", got)
 	}
 	if got := safeConsoleText("\x1b[2J\x1b[H\x1b]0;t\x07x"); got != "[2J[H]0;tx" {
 		t.Fatalf("non-SGR escapes should drop their ESC byte, got %q", got)
