@@ -24,7 +24,7 @@ import (
 	"unicode"
 )
 
-const version = "1.0.2"
+const version = "1.0.3"
 
 var supportedExt = map[string]bool{
 	".avi": true, ".mp4": true, ".m4v": true, ".mov": true, ".mkv": true,

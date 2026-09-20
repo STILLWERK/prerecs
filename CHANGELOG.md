@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.0.3 — Robustness and polish patch
 
 - New `--no-native-xvid` option bypasses the `xvid_encraw` path entirely, so a machine whose native encoder fails verification can still convert through FFmpeg libxvid.
 - `--preset` for ProRes, MagicYUV, and Ut Video now fails once during option collection when the required FFmpeg encoder or MagicYUV installation is missing, instead of failing every item mid-batch.
