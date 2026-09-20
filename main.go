@@ -181,7 +181,7 @@ func main() {
 		return
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, safeConsoleText(err.Error()))
+		fmt.Fprintln(os.Stderr, strictConsoleText(err.Error()))
 		printUsage()
 		os.Exit(2)
 	}
@@ -198,7 +198,7 @@ func main() {
 
 	caps, enc, err := detectCapabilities()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, ui.red("Error: ")+safeConsoleText(err.Error()))
+		fmt.Fprintln(os.Stderr, ui.red("Error: ")+strictConsoleText(err.Error()))
 		pauseIfDoubleClicked()
 		os.Exit(1)
 	}
@@ -216,7 +216,7 @@ func main() {
 				}
 				return
 			}
-			fmt.Fprintln(os.Stderr, ui.red("Error: ")+safeConsoleText(err.Error()))
+			fmt.Fprintln(os.Stderr, ui.red("Error: ")+strictConsoleText(err.Error()))
 			if cfg.yes {
 				os.Exit(1)
 			}
@@ -256,7 +256,7 @@ func main() {
 				}
 				return
 			}
-			fmt.Fprintln(os.Stderr, ui.red("Error: ")+safeConsoleText(err.Error()))
+			fmt.Fprintln(os.Stderr, ui.red("Error: ")+strictConsoleText(err.Error()))
 			if cfg.yes {
 				os.Exit(1)
 			}
@@ -313,7 +313,7 @@ func main() {
 				if result.LastOutputDir == "" {
 					fmt.Println(ui.dim("  No output folder was created in the last job."))
 				} else if err := openFolder(result.LastOutputDir); err != nil {
-					fmt.Println(ui.yellow("  Could not open folder: ") + safeConsoleText(err.Error()))
+					fmt.Println(ui.yellow("  Could not open folder: ") + strictConsoleText(err.Error()))
 				}
 			case "3":
 				return
@@ -375,12 +375,12 @@ func analyzeInputs(ffprobe string, paths []string, ui theme) ([]MediaInfo, int) 
 	inputFailures := 0
 	fmt.Println(ui.bold("ANALYZING") + ui.dim("  metadata only"))
 	for i, p := range paths {
-		fmt.Printf("  [%d/%d] %s ... ", i+1, len(paths), safeConsoleText(filepath.Base(p)))
+		fmt.Printf("  [%d/%d] %s ... ", i+1, len(paths), strictConsoleText(filepath.Base(p)))
 		info, err := probeMedia(ffprobe, p, false)
 		if err != nil {
 			inputFailures++
 			fmt.Println(ui.red("FAILED"))
-			fmt.Println("      " + safeConsoleText(err.Error()))
+			fmt.Println("      " + strictConsoleText(err.Error()))
 			continue
 		}
 		infos = append(infos, info)
@@ -570,7 +570,7 @@ func printHeader(ui theme, caps Capabilities, noNativeXvid bool) {
 	if caps.HasProResVulkan {
 		fmt.Println(ui.dim("  ProRes Vulkan GPU fast path available (experimental; automatic CPU fallback)"))
 	}
-	fmt.Printf("  %s\n\n", ui.dim(safeConsoleText(shortFFmpeg(caps.Version))))
+	fmt.Printf("  %s\n\n", ui.dim(strictConsoleText(shortFFmpeg(caps.Version))))
 }
 
 func shortFFmpeg(v string) string {
@@ -942,7 +942,7 @@ func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (Conv
 				fmt.Println(ui.bold("SHARE SOURCE CHECK"))
 				fmt.Println(ui.yellow("  Some inputs are already distribution-compressed:"))
 				for _, in := range compressed {
-					fmt.Printf("    - %s (%s, %s)\n", safeConsoleText(filepath.Base(in.Path)), strings.ToUpper(in.Codec), humanBytes(in.SizeBytes))
+					fmt.Printf("    - %s (%s, %s)\n", strictConsoleText(filepath.Base(in.Path)), strictConsoleText(strings.ToUpper(in.Codec)), humanBytes(in.SizeBytes))
 				}
 				fmt.Println(ui.dim("  Xvid cannot restore lost detail and may become much larger than the source."))
 				fmt.Println("  1. Skip these files / keep originals " + ui.green("recommended"))
@@ -1087,7 +1087,7 @@ func incompatibleAudioCopies(preset string, infos []MediaInfo) []string {
 			if audioCopyCompatible(preset, a) {
 				continue
 			}
-			label := safeConsoleText(filepath.Base(in.Path)) + "=" + strings.ToUpper(a)
+			label := strictConsoleText(filepath.Base(in.Path)) + "=" + strictConsoleText(strings.ToUpper(a))
 			if !seen[label] {
 				seen[label] = true
 				bad = append(bad, label)
@@ -1213,7 +1213,7 @@ func xvidAvailableForInputs(caps Capabilities, infos []MediaInfo, skipCompressed
 		if caps.HasLibXvid {
 			continue
 		}
-		missing = append(missing, safeConsoleText(filepath.Base(in.Path)))
+		missing = append(missing, strictConsoleText(filepath.Base(in.Path)))
 	}
 	return len(missing) == 0, missing
 }
@@ -1281,7 +1281,7 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 				continue
 			}
 			if err := validatePresetInputs("prores_lt", infos); err != nil {
-				fmt.Println(ui.yellow("  " + safeConsoleText(err.Error())))
+				fmt.Println(ui.yellow("  " + strictConsoleText(err.Error())))
 				fmt.Println()
 				continue
 			}
@@ -1290,7 +1290,7 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 			if !(e.caps.HasMagicYUV && e.caps.MagicInstalled && magicCompatible) {
 				fmt.Println(ui.yellow("  MagicYUV is not available. Install/licence MagicYUV and use an FFmpeg build with the encoder."))
 				if err := validatePresetInputs("magicyuv_lossless", infos); err != nil {
-					fmt.Println(ui.yellow("  " + safeConsoleText(err.Error())))
+					fmt.Println(ui.yellow("  " + strictConsoleText(err.Error())))
 				}
 				fmt.Println()
 				continue
@@ -1320,7 +1320,7 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 			case "1":
 				if e.caps.HasProRes {
 					if err := validatePresetInputs("prores_422", infos); err != nil {
-						fmt.Println(ui.yellow("  " + safeConsoleText(err.Error())))
+						fmt.Println(ui.yellow("  " + strictConsoleText(err.Error())))
 						fmt.Println()
 						continue
 					}
@@ -1331,7 +1331,7 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 			case "2":
 				if e.caps.HasProRes {
 					if err := validatePresetInputs("prores_hq", infos); err != nil {
-						fmt.Println(ui.yellow("  " + safeConsoleText(err.Error())))
+						fmt.Println(ui.yellow("  " + strictConsoleText(err.Error())))
 						fmt.Println()
 						continue
 					}
@@ -1392,7 +1392,7 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 				if !e.caps.HasUtVideo {
 					fmt.Println(ui.yellow("  FFmpeg build does not include the Ut Video encoder."))
 				} else if err := validatePresetInputs("utvideo_lossless", infos); err != nil {
-					fmt.Println(ui.yellow("  " + safeConsoleText(err.Error())))
+					fmt.Println(ui.yellow("  " + strictConsoleText(err.Error())))
 				}
 				fmt.Println()
 			}
@@ -1441,7 +1441,7 @@ func printPlan(ui theme, infos []MediaInfo, opts ConvertOptions) {
 	if opts.OutputDir == "" {
 		fmt.Println("  Output:  converted_prerecs beside each source")
 	} else {
-		fmt.Printf("  Output:  %s\n", safeConsoleText(opts.OutputDir))
+		fmt.Printf("  Output:  %s\n", strictConsoleText(opts.OutputDir))
 	}
 	skipped := 0
 	if isXvidPreset(opts.Preset) && opts.SkipCompressed && !opts.ForceXvid {
@@ -1543,7 +1543,7 @@ func reconcileScannedInput(info *MediaInfo, count int64, ui theme, rep itemRepor
 	info.FrameCount = count
 	info.FrameCountExact = true
 	if _, rat := selectFrameRate("", info.FPS, count, info.Duration); rat == nil && info.FPS != "" {
-		rep.line(ui.yellow(fmt.Sprintf("Container frame rate %s does not match the decoded stream; preserving source timing.", info.FPS)))
+		rep.line(ui.yellow(fmt.Sprintf("Container frame rate %s does not match the decoded stream; preserving source timing.", strictConsoleText(info.FPS))))
 		// Disagreement proves the metadata is inconsistent but not which field
 		// is stale — Duration could be the liar just as well. Keep it and
 		// verification would compare honest passthrough timing against a
@@ -1612,7 +1612,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	if err != nil {
 		item.Status = "failed"
 		item.Message = err.Error()
-		rep.line(ui.red("FAILED") + " " + err.Error())
+		rep.line(ui.red("FAILED") + " " + strictConsoleText(err.Error()))
 		return item
 	}
 	if len(existing) > 0 {
@@ -1624,15 +1624,15 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 				if statErr != nil || (srcStat != nil && candStat.ModTime().Before(srcStat.ModTime())) {
 					continue
 				}
-				rep.line(fmt.Sprintf("Existing output detected: %s", filepath.Base(cand)))
+				rep.line(fmt.Sprintf("Existing output detected: %s", strictConsoleText(filepath.Base(cand))))
 				rep.line("Checking it before deciding whether to re-encode...")
 				outInfo, probeErr := probeMedia(e.caps.FFprobe, cand, false)
 				if probeErr != nil {
-					rep.line(ui.dim("Rejected: metadata probe failed: " + probeErr.Error()))
+					rep.line(ui.dim("Rejected: metadata probe failed: " + strictConsoleText(probeErr.Error())))
 					continue
 				}
 				if !presetCodecMatches(opts.Preset, outInfo) {
-					rep.line(ui.dim(fmt.Sprintf("Rejected: codec is %s/%s, expected %s", outInfo.Codec, outInfo.CodecTag, presetLabel(opts.Preset))))
+					rep.line(ui.dim(fmt.Sprintf("Rejected: codec is %s/%s, expected %s", strictConsoleText(outInfo.Codec), strictConsoleText(outInfo.CodecTag), presetLabel(opts.Preset))))
 					continue
 				}
 				checkStarted := time.Now()
@@ -1647,12 +1647,12 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 						rep.line(ui.yellow("OUTPUT CHECK CANCELLED"))
 						rep.line(indentError(decodeErr.Error(), 2))
 						if relErr := releaseOutputReservation(out); relErr != nil {
-							rep.line(ui.yellow("WARNING: could not release reserved output name: " + relErr.Error()))
+							rep.line(ui.yellow("WARNING: could not release reserved output name: " + strictConsoleText(relErr.Error())))
 						}
 						item.Status = "cancelled"
 						return item
 					}
-					rep.line(ui.dim("Rejected: full decode check failed: " + decodeErr.Error()))
+					rep.line(ui.dim("Rejected: full decode check failed: " + strictConsoleText(decodeErr.Error())))
 					continue
 				}
 				outInfo.FrameCount = decoded
@@ -1665,7 +1665,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 					item.Backend = "existing verified output"
 					item.Message = "existing output already verified"
 					if relErr := releaseOutputReservation(out); relErr != nil {
-						msg := "cleanup failed: " + relErr.Error()
+						msg := "cleanup failed: " + strictConsoleText(relErr.Error())
 						rep.line(ui.yellow("WARNING: " + msg))
 						item.Message += "; " + msg
 					}
@@ -1673,7 +1673,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 					rep.line(fmt.Sprintf("Frames: %d -> %d   Size: %s -> %s", info.FrameCount, outInfo.FrameCount, humanBytes(info.SizeBytes), humanBytes(outInfo.SizeBytes)))
 					return item
 				}
-				rep.line(ui.dim("Rejected: " + strings.Join(problems, "; ")))
+				rep.line(ui.dim("Rejected: " + strictConsoleText(strings.Join(problems, "; "))))
 			}
 			rep.line(ui.yellow("Existing output was stale or did not validate; preserving it and writing a numbered copy."))
 		}
@@ -1686,7 +1686,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	// masquerading under a canonical name.
 	removeOut := func() {
 		if rmErr := os.Remove(out); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-			msg := "cleanup failed: " + rmErr.Error()
+			msg := "cleanup failed: " + strictConsoleText(rmErr.Error())
 			rep.line(ui.yellow("WARNING: " + msg))
 			if item.Message != "" {
 				item.Message += "; " + msg
@@ -1706,7 +1706,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		if preflightErr != nil {
 			usedNative = false
 			rep.line(ui.yellow("Native Xvid preflight could not validate the AVI; using FFmpeg libxvid."))
-			rep.line(ui.dim(preflightErr.Error()))
+			rep.line(ui.dim(strictConsoleText(preflightErr.Error())))
 		} else if !ok {
 			usedNative = false
 			rep.line(ui.yellow("Native Xvid preflight: Windows VfW cannot decode the final source frame; using FFmpeg libxvid."))
@@ -1743,7 +1743,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		if err != nil && e.enc["libxvid"] && ctx.Err() == nil {
 			rep.finish()
 			rep.line(ui.yellow("Native Xvid failed its frame-integrity check; retrying with FFmpeg libxvid."))
-			rep.line(ui.dim(err.Error()))
+			rep.line(ui.dim(strictConsoleText(err.Error())))
 			// Keep `out` occupied: it is the O_EXCL reservation guarding this
 			// destination against concurrent same-stem runs. Removing it here
 			// would briefly release the reservation before the fallback encode;
@@ -1782,7 +1782,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		if err != nil && e.caps.HasProRes && ctx.Err() == nil {
 			rep.finish()
 			rep.line(ui.yellow("Vulkan ProRes failed; retrying with CPU prores_ks."))
-			rep.line(ui.dim(err.Error()))
+			rep.line(ui.dim(strictConsoleText(err.Error())))
 			// Same reservation rule: `out` must stay occupied through the
 			// backend switch; ffmpeg -y truncates whatever the GPU attempt left.
 			item.Backend = "CPU prores_ks fallback"
@@ -1909,7 +1909,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 			rep.line(indentError(scanErr.Error(), 2))
 			return item
 		case scanErr != nil:
-			rep.line(ui.dim("Source rescan failed: " + scanErr.Error()))
+			rep.line(ui.dim("Source rescan failed: " + strictConsoleText(scanErr.Error())))
 		case count != info.FrameCount:
 			rep.line(ui.yellow(fmt.Sprintf("Container frame count %d was stale; the source actually decodes %d frames — re-verifying against the decoded count.", info.FrameCount, count)))
 			reconcileScannedInput(&info, count, ui, rep)
@@ -1922,7 +1922,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 				// conform built on the stale rate) and the expectations can
 				// no longer be recomputed — the timeline cannot be verified,
 				// so the rescue must fail rather than weaken the checks.
-				problems = append(problems, "timing cannot be verified after correcting stale metadata: "+terr.Error())
+				problems = append(problems, "timing cannot be verified after correcting stale metadata: "+strictConsoleText(terr.Error()))
 			}
 		}
 	}
@@ -1933,7 +1933,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		removeOut()
 		rep.line(ui.red("VERIFY FAILED"))
 		for _, problem := range problems {
-			rep.line("- " + problem)
+			rep.line("- " + strictConsoleText(problem))
 		}
 		return item
 	}
@@ -1948,7 +1948,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		}
 		rep.line(msg)
 	}
-	rep.line("Output: " + out)
+	rep.line("Output: " + strictConsoleText(out))
 	return item
 }
 
@@ -2082,7 +2082,7 @@ func runBatch(ctx context.Context, ui theme, e *Engine, infos []MediaInfo, opts 
 			if ctx.Err() != nil {
 				break
 			}
-			fmt.Printf("\n  [%d/%d] %s\n", i+1, len(infos), safeConsoleText(filepath.Base(info.Path)))
+			fmt.Printf("\n  [%d/%d] %s\n", i+1, len(infos), strictConsoleText(filepath.Base(info.Path)))
 			item := processItem(ctx, ui, e, info, opts, sequentialReporter(ui))
 			addBatchItem(&result, item)
 		}
@@ -2180,7 +2180,7 @@ func printBatchSummary(ui theme, result BatchResult, cancelled error) {
 			fmt.Println()
 			fmt.Printf("     %s\n", ui.dim(item.Backend))
 		case "skipped":
-			fmt.Printf("  %s %-28s  %s\n", ui.yellow("SKIP"), clipName(name, 28), safeConsoleText(item.Message))
+			fmt.Printf("  %s %-28s  %s\n", ui.yellow("SKIP"), clipName(name, 28), strictConsoleText(item.Message))
 		case "failed":
 			fmt.Printf("  %s %-28s  %s\n", ui.red("FAIL"), clipName(name, 28), conciseError(item.Message, 70))
 		}
@@ -2447,8 +2447,41 @@ func safeConsoleText(s string) string {
 	return b.String()
 }
 
+// strictConsoleText strips every terminal escape and non-print byte from
+// untrusted text — filenames, probed metadata, FFmpeg/ffprobe messages —
+// before it is composed into styled output. Unlike safeConsoleText it trusts
+// no SGR: theme styling is only ever applied around sanitized fragments,
+// never accepted from inside them, so a hostile name cannot spoof the theme.
+func strictConsoleText(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	rs := []rune(s)
+	for i := 0; i < len(rs); i++ {
+		r := rs[i]
+		if r == '\x1b' {
+			// Consume the sequence instead of leaving "[32m" residue: CSI runs
+			// ESC [ … to a 0x40–0x7e final byte; OSC runs ESC ] … to BEL or ST.
+			if i+1 < len(rs) && rs[i+1] == '[' {
+				for i += 2; i < len(rs) && (rs[i] < 0x40 || rs[i] > 0x7e); i++ {
+				}
+			} else if i+1 < len(rs) && rs[i+1] == ']' {
+				for i += 2; i < len(rs) && rs[i] != '\x07' && !(rs[i] == '\x1b' && i+1 < len(rs) && rs[i+1] == '\\'); i++ {
+				}
+				if i < len(rs) && rs[i] == '\x1b' {
+					i++ // ST is two bytes; the loop's i++ passes the backslash
+				}
+			}
+			continue
+		}
+		if r == '\n' || unicode.IsPrint(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func clipName(s string, n int) string {
-	s = safeConsoleText(s)
+	s = strictConsoleText(s)
 	if len(s) <= n {
 		return s
 	}
@@ -2463,7 +2496,7 @@ func conciseError(s string, n int) string {
 }
 func indentError(s string, n int) string {
 	pad := strings.Repeat(" ", n)
-	lines := strings.Split(strings.TrimSpace(safeConsoleText(s)), "\n")
+	lines := strings.Split(strings.TrimSpace(strictConsoleText(s)), "\n")
 	if len(lines) > 8 {
 		lines = append(lines[:8], "...")
 	}

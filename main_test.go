@@ -1009,6 +1009,26 @@ func TestSafeConsoleTextStripsControlBytes(t *testing.T) {
 	}
 }
 
+// Untrusted fragments (filenames, probed metadata, tool errors) are sanitized
+// before styling is composed around them: even a theme code like \x1b[32m must
+// not survive inside untrusted text, or a filename could recolor/reset the
+// status output that follows it.
+func TestStrictConsoleTextStripsAllEscapes(t *testing.T) {
+	cases := map[string]string{
+		"evil\x1b[32mVERIFIED\x1b[0m.avi":   "evilVERIFIED.avi",
+		"clip\x1b[8m\x1b[0m.mov":            "clip.mov",
+		"pre\x1b[38;5;9mred\x1b[2Kpost.mkv": "preredpost.mkv",
+		"ti\x1b]0;pwned\x07tle.mp4":         "title.mp4",
+		"os\x1b]0;pwned\x1b\\c.mp4":         "osc.mp4",
+		"plain\x00name\rline\nnext.avi":     "plainnameline\nnext.avi",
+	}
+	for in, want := range cases {
+		if got := strictConsoleText(in); got != want {
+			t.Fatalf("strictConsoleText(%q)=%q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestHasAlphaRecognizesPackedARGBFormats(t *testing.T) {
 	for _, pixFmt := range []string{"rgba", "bgra", "argb", "abgr", "yuva420p", "yuva444p", "gbrap", "gbraf16le", "ya8", "ya16le", "ya16be", "v408", "vuya", "uyva", "ayuv", "ayuv64le", "y410le", "y412le", "y416le", "pal8"} {
 		if !hasAlpha(pixFmt) {
