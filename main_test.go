@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -2453,10 +2454,26 @@ func TestSelectFrameRate(t *testing.T) {
 	if s, r := selectFrameRate("0/0", "30/1", 300, 10.0); s != "30/1" || r == nil {
 		t.Fatalf("consistent metadata accepts fallback: %s %v", s, r)
 	}
+	// Container rounding within ~2.5 frames still passes.
+	if s, r := selectFrameRate("0/0", "30/1", 300, 10.05); s != "30/1" || r == nil {
+		t.Fatalf("rounded duration accepts fallback: %s %v", s, r)
+	}
 	// VFR hazard: 300 frames over 20s means a true 15 fps average — a nominal
 	// r_frame_rate of 30 must not be trusted to rebuild the timeline.
 	if s, r := selectFrameRate("0/0", "30/1", 300, 20.0); s != "" || r != nil {
 		t.Fatalf("inconsistent r_frame_rate rejected: %s %v", s, r)
+	}
+	// Adversarial: 295 frames over 10s is a true 29.5 fps average. A relative
+	// 2% rate tolerance would accept 30 fps and silently retime 1.67%; the
+	// frame-quantum duration tolerance must reject it.
+	if s, r := selectFrameRate("0/0", "30/1", 295, 10.0); s != "" || r != nil {
+		t.Fatalf("sub-2%% fps drift must be rejected: %s %v", s, r)
+	}
+	// Long clips: a relative tolerance would scale the permitted drift with
+	// duration; the quantum tolerance stays constant. 1h at nominal 30 fps
+	// but real 29.5 fps must still reject.
+	if s, r := selectFrameRate("0/0", "30/1", 106200, 3600.0); s != "" || r != nil {
+		t.Fatalf("long-clip drift must be rejected: %s %v", s, r)
 	}
 }
 
@@ -2494,6 +2511,8 @@ func TestWantsHelp(t *testing.T) {
 		{"h after terminator is a path", []string{"--", "-h"}, false},
 		{"terminator consumed as option value", []string{"--output", "--", "--help", "clip.avi"}, true},
 		{"terminator consumed as preset value", []string{"--preset", "--", "-h"}, true},
+		{"help consumed as option value", []string{"--output", "--help", "clip.avi"}, false},
+		{"h consumed as preset value", []string{"--preset", "-h", "clip.avi"}, false},
 		{"positional named like an option", []string{"output", "--", "--help"}, false},
 		{"no help", []string{"file.avi", "--yes"}, false},
 		{"empty", nil, false},
@@ -2503,5 +2522,63 @@ func TestWantsHelp(t *testing.T) {
 				t.Fatalf("wantsHelp(%v)=%v, want %v", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestMainYesEOFNonzero runs the real main() in a helper process: with --yes,
+// a valid source, no --preset, and stdin at EOF, the required preset selection
+// cannot complete. Automation must not read "did nothing" as success — the
+// process must exit nonzero.
+func TestMainYesEOFNonzero(t *testing.T) {
+	if os.Getenv("PRERECS_MAIN_HELPER") == "1" {
+		var helperArgs []string
+		if err := json.Unmarshal([]byte(os.Getenv("PRERECS_MAIN_ARGS")), &helperArgs); err != nil {
+			os.Exit(70)
+		}
+		os.Args = append([]string{"prerecs"}, helperArgs...)
+		main()
+		return
+	}
+	caps, enc, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	if !enc["ffv1"] {
+		t.Skip("ffv1 encoder unavailable")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "in.avi")
+	if b, err := exec.Command(caps.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=64x64:rate=30",
+		"-frames:v", "3", "-c:v", "ffv1", src,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("fixture encode: %v %s", err, b)
+	}
+
+	run := func(args ...string) int {
+		payload, _ := json.Marshal(args)
+		cmd := exec.Command(os.Args[0], "-test.run=^TestMainYesEOFNonzero$")
+		cmd.Env = append(os.Environ(),
+			"PRERECS_MAIN_HELPER=1",
+			"PRERECS_MAIN_ARGS="+string(payload),
+		)
+		cmd.Stdin = strings.NewReader("") // immediate EOF
+		err := cmd.Run()
+		if err == nil {
+			return 0
+		}
+		if ee, ok := err.(*exec.ExitError); ok {
+			return ee.ExitCode()
+		}
+		t.Fatalf("helper run failed: %v", err)
+		return -1
+	}
+
+	if code := run("--yes"); code == 0 {
+		t.Fatal("--yes with no input and EOF exited 0")
+	}
+	if code := run("--yes", src); code == 0 {
+		t.Fatal("--yes with a file but no preset selection exited 0 on EOF")
 	}
 }

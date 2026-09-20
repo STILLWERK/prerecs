@@ -240,6 +240,13 @@ func main() {
 		opts, err := collectOptions(cfg, ui, engine, infos)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				// Interactive EOF (Ctrl+D) exits quietly. Under --yes an
+				// automation run that never got its required input must not
+				// report success for zero work.
+				if code := missingInputExitCode(cfg); code != 0 {
+					fmt.Fprintln(os.Stderr, ui.red("Error: ")+"required input missing and stdin reached EOF")
+					os.Exit(code)
+				}
 				return
 			}
 			fmt.Fprintln(os.Stderr, ui.red("Error: ")+err.Error())
@@ -434,19 +441,18 @@ func reorderArgs(args []string) ([]string, error) {
 func wantsHelp(args []string) bool {
 	expectValue := false
 	for _, a := range args {
+		// A pending value consumes the token verbatim — even one that looks
+		// like -h/--help/-- — matching how reorderArgs and flag.Parse treat
+		// string-flag arguments.
+		if expectValue {
+			expectValue = false
+			continue
+		}
 		if a == "--" {
-			if expectValue {
-				expectValue = false
-				continue
-			}
 			return false
 		}
 		if a == "-h" || a == "--help" {
 			return true
-		}
-		if expectValue {
-			expectValue = false
-			continue
 		}
 		if len(a) > 1 && a[0] == '-' {
 			name := strings.TrimLeft(a, "-")
@@ -1491,10 +1497,12 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		if info.FPSFromFallback {
 			// The scan produced a trusted frame count; re-evaluate the
 			// lower-trust r_frame_rate guess against it before it can drive
-			// the constant-rate timeline rebuild below.
+			// the constant-rate timeline rebuild below. Once corroborated it
+			// is no longer a fallback.
 			if _, rat := selectFrameRate("", info.FPS, count, info.Duration); rat == nil {
-				info.FPS, info.FPSFloat, info.FPSFromFallback = "", 0, false
+				info.FPS, info.FPSFloat = "", 0
 			}
+			info.FPSFromFallback = false
 		}
 		if info.FPSFloat > 0 {
 			info.Duration = float64(count) / info.FPSFloat
@@ -1574,6 +1582,20 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	}
 	item.Output = out
 
+	// removeOut deletes the file this run produced. A failed removal is
+	// surfaced rather than swallowed: on Windows a transient lock can refuse
+	// the delete, and silently leaving the file would let a bad output keep
+	// masquerading under a canonical name.
+	removeOut := func() {
+		if rmErr := os.Remove(out); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			msg := "cleanup failed: " + rmErr.Error()
+			rep.line(ui.yellow("WARNING: " + msg))
+			if item.Message != "" {
+				item.Message += "; " + msg
+			}
+		}
+	}
+
 	started := time.Now()
 	var expectedFPS *big.Rat
 	var expectedDur float64
@@ -1612,7 +1634,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 			rep.finish()
 			rep.line(ui.yellow("Native Xvid failed its frame-integrity check; retrying with FFmpeg libxvid."))
 			rep.line(ui.dim(err.Error()))
-			_ = os.Remove(out)
+			removeOut()
 			if opts.Preset == "xvid_max_q2" {
 				item.Backend = "FFmpeg libxvid Share fallback (strict Q2 full RD/B0)"
 			} else if opts.Preset == "xvid_efficient_q2" {
@@ -1648,7 +1670,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 			rep.finish()
 			rep.line(ui.yellow("Vulkan ProRes failed; retrying with CPU prores_ks."))
 			rep.line(ui.dim(err.Error()))
-			_ = os.Remove(out)
+			removeOut()
 			item.Backend = "CPU prores_ks fallback"
 			args, expectedFPS, expectedDur, err = e.buildCommand(info, opts, out)
 			if err == nil {
@@ -1689,7 +1711,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	rep.finish()
 
 	if err != nil {
-		_ = os.Remove(out)
+		removeOut()
 		item.Elapsed = time.Since(started)
 		if errors.Is(err, context.Canceled) {
 			item.Status = "cancelled"
@@ -1708,7 +1730,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	// still preserved deliberately in the reuse check above.)
 	outInfo, err := probeMedia(e.caps.FFprobe, out, false)
 	if err != nil {
-		_ = os.Remove(out)
+		removeOut()
 		item.Elapsed = time.Since(started)
 		item.Status = "failed"
 		item.Message = err.Error()
@@ -1733,7 +1755,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 			// run can re-check and reuse it instead of discarding the work.
 			rep.line(ui.yellow("VERIFY DECODE CANCELLED"))
 		} else {
-			_ = os.Remove(out)
+			removeOut()
 			rep.line(ui.red("VERIFY DECODE FAILED"))
 		}
 		rep.line(indentError(err.Error(), 2))
@@ -1744,7 +1766,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	item.OutputInfo = outInfo
 	problems := verifyOutput(info, outInfo, opts, expectedFPS, expectedDur)
 	if len(problems) > 0 {
-		_ = os.Remove(out)
+		removeOut()
 		item.Elapsed = time.Since(started)
 		item.Status = "failed"
 		item.Message = strings.Join(problems, "; ")
@@ -2413,8 +2435,13 @@ func selectFrameRate(avg, r string, frames int64, dur float64) (string, *big.Rat
 		return "", nil
 	}
 	if frames > 0 && dur > 0 {
-		implied := float64(frames) / dur
-		if math.Abs(implied-ratFloat(rv)) > 0.02*ratFloat(rv) {
+		// Frame-quantum duration tolerance: permits container/timestamp
+		// rounding (~2.5 frames) but does not let a rate disagreement scale
+		// with clip length — a relative % would let a long clip drift by
+		// minutes, silently retiming it.
+		fps := ratFloat(rv)
+		candidateDur := float64(frames) / fps
+		if math.Abs(candidateDur-dur) > math.Max(0.01, 2.5/fps) {
 			return "", nil
 		}
 	}
@@ -3302,6 +3329,13 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 		select {
 		case <-ctx.Done():
 			waitErr = ctx.Err()
+			// CommandContext kills the child, but wait for the Wait goroutine
+			// to reap it so the .m4v handle is released before the deferred
+			// Remove — Windows cannot unlink a file a process still holds.
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+			}
 			finished = true
 		case err := <-done:
 			waitErr = err
