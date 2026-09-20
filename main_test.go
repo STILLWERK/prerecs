@@ -1029,6 +1029,38 @@ func TestStrictConsoleTextStripsAllEscapes(t *testing.T) {
 	}
 }
 
+// A stderr line longer than the bufio buffer must not end the drain:
+// ReadSlice reports ErrBufferFull per fragment, and bailing out leaves FFmpeg
+// blocked on a full pipe forever.
+func TestRunFFmpegDrainsOverlongStderrLine(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake ffmpeg is a shell script")
+	}
+	td := t.TempDir()
+	fake := filepath.Join(td, "ffmpeg")
+	script := "#!/bin/sh\nhead -c 262144 /dev/zero | tr '\\0' 'x' 1>&2\nexit 1\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{caps: Capabilities{FFmpeg: fake}}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := e.runFFmpeg(ctx, []string{"-i", "in"}, 0, func(progressInfo) {})
+	if err == nil {
+		t.Fatal("expected nonzero-exit error")
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("runFFmpeg did not drain stderr before the 15s timeout (deadlock)")
+	}
+	if time.Since(start) > 10*time.Second {
+		t.Fatalf("drain took %s", time.Since(start))
+	}
+	if len(err.Error()) > 33000 {
+		t.Fatalf("error buffer not bounded: %d bytes", len(err.Error()))
+	}
+}
+
 func TestHasAlphaRecognizesPackedARGBFormats(t *testing.T) {
 	for _, pixFmt := range []string{"rgba", "bgra", "argb", "abgr", "yuva420p", "yuva444p", "gbrap", "gbraf16le", "ya8", "ya16le", "ya16be", "v408", "vuya", "uyva", "ayuv", "ayuv64le", "y410le", "y412le", "y416le", "pal8"} {
 		if !hasAlpha(pixFmt) {

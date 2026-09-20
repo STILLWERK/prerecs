@@ -3367,7 +3367,9 @@ func (e *Engine) runFFmpeg(ctx context.Context, args []string, expectedDur float
 		defer close(done)
 		// ReadSlice drains in bounded fragments: a pathological overlong line
 		// can neither stall the pipe nor land in memory whole, and the error
-		// buffer keeps only the first 32 KiB.
+		// buffer keeps only the first 32 KiB. ErrBufferFull is a full fragment,
+		// not a failure — keep draining or a long line would block FFmpeg on
+		// the pipe exactly like the old capped scanner did.
 		r := bufio.NewReader(stderr)
 		for {
 			frag, rerr := r.ReadSlice('\n')
@@ -3377,7 +3379,7 @@ func (e *Engine) runFFmpeg(ctx context.Context, args []string, expectedDur float
 				}
 				errBuf.Write(frag)
 			}
-			if rerr != nil {
+			if rerr != nil && !errors.Is(rerr, bufio.ErrBufferFull) {
 				return
 			}
 		}
