@@ -423,12 +423,25 @@ func reorderArgs(args []string) ([]string, error) {
 	return append(flags, append([]string{"--"}, positional...)...), nil
 }
 
-func parseFlags(args []string) (cliConfig, []string, error) {
+// wantsHelp reports whether the option portion of args (everything before
+// the first `--`) requests usage output. Arguments after `--` are literal
+// paths, so a file named "-h" must not trigger help.
+func wantsHelp(args []string) bool {
 	for _, a := range args {
-		if a == "-h" || a == "--help" {
-			printUsage()
-			os.Exit(0)
+		if a == "--" {
+			return false
 		}
+		if a == "-h" || a == "--help" {
+			return true
+		}
+	}
+	return false
+}
+
+func parseFlags(args []string) (cliConfig, []string, error) {
+	if wantsHelp(args) {
+		printUsage()
+		os.Exit(0)
 	}
 	fs := flag.NewFlagSet("prerecs", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)

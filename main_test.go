@@ -2285,6 +2285,15 @@ func TestReorderArgs(t *testing.T) {
 			},
 		},
 		{
+			name: "help flag is a literal path after terminator",
+			in:   []string{"--", "-h"},
+			check: func(t *testing.T, c cliConfig, args []string) {
+				if len(args) != 1 || args[0] != "-h" {
+					t.Fatalf("cfg=%+v args=%v", c, args)
+				}
+			},
+		},
+		{
 			name: "inline value",
 			in:   []string{"file.avi", "--preset=share"},
 			check: func(t *testing.T, c cliConfig, args []string) {
@@ -2457,5 +2466,27 @@ func TestProbeProResVulkanTimeout(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("probe was not bounded by the timeout: %v", elapsed)
+	}
+}
+
+func TestWantsHelp(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   []string
+		want bool
+	}{
+		{"plain help", []string{"-h"}, true},
+		{"long help", []string{"--help"}, true},
+		{"help among options", []string{"--preset", "share", "--help"}, true},
+		{"help after terminator is a path", []string{"--", "--help"}, false},
+		{"h after terminator is a path", []string{"--", "-h"}, false},
+		{"no help", []string{"file.avi", "--yes"}, false},
+		{"empty", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := wantsHelp(tc.in); got != tc.want {
+				t.Fatalf("wantsHelp(%v)=%v, want %v", tc.in, got, tc.want)
+			}
+		})
 	}
 }
