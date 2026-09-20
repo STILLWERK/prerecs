@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2498,35 +2500,51 @@ func TestProbeProResVulkanTimeout(t *testing.T) {
 	}
 }
 
-func TestWantsHelp(t *testing.T) {
+// parseFlags is exercised directly rather than a parallel help pre-scan: the
+// real flag parser decides what counts as help, so these cases pin the actual
+// observable outcomes — help (errShowHelp), a parse error, or a clean parse.
+func TestParseFlagsHelp(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		in   []string
-		want bool
+		want string // "help", "err", or "ok"
 	}{
-		{"plain help", []string{"-h"}, true},
-		{"long help", []string{"--help"}, true},
-		{"help among options", []string{"--preset", "share", "--help"}, true},
-		{"help after terminator is a path", []string{"--", "--help"}, false},
-		{"h after terminator is a path", []string{"--", "-h"}, false},
-		{"terminator consumed as option value", []string{"--output", "--", "--help", "clip.avi"}, true},
-		{"terminator consumed as preset value", []string{"--preset", "--", "-h"}, true},
-		{"help consumed as option value", []string{"--output", "--help", "clip.avi"}, false},
-		{"h consumed as preset value", []string{"--preset", "-h", "clip.avi"}, false},
-		{"positional named like an option", []string{"output", "--", "--help"}, false},
-		{"single-dash long help", []string{"-help"}, true},
-		{"double-dash short help", []string{"--h"}, true},
-		{"help with inline value", []string{"-h=x"}, true},
-		{"long help with inline value", []string{"--help=x"}, true},
-		{"triple dash is not help", []string{"---h"}, false},
-		{"help spelling consumed as value", []string{"--timescale", "-help", "clip.avi"}, false},
-		{"help after parsed option", []string{"--timescale", "0.5", "-help"}, true},
-		{"no help", []string{"file.avi", "--yes"}, false},
-		{"empty", nil, false},
+		{"plain help", []string{"-h"}, "help"},
+		{"long help", []string{"--help"}, "help"},
+		{"help among options", []string{"--preset", "share", "--help"}, "help"},
+		{"help after terminator is a path", []string{"--", "--help"}, "ok"},
+		{"h after terminator is a path", []string{"--", "-h"}, "ok"},
+		{"terminator consumed as option value", []string{"--output", "--", "--help", "clip.avi"}, "help"},
+		{"terminator consumed as preset value", []string{"--preset", "--", "-h"}, "help"},
+		{"help consumed as option value", []string{"--output", "--help", "clip.avi"}, "ok"},
+		{"h consumed as preset value", []string{"--preset", "-h", "clip.avi"}, "ok"},
+		{"positional named like an option", []string{"output", "--", "--help"}, "ok"},
+		{"single-dash long help", []string{"-help"}, "help"},
+		{"double-dash short help", []string{"--h"}, "help"},
+		{"help with inline value", []string{"-h=x"}, "help"},
+		{"long help with inline value", []string{"--help=x"}, "help"},
+		{"triple dash is not help", []string{"---h"}, "err"},
+		{"help spelling consumed as value", []string{"--timescale", "-help", "clip.avi"}, "ok"},
+		{"help after parsed option", []string{"--timescale", "0.5", "-help"}, "help"},
+		// Malformed option streams lose to the parser's own errors — help is
+		// not claimed when the command line could never parse.
+		{"unknown option before help", []string{"-bogus", "-h"}, "err"},
+		{"unknown option after help", []string{"-h", "-bogus"}, "err"},
+		{"bad bool value before help", []string{"-yes=bad", "-h"}, "err"},
+		{"missing option value", []string{"--output"}, "err"},
+		{"no help", []string{"file.avi", "--yes"}, "ok"},
+		{"empty", nil, "ok"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := wantsHelp(tc.in); got != tc.want {
-				t.Fatalf("wantsHelp(%v)=%v, want %v", tc.in, got, tc.want)
+			_, _, err := parseFlags(tc.in)
+			got := "ok"
+			if errors.Is(err, errShowHelp) {
+				got = "help"
+			} else if err != nil {
+				got = "err"
+			}
+			if got != tc.want {
+				t.Fatalf("parseFlags(%v) outcome=%q (err=%v), want %q", tc.in, got, err, tc.want)
 			}
 		})
 	}
@@ -2656,7 +2674,7 @@ func TestRatStringSane(t *testing.T) {
 	}
 	// The short string 1e999999999 would make big.Rat.SetString materialize a
 	// ~10^9-digit numerator — reject before parsing, not after.
-	bad := []string{"1e999999999", "1e-999999999", "1e1001", "0x1p99", strings.Repeat("9", 65), "", "abc"}
+	bad := []string{"1e999999999", "1e-999999999", "1e1001", "1e+1001", "0x1p99", strings.Repeat("9", 65), "", "abc", "1e2e3", "1e-"}
 	for _, s := range bad {
 		if ratStringSane(s) {
 			t.Fatalf("ratStringSane(%q)=true, want false", s)
@@ -2712,6 +2730,9 @@ func TestExpandInputsSkipsTempStream(t *testing.T) {
 // the destination mid-switch. A wrapper around the real ffmpeg records, per
 // invocation, whether the trailing output path already exists.
 func TestProcessItemHoldsReservationThroughFallback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script ffmpeg wrapper needs /bin/sh")
+	}
 	e := nativeTestEngine(t)
 	td := t.TempDir()
 	src := filepath.Join(td, "clip.avi")
@@ -2752,20 +2773,85 @@ func TestProcessItemHoldsReservationThroughFallback(t *testing.T) {
 	}
 	checked := 0
 	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-		f := strings.Fields(line)
-		if len(f) != 2 {
+		status, outPath, ok := strings.Cut(line, " ")
+		if !ok {
 			continue
 		}
-		ext := strings.ToLower(filepath.Ext(f[1]))
+		ext := strings.ToLower(filepath.Ext(outPath))
 		if ext != ".avi" && ext != ".mov" {
 			continue // scan/verify invocations end in "-", not an output path
 		}
 		checked++
-		if f[0] != "present" {
+		if status != "present" {
 			t.Fatalf("output path did not exist when ffmpeg ran — reservation was released early: %s\nall calls:\n%s", line, data)
 		}
 	}
 	if checked == 0 {
 		t.Fatalf("no output-writing ffmpeg invocation recorded:\n%s", data)
+	}
+}
+
+// patchStrhLength rewrites the AVI stream header's dwLength field, which
+// ffprobe uses for the stream duration — letting a test claim a duration that
+// disagrees with the decoded frames without corrupting a single packet.
+func patchStrhLength(t *testing.T, path string, frames uint32) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := bytes.Index(data, []byte("strh"))
+	if idx < 0 {
+		t.Fatal("strh chunk not found")
+	}
+	binary.LittleEndian.PutUint32(data[idx+8+32:], frames) // dwLength field
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A container whose declared duration disagrees with its decoded frames proves
+// the metadata is inconsistent but does not say which field is stale. PreRecs
+// must not fail the conversion (the decoded stream is intact) nor retime it —
+// it must fall back to passthrough timing and verify on the exact frame count.
+func TestProcessItemStaleDurationPreservesTiming(t *testing.T) {
+	caps, enc, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	if !enc["libxvid"] {
+		t.Skip("libxvid unavailable")
+	}
+	td := t.TempDir()
+	src := filepath.Join(td, "clip.avi")
+	if b, err := exec.Command(caps.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30",
+		"-frames:v", "30", "-c:v", "libxvid", src,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("fixture: %v %s", err, b)
+	}
+	// Claim 90 frames/3s in the header while the stream really holds 30/1s.
+	patchStrhLength(t, src, 90)
+	info, err := probeMedia(caps.FFprobe, src, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Duration <= 1.5 {
+		t.Fatalf("fixture did not produce a stale duration: %v", info.Duration)
+	}
+	outDir := filepath.Join(td, "out")
+	rep, _ := captureReporter()
+	item := processItem(context.Background(), theme{}, &Engine{caps: caps, enc: enc}, info,
+		ConvertOptions{Preset: "xvid_compact", OutputDir: outDir, StripAudio: true}, rep)
+	if item.Status != "ok" {
+		t.Fatalf("stale-duration source failed instead of preserving timing: status=%q msg=%q", item.Status, item.Message)
+	}
+	outInfo, err := probeMedia(caps.FFprobe, item.Output, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(outInfo.Duration-1.0) > 0.2 {
+		t.Fatalf("output duration %.3fs — timing was not preserved (~1.0s expected)", outInfo.Duration)
 	}
 }

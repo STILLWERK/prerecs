@@ -173,6 +173,10 @@ func (t theme) dim(s string) string    { return t.c("2", s) }
 
 func main() {
 	cfg, args, err := parseFlags(os.Args[1:])
+	if errors.Is(err, errShowHelp) {
+		printUsage()
+		return
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		printUsage()
@@ -448,56 +452,17 @@ func reorderArgs(args []string) ([]string, error) {
 	return append(flags, append([]string{"--"}, positional...)...), nil
 }
 
-// wantsHelp reports whether the option portion of args requests usage output.
-// It tokenizes like reorderArgs: a `--` only terminates options when it is not
-// being consumed as the value of a preceding value-taking option, and arguments
-// after the real terminator are literal paths that must not trigger help.
-func wantsHelp(args []string) bool {
-	expectValue := false
-	for _, a := range args {
-		// A pending value consumes the token verbatim — even one that looks
-		// like -h/--help/-- — matching how reorderArgs and flag.Parse treat
-		// string-flag arguments.
-		if expectValue {
-			expectValue = false
-			continue
-		}
-		if a == "--" {
-			return false
-		}
-		if len(a) > 1 && a[0] == '-' {
-			// The flag package accepts one or two dashes; a third would be a
-			// syntax error, not help, so strip at most two.
-			tok := a[1:]
-			if tok[0] == '-' {
-				tok = tok[1:]
-			}
-			name := tok
-			hasValue := false
-			if i := strings.IndexByte(tok, '='); i >= 0 {
-				name, hasValue = tok[:i], true
-			}
-			// flag.Parse treats every undefined -h/-help spelling (-help,
-			// --h, -h=x) as a help request; match the same names so the
-			// pre-scan and the real parser agree on exit codes.
-			if name == "h" || name == "help" {
-				return true
-			}
-			if !hasValue && flagNeedsValue[name] {
-				expectValue = true
-			}
-		}
-	}
-	return false
-}
+// errShowHelp is the sentinel parseFlags returns for -h/-help in any spelling
+// the flag package itself recognizes. The real parser — not a parallel
+// pre-scan — decides what is help, so help detection can never disagree with
+// flag.Parse (value consumption, `--` termination, unknown-option and
+// bad-value errors all win over a help token, exactly as flag.Parse orders
+// them).
+var errShowHelp = errors.New("help requested")
 
 func parseFlags(args []string) (cliConfig, []string, error) {
-	if wantsHelp(args) {
-		printUsage()
-		os.Exit(0)
-	}
 	fs := flag.NewFlagSet("prerecs", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
+	fs.SetOutput(io.Discard) // help/errors are reported by the caller, not flag
 	var c cliConfig
 	fs.StringVar(&c.preset, "preset", "", "share|compact|xvid|xvid-q2|xvid-efficient|xvid-fast|edit|lossless|prores|hq|xvid-max-q2|xvid-small|xvid-max|4444|magicyuv|utvideo")
 	fs.StringVar(&c.timescale, "timescale", "", "game timescale, e.g. 0.1")
@@ -514,6 +479,9 @@ func parseFlags(args []string) (cliConfig, []string, error) {
 		return c, nil, err
 	}
 	if err := fs.Parse(reordered); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return c, nil, errShowHelp
+		}
 		return c, nil, err
 	}
 	return c, fs.Args(), nil
@@ -1540,7 +1508,14 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 			if info.FPS != "" {
 				rep.line(ui.yellow(fmt.Sprintf("Container frame rate %s does not match the decoded stream; preserving source timing.", info.FPS)))
 			}
+			// Disagreement proves the metadata is inconsistent but not which
+			// field is stale — Duration could be the liar just as well. Keep it
+			// and verification would compare honest passthrough timing against a
+			// possibly-stale expected duration. Clear both: passthrough carries
+			// real timestamps by construction and the exact frame count remains
+			// the integrity gate.
 			info.FPS, info.FPSFloat = "", 0
+			info.Duration = 0
 		}
 		info.FPSFromFallback = false
 		if info.FPSFloat > 0 {
