@@ -2431,20 +2431,32 @@ func TestSourceClassDistribution(t *testing.T) {
 }
 
 func TestSelectFrameRate(t *testing.T) {
-	if s, r := selectFrameRate("30/1", "25/1"); s != "30/1" || r == nil || ratFloat(r) != 30 {
+	// avg_frame_rate always wins when present.
+	if s, r := selectFrameRate("30/1", "25/1", 0, 0); s != "30/1" || r == nil || ratFloat(r) != 30 {
 		t.Fatalf("avg preferred: %s %v", s, r)
 	}
-	if s, r := selectFrameRate("0/0", "30/1"); s != "30/1" || r == nil || ratFloat(r) != 30 {
+	// Uncorroborated fallback: no frame count or duration to check against
+	// (elementary streams, bare containers) — r_frame_rate is the only rate.
+	if s, r := selectFrameRate("0/0", "30/1", 0, 0); s != "30/1" || r == nil || ratFloat(r) != 30 {
 		t.Fatalf("r_frame_rate fallback: %s %v", s, r)
 	}
-	if s, r := selectFrameRate("", "30000/1001"); s != "30000/1001" || r == nil {
+	if s, r := selectFrameRate("", "30000/1001", 0, 0); s != "30000/1001" || r == nil {
 		t.Fatalf("missing avg: %s %v", s, r)
 	}
-	if s, r := selectFrameRate("0/0", "0/0"); s != "" || r != nil {
+	if s, r := selectFrameRate("0/0", "0/0", 0, 0); s != "" || r != nil {
 		t.Fatalf("both unknown: %s %v", s, r)
 	}
-	if s, r := selectFrameRate("junk", "30/1"); s != "30/1" || r == nil {
+	if s, r := selectFrameRate("junk", "30/1", 0, 0); s != "30/1" || r == nil {
 		t.Fatalf("bad avg falls back: %s %v", s, r)
+	}
+	// Corroborated fallback: frames/duration agree with r_frame_rate.
+	if s, r := selectFrameRate("0/0", "30/1", 300, 10.0); s != "30/1" || r == nil {
+		t.Fatalf("consistent metadata accepts fallback: %s %v", s, r)
+	}
+	// VFR hazard: 300 frames over 20s means a true 15 fps average — a nominal
+	// r_frame_rate of 30 must not be trusted to rebuild the timeline.
+	if s, r := selectFrameRate("0/0", "30/1", 300, 20.0); s != "" || r != nil {
+		t.Fatalf("inconsistent r_frame_rate rejected: %s %v", s, r)
 	}
 }
 
@@ -2480,6 +2492,8 @@ func TestWantsHelp(t *testing.T) {
 		{"help among options", []string{"--preset", "share", "--help"}, true},
 		{"help after terminator is a path", []string{"--", "--help"}, false},
 		{"h after terminator is a path", []string{"--", "-h"}, false},
+		{"terminator consumed as option value", []string{"--output", "--", "--help", "clip.avi"}, true},
+		{"terminator consumed as preset value", []string{"--preset", "--", "-h"}, true},
 		{"no help", []string{"file.avi", "--yes"}, false},
 		{"empty", nil, false},
 	} {

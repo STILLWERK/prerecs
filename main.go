@@ -423,16 +423,30 @@ func reorderArgs(args []string) ([]string, error) {
 	return append(flags, append([]string{"--"}, positional...)...), nil
 }
 
-// wantsHelp reports whether the option portion of args (everything before
-// the first `--`) requests usage output. Arguments after `--` are literal
-// paths, so a file named "-h" must not trigger help.
+// wantsHelp reports whether the option portion of args requests usage output.
+// It tokenizes like reorderArgs: a `--` only terminates options when it is not
+// being consumed as the value of a preceding value-taking option, and arguments
+// after the real terminator are literal paths that must not trigger help.
 func wantsHelp(args []string) bool {
+	expectValue := false
 	for _, a := range args {
 		if a == "--" {
+			if expectValue {
+				expectValue = false
+				continue
+			}
 			return false
 		}
 		if a == "-h" || a == "--help" {
 			return true
+		}
+		if expectValue {
+			expectValue = false
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		if !strings.Contains(name, "=") && flagNeedsValue[name] {
+			expectValue = true
 		}
 	}
 	return false
@@ -2368,16 +2382,29 @@ func parseInt(v string) int       { n, _ := strconv.Atoi(v); return n }
 // selectFrameRate picks the best available container frame rate. avg_frame_rate
 // is preferred because it reflects the realised stream; when it is missing or
 // 0/0 (common on elementary streams and odd containers) r_frame_rate is a
-// lower-trust fallback. It is only used as the nominal rate — the exact decode
-// scan still governs frame counts and output verification.
-func selectFrameRate(avg, r string) (string, *big.Rat) {
+// lower-trust fallback. r_frame_rate is a nominal/guessed rate that can diverge
+// from the true average on VFR material, and the compressed-source path
+// rebuilds a constant-rate timeline from whatever rate is chosen — a wrong
+// guess would silently change playback speed while verification still passes.
+// The fallback is therefore trusted only when it agrees with the container's
+// own frame count/duration, or when no corroborating metadata exists at all
+// (e.g. raw elementary streams where r_frame_rate is the only rate available).
+// The exact decode scan still governs frame counts and output verification.
+func selectFrameRate(avg, r string, frames int64, dur float64) (string, *big.Rat) {
 	if v, err := parseRatAllowZero(avg); err == nil && v != nil {
 		return avg, v
 	}
-	if v, err := parseRatAllowZero(r); err == nil && v != nil {
-		return r, v
+	rv, err := parseRatAllowZero(r)
+	if err != nil || rv == nil {
+		return "", nil
 	}
-	return "", nil
+	if frames > 0 && dur > 0 {
+		implied := float64(frames) / dur
+		if math.Abs(implied-ratFloat(rv)) > 0.02*ratFloat(rv) {
+			return "", nil
+		}
+	}
+	return r, rv
 }
 
 func metadataFrameCountTrusted(codec string) bool {
@@ -2414,11 +2441,6 @@ func probeMedia(ffprobe, path string, count bool) (MediaInfo, error) {
 		return MediaInfo{}, errors.New("no video stream found")
 	}
 	sv := doc.Streams[vi]
-	fpsStr, fpsRat := selectFrameRate(sv.AvgFrameRate, sv.RFrameRate)
-	fpsFloat := 0.0
-	if fpsRat != nil {
-		fpsFloat = ratFloat(fpsRat)
-	}
 	dur := parseFloat(sv.Duration)
 	if dur == 0 {
 		dur = parseFloat(doc.Format.Duration)
@@ -2432,6 +2454,11 @@ func probeMedia(ffprobe, path string, count bool) (MediaInfo, error) {
 	if count && parseInt64(sv.NBReadFrames) > 0 {
 		frames = parseInt64(sv.NBReadFrames)
 		frameCountExact = true
+	}
+	fpsStr, fpsRat := selectFrameRate(sv.AvgFrameRate, sv.RFrameRate, frames, dur)
+	fpsFloat := 0.0
+	if fpsRat != nil {
+		fpsFloat = ratFloat(fpsRat)
 	}
 	if frames <= 0 && dur > 0 && fpsFloat > 0 {
 		frames = int64(math.Round(dur * fpsFloat))
