@@ -2494,6 +2494,7 @@ func TestWantsHelp(t *testing.T) {
 		{"h after terminator is a path", []string{"--", "-h"}, false},
 		{"terminator consumed as option value", []string{"--output", "--", "--help", "clip.avi"}, true},
 		{"terminator consumed as preset value", []string{"--preset", "--", "-h"}, true},
+		{"positional named like an option", []string{"output", "--", "--help"}, false},
 		{"no help", []string{"file.avi", "--yes"}, false},
 		{"empty", nil, false},
 	} {

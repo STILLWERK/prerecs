@@ -33,16 +33,20 @@ var supportedExt = map[string]bool{
 var stdinReader = bufio.NewReader(os.Stdin)
 
 type MediaInfo struct {
-	Path            string
-	Codec           string
-	CodecTag        string
-	Profile         string
-	Width           int
-	Height          int
-	PixelFormat     string
-	BitDepth        int
-	FPS             string
-	FPSFloat        float64
+	Path        string
+	Codec       string
+	CodecTag    string
+	Profile     string
+	Width       int
+	Height      int
+	PixelFormat string
+	BitDepth    int
+	FPS         string
+	FPSFloat    float64
+	// FPSFromFallback marks FPS as the lower-trust r_frame_rate guess rather
+	// than avg_frame_rate. The exact decode scan re-evaluates it against the
+	// trusted frame count before it may drive timeline decisions.
+	FPSFromFallback bool
 	Duration        float64
 	FrameCount      int64
 	FrameCountExact bool
@@ -444,9 +448,11 @@ func wantsHelp(args []string) bool {
 			expectValue = false
 			continue
 		}
-		name := strings.TrimLeft(a, "-")
-		if !strings.Contains(name, "=") && flagNeedsValue[name] {
-			expectValue = true
+		if len(a) > 1 && a[0] == '-' {
+			name := strings.TrimLeft(a, "-")
+			if !strings.Contains(name, "=") && flagNeedsValue[name] {
+				expectValue = true
+			}
 		}
 	}
 	return false
@@ -1482,6 +1488,14 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		info.FrameCount = count
 		info.FrameCountExact = true
 		oldDuration := info.Duration
+		if info.FPSFromFallback {
+			// The scan produced a trusted frame count; re-evaluate the
+			// lower-trust r_frame_rate guess against it before it can drive
+			// the constant-rate timeline rebuild below.
+			if _, rat := selectFrameRate("", info.FPS, count, info.Duration); rat == nil {
+				info.FPS, info.FPSFloat, info.FPSFromFallback = "", 0, false
+			}
+		}
 		if info.FPSFloat > 0 {
 			info.Duration = float64(count) / info.FPSFloat
 		}
@@ -2455,7 +2469,15 @@ func probeMedia(ffprobe, path string, count bool) (MediaInfo, error) {
 		frames = parseInt64(sv.NBReadFrames)
 		frameCountExact = true
 	}
-	fpsStr, fpsRat := selectFrameRate(sv.AvgFrameRate, sv.RFrameRate, frames, dur)
+	// Corroborate the r_frame_rate fallback only with trusted frame counts.
+	// Compressed containers can carry stale frame tables (the reason they get
+	// an exact decode scan at all); an untrusted count must neither confirm
+	// nor deny the fallback, so it is re-checked after the scan instead.
+	framesForCorrob := frames
+	if !frameCountExact {
+		framesForCorrob = 0
+	}
+	fpsStr, fpsRat := selectFrameRate(sv.AvgFrameRate, sv.RFrameRate, framesForCorrob, dur)
 	fpsFloat := 0.0
 	if fpsRat != nil {
 		fpsFloat = ratFloat(fpsRat)
@@ -2468,7 +2490,7 @@ func probeMedia(ffprobe, path string, count bool) (MediaInfo, error) {
 	if bit == 0 {
 		bit = deriveBitDepth(sv.PixFmt)
 	}
-	info := MediaInfo{Path: path, Codec: sv.CodecName, CodecTag: sv.CodecTagString, Profile: sv.Profile, Width: sv.Width, Height: sv.Height, PixelFormat: sv.PixFmt, BitDepth: bit, FPS: fpsStr, FPSFloat: fpsFloat, Duration: dur, FrameCount: frames, FrameCountExact: frameCountExact, SizeBytes: parseInt64(doc.Format.Size), BitRate: parseInt64(doc.Format.BitRate), ColorRange: sv.ColorRange, ColorSpace: sv.ColorSpace, ColorTransfer: sv.ColorTransfer, ColorPrimaries: sv.ColorPrimaries, HasAlpha: hasAlpha(sv.PixFmt), Chroma: chroma(sv.PixFmt), Audio: []string{}}
+	info := MediaInfo{Path: path, Codec: sv.CodecName, CodecTag: sv.CodecTagString, Profile: sv.Profile, Width: sv.Width, Height: sv.Height, PixelFormat: sv.PixFmt, BitDepth: bit, FPS: fpsStr, FPSFloat: fpsFloat, FPSFromFallback: fpsStr != "" && fpsStr == sv.RFrameRate && fpsStr != sv.AvgFrameRate, Duration: dur, FrameCount: frames, FrameCountExact: frameCountExact, SizeBytes: parseInt64(doc.Format.Size), BitRate: parseInt64(doc.Format.BitRate), ColorRange: sv.ColorRange, ColorSpace: sv.ColorSpace, ColorTransfer: sv.ColorTransfer, ColorPrimaries: sv.ColorPrimaries, HasAlpha: hasAlpha(sv.PixFmt), Chroma: chroma(sv.PixFmt), Audio: []string{}}
 	for _, sa := range doc.Streams {
 		if sa.CodecType != "audio" {
 			continue
