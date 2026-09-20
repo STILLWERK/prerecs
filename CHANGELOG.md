@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- New `--no-native-xvid` option bypasses the `xvid_encraw` path entirely, so a machine whose native encoder fails verification can still convert through FFmpeg libxvid.
+- `--preset` for ProRes, MagicYUV, and Ut Video now fails once during option collection when the required FFmpeg encoder or MagicYUV installation is missing, instead of failing every item mid-batch.
+- Fallback bit-depth detection recognizes the full-range `yuvj*` planar formats FFmpeg emits for MJPEG — legitimate 8-bit sources like `yuvj420p` are no longer refused by the lossless presets as "unverifiable". Packed/semi-planar layouts (`nv16`/`nv24`, `v308`/`vuyx`, `pal8`, `rgb0`/`bgr0`/`0rgb`/`0bgr`) and high-bit packed formats (`v210`, `v410`, `r210`, `p210`/`p410`, `x2rgb10`/`x2bgr10`, `p012`/`p212`/`p216`/`p412`/`p416`, `y210`/`y216`, `nv20`, `v30x`, `xv30`, `xv36`, `ayuv64`) report accurate depths for clearer rejection messages, including the endian-suffixed spellings ffprobe actually emits. Alpha is now detected for the packed alpha formats (`v408`/`vuya`/`uyva`, `ayuv*`, `y410`/`y412`/`y416`, `gbraf*`, `pal8`) instead of only planar/`RGBA`-named ones.
+- FFmpeg stdout/stderr pipes are drained with unbounded line readers; a single pathological overlong output line can no longer stall an encoder behind a full pipe buffer.
+- Filenames and FFmpeg/ffprobe messages are stripped of terminal control bytes before printing.
+- Plain-mode (`--plain`) progress lines pad to a fixed width so a shorter line no longer leaves the tail of a longer one behind.
+- The inconsistent-metadata decode scan message no longer names a specific backend, and the duplicate "estimated count" line it triggered is gone.
+
 ## v1.0.2 — Integrity and CLI hardening patch
 
 - Source scans, FFmpeg conversion input decodes, and output verification decodes now run with strict decoder-error handling (`-xerror -err_detect explode`). FFmpeg could previously log decoder errors but still exit 0 after silently dropping frames, allowing a corrupt source to produce a truncated output that verified green. Affected files now fail loudly instead.

@@ -21,6 +21,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode"
 )
 
 func TestRatTiming(t *testing.T) {
@@ -696,6 +697,53 @@ func TestDeriveBitDepthCommonPixelFormats(t *testing.T) {
 		"ya8":         8,
 		"ya16le":      16,
 		"ya16be":      16,
+		"yuvj411p":    8,
+		"yuvj420p":    8,
+		"yuvj422p":    8,
+		"yuvj440p":    8,
+		"yuvj444p":    8,
+		"nv16":        8,
+		"nv24":        8,
+		"v308":        8,
+		"v408":        8,
+		"vuyx":        8,
+		"vuya":        8,
+		"uyva":        8,
+		"ayuv":        8,
+		"pal8":        8,
+		"rgb0":        8,
+		"bgr0":        8,
+		"0rgb":        8,
+		"0bgr":        8,
+		"v210":        10,
+		"v410":        10,
+		"r210":        10,
+		// These formats only ever appear with an endian suffix in ffprobe
+		// output — test the names actually seen in the wild, including the
+		// FFmpeg 8.x successors (xv30/xv36) and packed YUVA (y41x).
+		"p010le":    10,
+		"p210le":    10,
+		"p210be":    10,
+		"p410le":    10,
+		"nv20le":    10,
+		"v30xle":    10,
+		"xv30le":    10,
+		"x2rgb10le": 10,
+		"x2bgr10le": 10,
+		"y210le":    10,
+		"y410le":    10,
+		"p012le":    12,
+		"p212le":    12,
+		"p412le":    12,
+		"y212le":    12,
+		"y412le":    12,
+		"xv36le":    12,
+		"p016le":    16,
+		"p216le":    16,
+		"p416le":    16,
+		"y216le":    16,
+		"y416le":    16,
+		"ayuv64le":  16,
 	}
 	for pixFmt, want := range cases {
 		if got := deriveBitDepth(pixFmt); got != want {
@@ -837,13 +885,104 @@ func TestCollectOptionsRejectsUnsupportedXvidInputEarly(t *testing.T) {
 	}
 }
 
+// A --preset that names an encoder this FFmpeg/system lacks must fail once up
+// front, not once per item mid-batch.
+func TestCollectOptionsRejectsMissingPresetEncoderEarly(t *testing.T) {
+	e := &Engine{caps: Capabilities{}, enc: map[string]bool{}}
+	infos := []MediaInfo{{Path: "clip.avi", Codec: "ffv1", PixelFormat: "yuv420p", BitDepth: 8, Chroma: "4:2:0"}}
+	for preset, want := range map[string]string{"edit": "prores_ks", "magicyuv": "magicyuv", "utvideo": "utvideo"} {
+		if _, err := collectOptions(cliConfig{preset: preset, yes: true}, theme{}, e, infos); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("--preset %s should fail early naming %s, got %v", preset, want, err)
+		}
+	}
+	// MagicYUV also requires the system codec/plugin install, not just the
+	// FFmpeg encoder.
+	magicFFmpegOnly := &Engine{caps: Capabilities{MagicInstalled: false}, enc: map[string]bool{"magicyuv": true}}
+	if _, err := collectOptions(cliConfig{preset: "magicyuv", yes: true}, theme{}, magicFFmpegOnly, infos); err == nil || !strings.Contains(err.Error(), "MagicYUV") {
+		t.Fatalf("encoder-only MagicYUV should be rejected up front: %v", err)
+	}
+}
+
+// --no-native-xvid must hide the native backend from availability checks and
+// plan text so libxvid becomes the only accepted Xvid path.
+func TestNoNativeXvidMasksAvailability(t *testing.T) {
+	caps := Capabilities{HasXvid: true, HasNativeXvid: true, HasLibXvid: false, XvidEncRaw: "xvid_encraw"}
+	infos := []MediaInfo{{Path: `C:\clips\master.avi`, Codec: "lagarith"}}
+	if ok, missing := xvidAvailableForInputs(caps, infos, false); !ok || len(missing) != 0 {
+		t.Fatalf("native-eligible input should be covered by native Xvid: ok=%v missing=%v", ok, missing)
+	}
+	masked := nativeXvidCaps(caps, true)
+	if ok, missing := xvidAvailableForInputs(masked, infos, false); ok || len(missing) != 1 {
+		t.Fatalf("--no-native-xvid should require libxvid: ok=%v missing=%v", ok, missing)
+	}
+	masked.HasLibXvid = true
+	if ok, _ := xvidAvailableForInputs(masked, infos, false); !ok {
+		t.Fatal("libxvid should satisfy availability when native Xvid is disabled")
+	}
+	if got := xvidBackendDescription(masked, infos); !strings.Contains(strings.ToLower(got), "ffmpeg") {
+		t.Fatalf("backend description should name FFmpeg under --no-native-xvid, got %q", got)
+	}
+}
+
+// The flag must survive collectOptions: it has to reach ConvertOptions and
+// mask native availability, or the enforcement point in processItem and the
+// early availability check both silently keep using xvid_encraw.
+func TestNoNativeXvidPropagatesThroughCollectOptions(t *testing.T) {
+	e := &Engine{
+		caps: Capabilities{HasXvid: true, HasNativeXvid: true, HasLibXvid: false},
+		enc:  map[string]bool{},
+	}
+	infos := []MediaInfo{{Path: `C:\clips\master.avi`, Codec: "lagarith"}}
+	// Native-only machine + flag: nothing can satisfy the Xvid preset, so the
+	// job must fail early with the libxvid hint.
+	if _, err := collectOptions(cliConfig{preset: "share", yes: true, noNativeXvid: true}, theme{}, e, infos); err == nil || !strings.Contains(err.Error(), "libxvid") {
+		t.Fatalf("--no-native-xvid on a native-only system should require libxvid: %v", err)
+	}
+	// With libxvid present the job proceeds and the flag reaches the options.
+	e.caps.HasLibXvid = true
+	e.enc["libxvid"] = true
+	opts, err := collectOptions(cliConfig{preset: "share", yes: true, noNativeXvid: true}, theme{}, e, infos)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.NoNativeXvid {
+		t.Fatal("noNativeXvid flag did not reach ConvertOptions")
+	}
+}
+
+func TestNoNativeXvidFlagParsesAfterPaths(t *testing.T) {
+	c, args, err := parseFlags([]string{"clip.avi", "--no-native-xvid", "--preset", "share"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.noNativeXvid || c.preset != "share" || len(args) != 1 || args[0] != "clip.avi" {
+		t.Fatalf("cfg=%+v args=%v", c, args)
+	}
+}
+
+// Filenames and tool error text reach the console; control bytes in them must
+// not be able to inject escape sequences or carriage-return rewrites.
+func TestSafeConsoleTextStripsControlBytes(t *testing.T) {
+	in := "evil\x1b[2K\x1b]0;pwned\x07\rname\x00\nsecond line"
+	got := safeConsoleText(in)
+	for _, r := range got {
+		if r != '\n' && !unicode.IsPrint(r) {
+			t.Fatalf("control byte %#U survived sanitization in %q", r, got)
+		}
+	}
+	if want := "evil[2K]0;pwnedname\nsecond line"; got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
 func TestHasAlphaRecognizesPackedARGBFormats(t *testing.T) {
-	for _, pixFmt := range []string{"rgba", "bgra", "argb", "abgr", "yuva420p", "yuva444p", "gbrap", "ya8", "ya16le", "ya16be"} {
+	for _, pixFmt := range []string{"rgba", "bgra", "argb", "abgr", "yuva420p", "yuva444p", "gbrap", "gbraf16le", "ya8", "ya16le", "ya16be", "v408", "vuya", "uyva", "ayuv", "ayuv64le", "y410le", "y412le", "y416le", "pal8"} {
 		if !hasAlpha(pixFmt) {
 			t.Fatalf("hasAlpha(%q)=false, want true", pixFmt)
 		}
 	}
-	for _, pixFmt := range []string{"rgb24", "bgr24", "yuv420p", "yuv444p"} {
+	// The packed siblings carry X padding, not alpha.
+	for _, pixFmt := range []string{"rgb24", "bgr24", "yuv420p", "yuv444p", "v308", "vuyx", "v30xle", "xv30le", "xv36le", "y210le", "y212le", "y216le", "x2rgb10le", "x2bgr10le"} {
 		if hasAlpha(pixFmt) {
 			t.Fatalf("hasAlpha(%q)=true, want false", pixFmt)
 		}
@@ -851,7 +990,7 @@ func TestHasAlphaRecognizesPackedARGBFormats(t *testing.T) {
 }
 
 func TestPackedRGBFormatsUseRGBConversionClassification(t *testing.T) {
-	for _, pixFmt := range []string{"argb", "abgr", "rgba", "bgra", "gbrap"} {
+	for _, pixFmt := range []string{"argb", "abgr", "rgba", "bgra", "gbrap", "0rgb", "0bgr", "x2rgb10le", "x2bgr10le", "r210"} {
 		if !isRGBPixelFormat(pixFmt) {
 			t.Fatalf("isRGBPixelFormat(%q)=false, want true", pixFmt)
 		}
@@ -892,6 +1031,7 @@ func TestLossless8BitPixFmtPreservesLayout(t *testing.T) {
 		{"rgba", MediaInfo{PixelFormat: "gbrap", BitDepth: 8, Chroma: "4:4:4", HasAlpha: true}, "MagicYUV", "gbrap"},
 		{"yuva444", MediaInfo{PixelFormat: "yuva444p", BitDepth: 8, Chroma: "4:4:4", HasAlpha: true}, "MagicYUV", "yuva444p"},
 		{"ut-yuv444", MediaInfo{PixelFormat: "yuv444p", BitDepth: 8, Chroma: "4:4:4"}, "Ut Video", "yuv444p"},
+		{"mjpeg-fullrange", MediaInfo{PixelFormat: "yuvj420p", BitDepth: 8, Chroma: "4:2:0"}, "MagicYUV", "yuv420p"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2846,6 +2986,57 @@ func TestProcessItemHoldsReservationThroughFallback(t *testing.T) {
 	}
 	if checked == 0 {
 		t.Fatalf("no output-writing ffmpeg invocation recorded:\n%s", data)
+	}
+}
+
+// --no-native-xvid must bypass the xvid_encraw path entirely: the item
+// converts through FFmpeg libxvid and no native stage is ever announced. The
+// fake encoder is armed to fail, so a regression that still calls it is
+// distinguishable from a clean libxvid conversion only through the reported
+// lines and backend label.
+func TestNoNativeXvidBypassesNativePath(t *testing.T) {
+	e := nativeTestEngine(t)
+	td := t.TempDir()
+	src := filepath.Join(td, "clip.avi")
+	if b, err := exec.Command(e.caps.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30",
+		"-frames:v", "15", "-c:v", "ffv1", src,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("fixture: %v %s", err, b)
+	}
+	es, _ := makeRealM4V(t, e.caps.FFmpeg, td, 15)
+	installFakeXvid(t, es, map[string]string{"PRERECS_FAKE_XVID_EXIT": "3"})
+	// Count invocations on the seam itself — stronger than matching reporter
+	// phrasing, which a rename could silently blind.
+	nativeCalls := 0
+	inner := xvidEncrawCommand
+	xvidEncrawCommand = func(ctx context.Context, path string, args ...string) *exec.Cmd {
+		nativeCalls++
+		return inner(ctx, path, args...)
+	}
+	t.Cleanup(func() { xvidEncrawCommand = inner })
+
+	info, err := probeMedia(e.caps.FFprobe, src, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, lines := captureReporter()
+	item := processItem(context.Background(), theme{}, e, info,
+		ConvertOptions{Preset: "xvid_compact", OutputDir: td, StripAudio: true, NoNativeXvid: true}, rep)
+	if item.Status != "ok" {
+		t.Fatalf("conversion failed: status=%q msg=%q", item.Status, item.Message)
+	}
+	if nativeCalls != 0 {
+		t.Fatalf("xvid_encraw invoked %d times despite --no-native-xvid", nativeCalls)
+	}
+	for _, l := range *lines {
+		if strings.Contains(strings.ToLower(l), "native xvid") {
+			t.Fatalf("native path announced despite --no-native-xvid: %q", l)
+		}
+	}
+	if !strings.Contains(item.Backend, "libxvid") {
+		t.Fatalf("backend=%q, want FFmpeg libxvid", item.Backend)
 	}
 }
 

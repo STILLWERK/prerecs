@@ -71,7 +71,7 @@ PreRecs is a Windows console application. Each GitHub release publishes a versio
 
 Required:
 
-1. `ffmpeg.exe` and `ffprobe.exe` from a Windows FFmpeg build;
+1. `ffmpeg.exe` and `ffprobe.exe` from a Windows FFmpeg 5.x or newer build;
 2. an FFmpeg build with the encoder needed by the selected preset. In particular, Xvid fallback requires `libxvid`, ProRes requires `prores_ks`, and Ut Video requires `utvideo`.
 
 Put FFmpeg in one of these locations:
@@ -82,7 +82,7 @@ Put FFmpeg in one of these locations:
 
 You can also set `PRERECS_FFMPEG` and `PRERECS_FFPROBE` to explicit executable paths. PreRecs checks those environment variables first.
 
-Native Xvid is optional. Install a compatible Xvid reference encoder and make `xvid_encraw.exe` available through `PRERECS_XVID_ENCRAW`, a `tools`/application directory, a standard Xvid installation directory, or `PATH`. Native Xvid is used only for eligible lossless AVI masters after a Windows VfW final-frame preflight. If the preflight fails, or the native encode fails its frame-count check, PreRecs falls back to FFmpeg libxvid when that encoder is available.
+Native Xvid is optional. Install a compatible Xvid reference encoder and make `xvid_encraw.exe` available through `PRERECS_XVID_ENCRAW`, a `tools`/application directory, a standard Xvid installation directory, or `PATH`. Native Xvid is used only for eligible lossless AVI masters after a Windows VfW final-frame preflight. If the preflight fails, or the native encode fails its frame-count check, PreRecs falls back to FFmpeg libxvid when that encoder is available. Pass `--no-native-xvid` to bypass the native path entirely and always encode with FFmpeg libxvid.
 
 MagicYUV is optional, proprietary, and never bundled. Its preset is offered only when the Windows codec/plugin registration and the FFmpeg encoder are both detected. Ut Video is the free lossless alternative.
 
@@ -136,6 +136,7 @@ Useful options:
 --yes                 Skip the final interactive confirmation.
 --force-xvid          Allow Xvid on already-compressed sources.
 --cpu-prores          Disable the experimental Vulkan ProRes path.
+--no-native-xvid      Disable the native xvid_encraw path; always use FFmpeg libxvid.
 --plain               Disable ANSI styling.
 --version             Print the application version.
 -h, --help            Show usage.
