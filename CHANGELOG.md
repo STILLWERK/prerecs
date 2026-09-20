@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.0.2 — Integrity and CLI hardening patch
+
+- Source scans, FFmpeg conversion input decodes, and output verification decodes now run with strict decoder-error handling (`-xerror -err_detect explode`). FFmpeg could previously log decoder errors but still exit 0 after silently dropping frames, allowing a corrupt source to produce a truncated output that verified green. Affected files now fail loudly instead.
+- Newly encoded outputs that fail probe, decode, or content verification are removed instead of remaining under the canonical output name. Pre-existing invalid candidates are still preserved and replaced with numbered outputs as before.
+- Sparse numbered outputs are now discovered for reuse (e.g. `clip_preset_2.avi` is considered even when the base name is free).
+- Command-line options are accepted before or after file/folder paths, and `--` terminates option parsing for dash-prefixed paths.
+- `--timescale` and `--capture-fps` are validated once during option collection instead of failing per file mid-batch.
+- `--yes` with no usable input now exits nonzero instead of reporting success for zero work.
+- Interactive prompts propagate stdin EOF instead of potentially looping forever on an exhausted pipe.
+- The Vulkan ProRes startup probe is bounded by a 10-second timeout so a wedged driver can no longer block program start; timeout simply disables the GPU path.
+- Directory scans skip filenames matching the exact generated output suffix convention, preventing self-consumption when an output folder is later used as an input folder.
+- `r_frame_rate` is used as a conservative fallback when `avg_frame_rate` is missing or `0/0`.
+- Wider distribution-codec classification (WMV1/2, H.263, FLV1, Theora, VP6 variants, Cinepak) now triggers the already-compressed protection; MJPEG intentionally remains unclassified as it is a common acquisition/intermediate codec.
+- Per-item elapsed time now includes output verification.
+- The native Xvid orchestration path (VOP counting, cancellation, remux) is now covered by CI tests through a fake `xvid_encraw` test process; codec tuning is unchanged.
+- CI now vets Windows-tagged sources (`GOOS=windows go vet`) in addition to building them.
+
 ## v1.0.1 — Hardening patch
 
 - Hardened fallback bit-depth detection for packed RGB, planar YUV/GBR, grayscale, and gray+alpha pixel formats when FFprobe does not report `bits_per_raw_sample`.

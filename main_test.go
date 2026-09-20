@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1211,12 +1213,12 @@ func TestProResPresetMatchesProfileAndPixelFormat(t *testing.T) {
 func TestVerifyOutputAudioAndFormat(t *testing.T) {
 	in := MediaInfo{
 		Width: 320, Height: 180, PixelFormat: "yuv420p", FrameCount: 30, FPSFloat: 30, Duration: 1,
-		Audio: []AudioInfo{{Codec: "aac", Channels: 2, SampleRate: 48000}},
+		Audio: []string{"aac"},
 	}
 	good := MediaInfo{
 		Codec: "mpeg4", CodecTag: "XVID", Width: 320, Height: 180, PixelFormat: "yuv420p",
 		FrameCount: 30, FPSFloat: 30, Duration: 1,
-		Audio: []AudioInfo{{Codec: "aac", Channels: 2, SampleRate: 48000}},
+		Audio: []string{"aac"},
 	}
 	if p := verifyOutput(in, good, ConvertOptions{Preset: "xvid_compact"}, big.NewRat(30, 1), 1); len(p) != 0 {
 		t.Fatalf("good output problems: %v", p)
@@ -1268,7 +1270,7 @@ func TestAudioCopyCompatibility(t *testing.T) {
 	if !audioCopyCompatible("prores_lt", "aac") {
 		t.Fatal("AAC should be safe for MOV/ProRes stream copy")
 	}
-	infos := []MediaInfo{{Path: "clip.mp4", Audio: []AudioInfo{{Codec: "aac"}}}}
+	infos := []MediaInfo{{Path: "clip.mp4", Audio: []string{"aac"}}}
 	bad := incompatibleAudioCopies("xvid_compact", infos)
 	if len(bad) != 1 || bad[0] != "clip.mp4=AAC" {
 		t.Fatalf("bad=%v", bad)
@@ -1516,13 +1518,29 @@ func TestBuildVulkanProResCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := " " + strings.Join(args, " ") + " "
-	for _, want := range []string{" -init_hw_device vulkan=prerecs_vk ", " -filter_hw_device prerecs_vk ", " format=yuv422p10le,hwupload ", " -c:v prores_ks_vulkan ", " -profile:v 1 ", " -async_depth 4 ", " -alpha_bits 0 "} {
+	for _, want := range []string{" -init_hw_device vulkan=prerecs_vk ", " -filter_hw_device prerecs_vk ", " format=yuv422p10le,hwupload ", " -c:v prores_ks_vulkan ", " -profile:v 1 ", " -async_depth 4 "} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("missing %q in %s", want, joined)
 		}
 	}
+	if strings.Contains(joined, " -alpha_bits ") {
+		t.Fatalf("alpha_bits must be omitted for non-alpha input: %s", joined)
+	}
 	if fps == nil || ratFloat(fps) != 30 || math.Abs(dur-10) > 1e-9 {
 		t.Fatalf("timing fps=%v dur=%v", fps, dur)
+	}
+}
+
+func TestBuildVulkanProResCommandAlphaBits(t *testing.T) {
+	e := &Engine{caps: Capabilities{HasProResVulkan: true}}
+	info := MediaInfo{Path: "alpha.avi", FPS: "30/1", FPSFloat: 30, FrameCount: 300, FrameCountExact: true, Duration: 10, PixelFormat: "yuva420p", HasAlpha: true, Chroma: "4:2:0", BitDepth: 8}
+	args, _, _, err := e.buildProResVulkanCommand(info, ConvertOptions{Preset: "prores_4444"}, "out.mov")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := " " + strings.Join(args, " ") + " "
+	if !strings.Contains(joined, " -alpha_bits 8 ") {
+		t.Fatalf("alpha source must keep -alpha_bits 8: %s", joined)
 	}
 }
 
@@ -1574,5 +1592,870 @@ func TestProResAlphaBits(t *testing.T) {
 	}
 	if got := proresAlphaBits(MediaInfo{HasAlpha: true, BitDepth: 10}); got != 16 {
 		t.Fatalf("10-bit alpha bits=%d", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.2 integrity hardening regression tests
+// ---------------------------------------------------------------------------
+
+func captureReporter() (itemReporter, *[]string) {
+	lines := []string{}
+	return itemReporter{
+		line:     func(s string) { lines = append(lines, s) },
+		progress: func(progressInfo) {},
+		finish:   func() {},
+	}, &lines
+}
+
+func TestStrictDecodeArgsOnEncodePaths(t *testing.T) {
+	e := &Engine{
+		caps: Capabilities{HasProResVulkan: true},
+		enc:  map[string]bool{"libxvid": true, "prores_ks": true},
+	}
+	info := MediaInfo{Path: "in.avi", Codec: "ffv1", FPS: "30/1", FPSFloat: 30, FrameCount: 30, FrameCountExact: true, Duration: 1, PixelFormat: "yuv420p"}
+	for _, preset := range []string{"xvid_compact", "prores_lt"} {
+		args, _, _, err := e.buildCommand(info, ConvertOptions{Preset: preset, StripAudio: true}, "out.bin")
+		if err != nil {
+			t.Fatalf("%s: %v", preset, err)
+		}
+		joined := " " + strings.Join(args, " ") + " "
+		if !strings.Contains(joined, " -xerror ") || !strings.Contains(joined, " -err_detect explode ") {
+			t.Fatalf("%s encode args missing strict decode flags: %s", preset, joined)
+		}
+	}
+	vargs, _, _, err := e.buildProResVulkanCommand(info, ConvertOptions{Preset: "prores_lt", StripAudio: true}, "out.mov")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := " " + strings.Join(vargs, " ") + " "
+	if !strings.Contains(joined, " -xerror ") || !strings.Contains(joined, " -err_detect explode ") {
+		t.Fatalf("Vulkan encode args missing strict decode flags: %s", joined)
+	}
+}
+
+// TestCorruptSourceNeverVerifies is the headline v1.0.1 regression: FFmpeg can
+// log decoder errors yet exit 0 with a partial frame count, so the scan used to
+// accept a truncated count as truth and VERIFY then confirmed the same
+// truncated output. With strict decode flags the scan must fail, no output is
+// produced, and nothing reports VERIFIED.
+func TestCorruptSourceNeverVerifies(t *testing.T) {
+	caps, enc, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	if !enc["libxvid"] {
+		t.Skip("libxvid unavailable")
+	}
+	td := t.TempDir()
+	src := filepath.Join(td, "clip.avi")
+	if b, err := exec.Command(caps.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30",
+		"-frames:v", "60", "-c:v", "libxvid", "-q:v", "4", src,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("fixture encode: %v %s", err, b)
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := filepath.Join(td, "corrupt.avi")
+	broken := append([]byte(nil), data...)
+	lo, hi := len(broken)*30/100, len(broken)*60/100
+	for i := lo; i < hi; i++ {
+		broken[i] = 0
+	}
+	if err := os.WriteFile(corrupt, broken, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Demonstrate the vulnerable condition: the same file decoded without the
+	// strict flags may still exit 0 while dropping frames. If a future FFmpeg
+	// makes errors fatal by default this simply stops being interesting.
+	nonStrict := exec.Command(caps.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-nostdin",
+		"-i", corrupt, "-map", "0:v:0", "-an", "-sn", "-dn",
+		"-fps_mode", "passthrough", "-f", "null", "-")
+	if err := nonStrict.Run(); err == nil {
+		t.Log("vulnerability condition reproduced: non-strict ffmpeg exited 0 on a corrupt stream")
+	} else {
+		t.Logf("non-strict ffmpeg exited nonzero on this corruption: %v", err)
+	}
+
+	info, err := probeMedia(caps.FFprobe, corrupt, false)
+	if err != nil {
+		t.Fatalf("ffprobe should still read the corrupt container: %v", err)
+	}
+	e := &Engine{caps: caps, enc: enc}
+	if _, err := e.countDecodedFrames(context.Background(), info, func(progressInfo) {}); err == nil {
+		t.Fatal("strict decode scan accepted a corrupt source")
+	}
+
+	outDir := filepath.Join(td, "out")
+	rep, lines := captureReporter()
+	item := processItem(context.Background(), theme{}, e, info, ConvertOptions{Preset: "xvid_compact", OutputDir: outDir, StripAudio: true}, rep)
+	if item.Status != "failed" {
+		t.Fatalf("corrupt source produced status %q, want failed", item.Status)
+	}
+	for _, l := range *lines {
+		if strings.Contains(l, "VERIFIED") {
+			t.Fatalf("VERIFIED was reported for a corrupt source; lines: %v", *lines)
+		}
+	}
+	if item.Output != "" && fileExists(item.Output) {
+		t.Fatalf("failed item left output behind: %s", item.Output)
+	}
+	entries, _ := os.ReadDir(outDir)
+	for _, en := range entries {
+		if supportedExt[strings.ToLower(filepath.Ext(en.Name()))] {
+			t.Fatalf("failed conversion left media output behind: %s", en.Name())
+		}
+	}
+
+	res := runBatch(context.Background(), theme{}, e, []MediaInfo{info}, ConvertOptions{Preset: "xvid_compact", OutputDir: filepath.Join(td, "out2"), StripAudio: true})
+	if code := headlessExitCode(res, nil); code == 0 {
+		t.Fatal("headless exit code 0 for a corrupt source")
+	}
+}
+
+// TestStrictVerifyRejectsCorruptOutput proves the VERIFY stage itself is strict:
+// a damaged "output" file fails countDecodedFrames instead of returning a
+// truncated frame count that would match a truncated encode.
+func TestStrictVerifyRejectsCorruptOutput(t *testing.T) {
+	caps, enc, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	if !enc["libxvid"] {
+		t.Skip("libxvid unavailable")
+	}
+	td := t.TempDir()
+	good := filepath.Join(td, "good.avi")
+	if b, err := exec.Command(caps.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30",
+		"-frames:v", "40", "-c:v", "libxvid", "-q:v", "4", good,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("fixture: %v %s", err, b)
+	}
+	data, err := os.ReadFile(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := filepath.Join(td, "bad.avi")
+	broken := append([]byte(nil), data...)
+	lo, hi := len(broken)*40/100, len(broken)*70/100
+	for i := lo; i < hi; i++ {
+		broken[i] = 0xAA
+	}
+	if err := os.WriteFile(bad, broken, 0644); err != nil {
+		t.Fatal(err)
+	}
+	outInfo, err := probeMedia(caps.FFprobe, bad, false)
+	if err != nil {
+		t.Fatalf("probe of damaged output: %v", err)
+	}
+	e := &Engine{caps: caps, enc: enc}
+	if _, err := e.countDecodedFrames(context.Background(), outInfo, func(progressInfo) {}); err == nil {
+		t.Fatal("strict verification decode accepted a damaged output")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fake xvid_encraw: a subprocess helper standing in for the real binary so the
+// whole runNativeXvid orchestration (poll, count, cancel, remux) runs in CI.
+// ---------------------------------------------------------------------------
+
+func vopOffsets(data []byte) []int {
+	var offs []int
+	for i := 0; i+3 < len(data); i++ {
+		if data[i] == 0x00 && data[i+1] == 0x00 && data[i+2] == 0x01 && data[i+3] == 0xB6 {
+			offs = append(offs, i)
+		}
+	}
+	return offs
+}
+
+// TestFakeXvidEncrawHelper is not a test: it impersonates xvid_encraw when
+// spawned as a child process with PRERECS_FAKE_XVID=1.
+func TestFakeXvidEncrawHelper(t *testing.T) {
+	if os.Getenv("PRERECS_FAKE_XVID") != "1" {
+		return
+	}
+	// Args after "--" are the real xvid_encraw command line.
+	xargs := []string{}
+	for i, a := range os.Args {
+		if a == "--" {
+			xargs = os.Args[i+1:]
+			break
+		}
+	}
+	outPath := ""
+	for i := 0; i+1 < len(xargs); i++ {
+		if xargs[i] == "-o" {
+			outPath = xargs[i+1]
+		}
+	}
+	data, err := os.ReadFile(os.Getenv("PRERECS_FAKE_XVID_STREAM"))
+	if err != nil || outPath == "" {
+		fmt.Fprintln(os.Stderr, "fake xvid: bad invocation")
+		os.Exit(64)
+	}
+	vops := vopOffsets(data)
+	limit := len(vops)
+	if n, _ := strconv.Atoi(os.Getenv("PRERECS_FAKE_XVID_VOPS")); n > 0 && n < limit {
+		limit = n
+	}
+	delay, _ := time.ParseDuration(os.Getenv("PRERECS_FAKE_XVID_DELAY"))
+	f, err := os.Create(outPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "fake xvid:", err)
+		os.Exit(65)
+	}
+	if len(vops) == 0 {
+		f.Write(data)
+	} else {
+		f.Write(data[:vops[0]])
+		for i := 0; i < limit; i++ {
+			end := len(data)
+			if i+1 < len(vops) {
+				end = vops[i+1]
+			}
+			if _, err := f.Write(data[vops[i]:end]); err != nil {
+				os.Exit(66)
+			}
+			f.Sync()
+			if delay > 0 {
+				time.Sleep(delay)
+			}
+		}
+	}
+	f.Close()
+	if code := os.Getenv("PRERECS_FAKE_XVID_EXIT"); code != "" {
+		n, _ := strconv.Atoi(code)
+		fmt.Fprintln(os.Stderr, "fake xvid: forced failure")
+		os.Exit(n)
+	}
+	os.Exit(0)
+}
+
+func installFakeXvid(t *testing.T, stream string, extra map[string]string) {
+	t.Helper()
+	old := xvidEncrawCommand
+	xvidEncrawCommand = func(ctx context.Context, path string, args ...string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, os.Args[0],
+			append([]string{"-test.run=^TestFakeXvidEncrawHelper$", "--"}, args...)...)
+		env := append(os.Environ(), "PRERECS_FAKE_XVID=1", "PRERECS_FAKE_XVID_STREAM="+stream)
+		for k, v := range extra {
+			env = append(env, k+"="+v)
+		}
+		cmd.Env = env
+		return cmd
+	}
+	t.Cleanup(func() { xvidEncrawCommand = old })
+}
+
+// makeRealM4V builds a genuine MPEG-4 Part 2 elementary stream whose VOP count
+// equals the requested frame count, and returns (path, vopCount).
+func makeRealM4V(t *testing.T, ffmpeg, dir string, frames int) (string, int) {
+	t.Helper()
+	es := filepath.Join(dir, "es.m4v")
+	if b, err := exec.Command(ffmpeg,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=64x64:rate=30",
+		"-frames:v", strconv.Itoa(frames), "-c:v", "libxvid", "-bf", "0",
+		"-f", "m4v", es,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("m4v fixture: %v %s", err, b)
+	}
+	data, err := os.ReadFile(es)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vops := vopOffsets(data)
+	if len(vops) != frames {
+		t.Fatalf("fixture has %d VOPs, want %d", len(vops), frames)
+	}
+	return es, frames
+}
+
+func nativeTestEngine(t *testing.T) *Engine {
+	t.Helper()
+	caps, enc, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	if !enc["libxvid"] {
+		t.Skip("libxvid unavailable")
+	}
+	caps.HasNativeXvid = true
+	caps.XvidEncRaw = "fake-xvid-encraw"
+	return &Engine{caps: caps, enc: enc}
+}
+
+func TestNativeXvidFakeSuccess(t *testing.T) {
+	e := nativeTestEngine(t)
+	td := t.TempDir()
+	es, frames := makeRealM4V(t, e.caps.FFmpeg, td, 20)
+	installFakeXvid(t, es, nil)
+	src := filepath.Join(td, "src.avi")
+	info := MediaInfo{Path: src, Codec: "ffv1", FPS: "30/1", FPSFloat: 30, FrameCount: int64(frames), FrameCountExact: true, Duration: float64(frames) / 30}
+	out := filepath.Join(td, "out.avi")
+	target, dur, err := e.runNativeXvid(context.Background(), info, ConvertOptions{Preset: "xvid_compact", StripAudio: true}, out, func(progressInfo) {})
+	if err != nil {
+		t.Fatalf("native path failed: %v", err)
+	}
+	if target == nil || ratFloat(target) != 30 || math.Abs(dur-float64(frames)/30) > 1e-6 {
+		t.Fatalf("timing fps=%v dur=%v", target, dur)
+	}
+	if !fileExists(out) {
+		t.Fatal("remuxed AVI missing")
+	}
+	if fileExists(out + ".video.tmp.m4v") {
+		t.Fatal("temporary elementary stream was not cleaned up")
+	}
+	outInfo, err := probeMedia(e.caps.FFprobe, out, true)
+	if err != nil {
+		t.Fatalf("probe remuxed output: %v", err)
+	}
+	if !strings.EqualFold(outInfo.CodecTag, "XVID") && !strings.EqualFold(outInfo.Codec, "mpeg4") {
+		t.Fatalf("remuxed output is %s/%s, want mpeg4/XVID", outInfo.Codec, outInfo.CodecTag)
+	}
+}
+
+func TestNativeXvidFakeWrongFrameCount(t *testing.T) {
+	e := nativeTestEngine(t)
+	td := t.TempDir()
+	es, frames := makeRealM4V(t, e.caps.FFmpeg, td, 20)
+	installFakeXvid(t, es, map[string]string{"PRERECS_FAKE_XVID_VOPS": "15"})
+	info := MediaInfo{Path: filepath.Join(td, "src.avi"), Codec: "ffv1", FPS: "30/1", FPSFloat: 30, FrameCount: int64(frames), FrameCountExact: true, Duration: float64(frames) / 30}
+	out := filepath.Join(td, "out.avi")
+	_, _, err := e.runNativeXvid(context.Background(), info, ConvertOptions{Preset: "xvid_compact", StripAudio: true}, out, func(progressInfo) {})
+	if err == nil || !strings.Contains(err.Error(), "VOP") {
+		t.Fatalf("expected VOP count failure, got %v", err)
+	}
+	if fileExists(out) {
+		t.Fatal("no AVI should exist when the frame-integrity check fails")
+	}
+	if fileExists(out + ".video.tmp.m4v") {
+		t.Fatal("temporary stream leaked")
+	}
+}
+
+func TestNativeXvidFakeExitError(t *testing.T) {
+	e := nativeTestEngine(t)
+	td := t.TempDir()
+	es, frames := makeRealM4V(t, e.caps.FFmpeg, td, 10)
+	installFakeXvid(t, es, map[string]string{"PRERECS_FAKE_XVID_EXIT": "3"})
+	info := MediaInfo{Path: filepath.Join(td, "src.avi"), Codec: "ffv1", FPS: "30/1", FPSFloat: 30, FrameCount: int64(frames), FrameCountExact: true, Duration: float64(frames) / 30}
+	out := filepath.Join(td, "out.avi")
+	_, _, err := e.runNativeXvid(context.Background(), info, ConvertOptions{Preset: "xvid_compact", StripAudio: true}, out, func(progressInfo) {})
+	if err == nil || !strings.Contains(err.Error(), "native Xvid failed") {
+		t.Fatalf("expected encoder failure, got %v", err)
+	}
+	if fileExists(out) {
+		t.Fatal("output must not exist after encoder failure")
+	}
+}
+
+func TestNativeXvidFakeCancellation(t *testing.T) {
+	e := nativeTestEngine(t)
+	td := t.TempDir()
+	es, frames := makeRealM4V(t, e.caps.FFmpeg, td, 60)
+	installFakeXvid(t, es, map[string]string{"PRERECS_FAKE_XVID_DELAY": "80ms"})
+	info := MediaInfo{Path: filepath.Join(td, "src.avi"), Codec: "ffv1", FPS: "30/1", FPSFloat: 30, FrameCount: int64(frames), FrameCountExact: true, Duration: float64(frames) / 30}
+	out := filepath.Join(td, "out.avi")
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	_, _, err := e.runNativeXvid(ctx, info, ConvertOptions{Preset: "xvid_compact", StripAudio: true}, out, func(progressInfo) {})
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected cancellation, got %v", err)
+	}
+	if fileExists(out + ".video.tmp.m4v") {
+		t.Fatal("temporary stream leaked after cancellation")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Verification-failure cleanup (#3)
+// ---------------------------------------------------------------------------
+
+// The source claims an audio track the file does not actually carry, so a real
+// encode succeeds but the output legitimately fails verification.
+func encodeButVerifyFails(t *testing.T) (*Engine, MediaInfo) {
+	t.Helper()
+	caps, enc, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	if !enc["libxvid"] || !enc["ffv1"] {
+		t.Skip("libxvid/ffv1 unavailable")
+	}
+	caps.HasNativeXvid = false
+	td := t.TempDir()
+	src := filepath.Join(td, "clip.avi")
+	if b, err := exec.Command(caps.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30",
+		"-frames:v", "20", "-c:v", "ffv1", src,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("fixture: %v %s", err, b)
+	}
+	info, err := probeMedia(caps.FFprobe, src, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.Audio = []string{"aac"} // lie: the AVI has no audio stream
+	return &Engine{caps: caps, enc: enc}, info
+}
+
+func TestProcessItemRemovesVerifyFailedOutput(t *testing.T) {
+	e, info := encodeButVerifyFails(t)
+	outDir := t.TempDir()
+	rep, lines := captureReporter()
+	item := processItem(context.Background(), theme{}, e, info, ConvertOptions{Preset: "xvid_compact", OutputDir: outDir}, rep)
+	if item.Status != "failed" {
+		t.Fatalf("status=%q, want failed", item.Status)
+	}
+	if !strings.Contains(item.Message, "audio") {
+		t.Fatalf("expected audio mismatch message, got %q", item.Message)
+	}
+	if item.Output != "" && fileExists(item.Output) {
+		t.Fatalf("verification-failed output left behind: %s", item.Output)
+	}
+	if item.Elapsed <= 0 {
+		t.Fatal("elapsed time not recorded through verification")
+	}
+	for _, l := range *lines {
+		if strings.Contains(l, "VERIFIED") {
+			t.Fatalf("VERIFIED printed for failed output")
+		}
+	}
+	entries, err := os.ReadDir(outDir)
+	if err == nil {
+		for _, en := range entries {
+			if supportedExt[strings.ToLower(filepath.Ext(en.Name()))] {
+				t.Fatalf("output dir still contains media file %s", en.Name())
+			}
+		}
+	}
+}
+
+func TestProcessItemPreservesExistingBadCandidate(t *testing.T) {
+	e, info := encodeButVerifyFails(t)
+	outDir := t.TempDir()
+	stale := filepath.Join(outDir, "clip_xvid_compact.avi")
+	garbage := []byte("this is not a valid avi file")
+	if err := os.WriteFile(stale, garbage, 0644); err != nil {
+		t.Fatal(err)
+	}
+	rep, _ := captureReporter()
+	item := processItem(context.Background(), theme{}, e, info, ConvertOptions{Preset: "xvid_compact", OutputDir: outDir}, rep)
+	if item.Status != "failed" {
+		t.Fatalf("status=%q, want failed (verification should fail on fake audio)", item.Status)
+	}
+	data, err := os.ReadFile(stale)
+	if err != nil || string(data) != string(garbage) {
+		t.Fatal("pre-existing invalid candidate was not preserved")
+	}
+	// The freshly encoded numbered copy must be gone after its verify failure.
+	if fileExists(filepath.Join(outDir, "clip_xvid_compact_2.avi")) {
+		t.Fatal("numbered output was not removed after verification failure")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Prompt EOF propagation (#4)
+// ---------------------------------------------------------------------------
+
+func TestAskLineEOF(t *testing.T) {
+	old := stdinReader
+	defer func() { stdinReader = old }()
+	stdinReader = bufio.NewReader(strings.NewReader(""))
+	if _, err := askLine("X", "def"); !errors.Is(err, io.EOF) {
+		t.Fatalf("expected EOF, got %v", err)
+	}
+	// Trailing content without a newline is still a valid answer; the NEXT read
+	// reports EOF.
+	stdinReader = bufio.NewReader(strings.NewReader("y"))
+	v, err := askLine("X", "")
+	if err != nil || v != "y" {
+		t.Fatalf("last-line answer=%q err=%v", v, err)
+	}
+	if _, err := askLine("X", "def"); !errors.Is(err, io.EOF) {
+		t.Fatalf("second read expected EOF, got %v", err)
+	}
+}
+
+func TestAskChoiceEOF(t *testing.T) {
+	old := stdinReader
+	defer func() { stdinReader = old }()
+	stdinReader = bufio.NewReader(strings.NewReader(""))
+	done := make(chan error, 1)
+	go func() {
+		_, err := askChoice("Choose", []string{"1", "2"}, "1")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("expected EOF, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("askChoice looped forever on EOF")
+	}
+}
+
+func TestAskYesNoEOF(t *testing.T) {
+	old := stdinReader
+	defer func() { stdinReader = old }()
+	stdinReader = bufio.NewReader(strings.NewReader(""))
+	if _, err := askYesNo("OK?", true); !errors.Is(err, io.EOF) {
+		t.Fatalf("expected EOF, got %v", err)
+	}
+	stdinReader = bufio.NewReader(strings.NewReader("n"))
+	v, err := askYesNo("OK?", true)
+	if err != nil || v {
+		t.Fatalf("answer=%v err=%v", v, err)
+	}
+}
+
+func TestChoosePresetEOF(t *testing.T) {
+	old := stdinReader
+	defer func() { stdinReader = old }()
+	e := &Engine{caps: Capabilities{HasXvid: true}}
+	stdinReader = bufio.NewReader(strings.NewReader(""))
+	done := make(chan error, 1)
+	go func() {
+		_, err := choosePreset(theme{}, e, nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("expected EOF, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("choosePreset looped forever on EOF")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sparse numbered outputs (#5)
+// ---------------------------------------------------------------------------
+
+func TestOutputCandidatesSparse(t *testing.T) {
+	td := t.TempDir()
+	src := filepath.Join(td, "clip.avi")
+	if err := os.WriteFile(src, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := t.TempDir()
+	// Sparse: base name missing, _2 and _4 exist.
+	for _, n := range []string{"clip_xvid_compact_2.avi", "clip_xvid_compact_4.avi"} {
+		if err := os.WriteFile(filepath.Join(out, n), []byte("old"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	existing, next, err := outputCandidates(src, out, "xvid_compact")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(existing) != 2 || filepath.Base(existing[0]) != "clip_xvid_compact_2.avi" || filepath.Base(existing[1]) != "clip_xvid_compact_4.avi" {
+		t.Fatalf("existing=%v, want [_2 _4] in order", existing)
+	}
+	if filepath.Base(next) != "clip_xvid_compact.avi" {
+		t.Fatalf("next=%s, want base name (lowest free)", filepath.Base(next))
+	}
+}
+
+func TestOutputCandidatesContiguous(t *testing.T) {
+	td := t.TempDir()
+	src := filepath.Join(td, "clip.avi")
+	if err := os.WriteFile(src, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := t.TempDir()
+	for _, n := range []string{"clip_xvid_compact.avi", "clip_xvid_compact_2.avi"} {
+		if err := os.WriteFile(filepath.Join(out, n), []byte("old"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	existing, next, err := outputCandidates(src, out, "xvid_compact")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(existing) != 2 {
+		t.Fatalf("existing=%v", existing)
+	}
+	if filepath.Base(next) != "clip_xvid_compact_3.avi" {
+		t.Fatalf("next=%s, want _3", filepath.Base(next))
+	}
+	releaseOutputReservation(next)
+	// Non-numeric or wrong-suffix names must not be treated as candidates.
+	os.WriteFile(filepath.Join(out, "clip_xvid_compact_x.avi"), []byte("y"), 0644)
+	os.WriteFile(filepath.Join(out, "clip_xvid_compact_7.bak"), []byte("y"), 0644)
+	os.WriteFile(filepath.Join(out, "clip_xvid_compact_99.avi"), []byte("old"), 0644)
+	existing, next, err = outputCandidates(src, out, "xvid_compact")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(existing) != 3 || filepath.Base(existing[2]) != "clip_xvid_compact_99.avi" {
+		t.Fatalf("existing=%v", existing)
+	}
+	if filepath.Base(next) != "clip_xvid_compact_3.avi" {
+		t.Fatalf("next=%s, want lowest free slot _3", filepath.Base(next))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CLI robustness (#6, #9, #10)
+// ---------------------------------------------------------------------------
+
+func TestCollectOptionsValidatesTimingFlags(t *testing.T) {
+	e := &Engine{caps: Capabilities{HasProRes: true}, enc: map[string]bool{"prores_ks": true}}
+	infos := []MediaInfo{{Path: "clip.mp4", Codec: "h264"}}
+	if _, err := collectOptions(cliConfig{preset: "edit", timescale: "abc", yes: true}, theme{}, e, infos); err == nil || !strings.Contains(err.Error(), "timescale") {
+		t.Fatalf("bad --timescale not rejected up front: %v", err)
+	}
+	if _, err := collectOptions(cliConfig{preset: "edit", captureFPS: "abc", timescale: "0.1", yes: true}, theme{}, e, infos); err == nil || !strings.Contains(err.Error(), "capture-fps") {
+		t.Fatalf("bad --capture-fps not rejected up front: %v", err)
+	}
+	if _, err := collectOptions(cliConfig{preset: "edit", timescale: "0.1", captureFPS: "30", yes: true}, theme{}, e, infos); err != nil {
+		t.Fatalf("valid timing flags rejected: %v", err)
+	}
+	opts, err := collectOptions(cliConfig{preset: "edit", timescale: "1/10", captureFPS: "60000/1001", yes: true}, theme{}, e, infos)
+	if err != nil || !opts.Conform || opts.Timescale != "1/10" {
+		t.Fatalf("fractional timing flags: opts=%+v err=%v", opts, err)
+	}
+}
+
+func TestMissingInputExitCode(t *testing.T) {
+	if missingInputExitCode(cliConfig{yes: true}) == 0 {
+		t.Fatal("--yes with no input must exit nonzero")
+	}
+	if missingInputExitCode(cliConfig{}) != 0 {
+		t.Fatal("interactive EOF should still exit 0")
+	}
+}
+
+func TestReorderArgs(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       []string
+		wantErr  bool
+		wantLast []string
+		check    func(t *testing.T, c cliConfig, args []string)
+	}{
+		{
+			name: "options first",
+			in:   []string{"--preset", "share", "file.avi"},
+			check: func(t *testing.T, c cliConfig, args []string) {
+				if c.preset != "share" || len(args) != 1 || args[0] != "file.avi" {
+					t.Fatalf("cfg=%+v args=%v", c, args)
+				}
+			},
+		},
+		{
+			name: "options after positional",
+			in:   []string{"file.avi", "--preset", "share"},
+			check: func(t *testing.T, c cliConfig, args []string) {
+				if c.preset != "share" || len(args) != 1 || args[0] != "file.avi" {
+					t.Fatalf("cfg=%+v args=%v", c, args)
+				}
+			},
+		},
+		{
+			name: "interleaved",
+			in:   []string{"file1.avi", "--preset", "share", "file2.avi", "--yes"},
+			check: func(t *testing.T, c cliConfig, args []string) {
+				if c.preset != "share" || !c.yes || len(args) != 2 || args[0] != "file1.avi" || args[1] != "file2.avi" {
+					t.Fatalf("cfg=%+v args=%v", c, args)
+				}
+			},
+		},
+		{
+			name: "dash terminator",
+			in:   []string{"--", "-weird.avi"},
+			check: func(t *testing.T, c cliConfig, args []string) {
+				if len(args) != 1 || args[0] != "-weird.avi" {
+					t.Fatalf("cfg=%+v args=%v", c, args)
+				}
+			},
+		},
+		{
+			name: "inline value",
+			in:   []string{"file.avi", "--preset=share"},
+			check: func(t *testing.T, c cliConfig, args []string) {
+				if c.preset != "share" {
+					t.Fatalf("cfg=%+v", c)
+				}
+			},
+		},
+		{
+			name: "single dash form",
+			in:   []string{"file.avi", "-preset", "share", "-yes"},
+			check: func(t *testing.T, c cliConfig, args []string) {
+				if c.preset != "share" || !c.yes {
+					t.Fatalf("cfg=%+v", c)
+				}
+			},
+		},
+		{
+			name:    "missing value",
+			in:      []string{"file.avi", "--preset"},
+			wantErr: true,
+		},
+		{
+			name:    "unknown option",
+			in:      []string{"file.avi", "--bogus"},
+			wantErr: true,
+		},
+		{
+			name: "bool with inline value",
+			in:   []string{"file.avi", "--yes=true"},
+			check: func(t *testing.T, c cliConfig, args []string) {
+				if !c.yes {
+					t.Fatalf("cfg=%+v", c)
+				}
+			},
+		},
+		{
+			name: "timescale and capture fps after path",
+			in:   []string{"file.avi", "--timescale", "0.1", "--capture-fps", "30", "--strip-audio"},
+			check: func(t *testing.T, c cliConfig, args []string) {
+				if c.timescale != "0.1" || c.captureFPS != "30" || !c.stripAudio {
+					t.Fatalf("cfg=%+v", c)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, args, err := parseFlags(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got cfg=%+v args=%v", cfg, args)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.check(t, cfg, args)
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Generated-name guard (#12), codec classes (#8), frame-rate fallback (#13),
+// Vulkan probe timeout (#11)
+// ---------------------------------------------------------------------------
+
+func TestIsGeneratedOutputName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"clip_prores_lt.mov":            true,
+		"clip_xvid_max_q2.avi":          true,
+		"clip_xvid_max_q2_3.avi":        true,
+		"clip_utvideo_lossless_10.avi":  true,
+		"CLIP_PRORES_LT.MOV":            true, // extension is case-insensitive
+		"clip_prores_lt_extra.mov":      false,
+		"clip_xvid_compact_abc.avi":     false,
+		"clip_xvid_compact_7.bak":       false,
+		"myxvid_compact.avi":            false, // no underscore boundary
+		"xvid_compact.avi":              false, // bare preset name is not stem_preset
+		"clip.mp4":                      false,
+		"clip_prores_lt.mp4":            false, // outputs are only .avi/.mov
+		"vacation_prores_4444.mov":      true,  // exact generated pattern: skip
+		"vacation_prores_4444_12.mov":   true,
+		"holiday_magicyuv_lossless.AVI": true,
+	} {
+		if got := isGeneratedOutputName(name); got != want {
+			t.Errorf("isGeneratedOutputName(%q)=%v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestExpandInputsSkipsGeneratedOutputs(t *testing.T) {
+	td := t.TempDir()
+	for _, name := range []string{"a.mp4", "b_prores_lt.mov", "c_xvid_max_q2_2.avi", "d_xvid_max_q2x.avi", "note.txt"} {
+		if err := os.WriteFile(filepath.Join(td, name), []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := expandInputs([]string{td})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bases []string
+	for _, p := range got {
+		bases = append(bases, filepath.Base(p))
+	}
+	want := []string{"a.mp4", "d_xvid_max_q2x.avi"}
+	if strings.Join(bases, ",") != strings.Join(want, ",") {
+		t.Fatalf("expanded=%v, want %v", bases, want)
+	}
+}
+
+func TestSourceClassDistribution(t *testing.T) {
+	for codec, want := range map[string]string{
+		"h264": "compressed", "hevc": "compressed", "av1": "compressed",
+		"vp9": "compressed", "mpeg4": "compressed", "mpeg2video": "compressed",
+		"wmv1": "compressed", "wmv2": "compressed", "wmv3": "compressed",
+		"h263": "compressed", "h263p": "compressed", "flv1": "compressed",
+		"theora": "compressed", "vp6": "compressed", "vp6f": "compressed",
+		"vp6a": "compressed", "cinepak": "compressed", "msmpeg4v3": "compressed",
+		"lagarith": "lossless", "ffv1": "lossless", "utvideo": "lossless",
+		"prores": "intermediate", "dnxhd": "intermediate",
+		"mjpeg":   "other", // acquisition/intermediate codec, not distribution
+		"unknown": "other",
+	} {
+		if got := sourceClass(MediaInfo{Codec: codec}); got != want {
+			t.Errorf("sourceClass(%s)=%q, want %q", codec, got, want)
+		}
+	}
+	// Codec-tag driven detection still works for xvid/divx/dx50 mpeg4.
+	if got := sourceClass(MediaInfo{Codec: "mpeg4", CodecTag: "DX50"}); got != "compressed" {
+		t.Errorf("mpeg4/DX50 = %q", got)
+	}
+}
+
+func TestSelectFrameRate(t *testing.T) {
+	if s, r := selectFrameRate("30/1", "25/1"); s != "30/1" || r == nil || ratFloat(r) != 30 {
+		t.Fatalf("avg preferred: %s %v", s, r)
+	}
+	if s, r := selectFrameRate("0/0", "30/1"); s != "30/1" || r == nil || ratFloat(r) != 30 {
+		t.Fatalf("r_frame_rate fallback: %s %v", s, r)
+	}
+	if s, r := selectFrameRate("", "30000/1001"); s != "30000/1001" || r == nil {
+		t.Fatalf("missing avg: %s %v", s, r)
+	}
+	if s, r := selectFrameRate("0/0", "0/0"); s != "" || r != nil {
+		t.Fatalf("both unknown: %s %v", s, r)
+	}
+	if s, r := selectFrameRate("junk", "30/1"); s != "30/1" || r == nil {
+		t.Fatalf("bad avg falls back: %s %v", s, r)
+	}
+}
+
+func TestProbeProResVulkanTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fake executable is not portable to Windows")
+	}
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "ffmpeg")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nsleep 60\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	old := vulkanProbeTimeout
+	vulkanProbeTimeout = 300 * time.Millisecond
+	defer func() { vulkanProbeTimeout = old }()
+	start := time.Now()
+	if probeProResVulkan(fake) {
+		t.Fatal("hung probe reported Vulkan available")
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("probe was not bounded by the timeout: %v", elapsed)
 	}
 }

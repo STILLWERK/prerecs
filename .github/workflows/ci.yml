@@ -52,6 +52,14 @@ jobs:
           go-version: '1.26.x'
           cache-dependency-path: go.mod
 
+      - name: Vet Windows-tagged sources
+        shell: pwsh
+        run: |
+          $env:CGO_ENABLED = '0'
+          $env:GOOS = 'windows'
+          $env:GOARCH = 'amd64'
+          go vet ./...
+
       - name: Build and check version
         shell: pwsh
         run: |

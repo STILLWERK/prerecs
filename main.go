@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-const version = "1.0.1"
+const version = "1.0.2"
 
 var supportedExt = map[string]bool{
 	".avi": true, ".mp4": true, ".m4v": true, ".mov": true, ".mkv": true,
@@ -31,14 +31,6 @@ var supportedExt = map[string]bool{
 }
 
 var stdinReader = bufio.NewReader(os.Stdin)
-
-type AudioInfo struct {
-	Index      int
-	Codec      string
-	Channels   int
-	SampleRate int
-	Language   string
-}
 
 type MediaInfo struct {
 	Path            string
@@ -62,7 +54,8 @@ type MediaInfo struct {
 	ColorPrimaries  string
 	HasAlpha        bool
 	Chroma          string
-	Audio           []AudioInfo
+	// Audio holds the codec name of each audio stream, in stream order.
+	Audio []string
 }
 
 type Capabilities struct {
@@ -78,7 +71,6 @@ type Capabilities struct {
 	HasNativeXvid   bool
 	XvidEncRaw      string
 	MagicInstalled  bool
-	MagicDetail     string
 }
 
 type ConvertOptions struct {
@@ -120,28 +112,23 @@ type BatchResult struct {
 
 type ffprobeDoc struct {
 	Streams []struct {
-		Index            int               `json:"index"`
-		CodecName        string            `json:"codec_name"`
-		Profile          string            `json:"profile"`
-		CodecType        string            `json:"codec_type"`
-		Width            int               `json:"width"`
-		Height           int               `json:"height"`
-		PixFmt           string            `json:"pix_fmt"`
-		BitsPerRawSample string            `json:"bits_per_raw_sample"`
-		AvgFrameRate     string            `json:"avg_frame_rate"`
-		RFrameRate       string            `json:"r_frame_rate"`
-		Duration         string            `json:"duration"`
-		NBFrames         string            `json:"nb_frames"`
-		NBReadPackets    string            `json:"nb_read_packets"`
-		NBReadFrames     string            `json:"nb_read_frames"`
-		CodecTagString   string            `json:"codec_tag_string"`
-		ColorRange       string            `json:"color_range"`
-		ColorSpace       string            `json:"color_space"`
-		ColorTransfer    string            `json:"color_transfer"`
-		ColorPrimaries   string            `json:"color_primaries"`
-		Channels         int               `json:"channels"`
-		SampleRate       string            `json:"sample_rate"`
-		Tags             map[string]string `json:"tags"`
+		CodecName        string `json:"codec_name"`
+		Profile          string `json:"profile"`
+		CodecType        string `json:"codec_type"`
+		Width            int    `json:"width"`
+		Height           int    `json:"height"`
+		PixFmt           string `json:"pix_fmt"`
+		BitsPerRawSample string `json:"bits_per_raw_sample"`
+		AvgFrameRate     string `json:"avg_frame_rate"`
+		RFrameRate       string `json:"r_frame_rate"`
+		Duration         string `json:"duration"`
+		NBFrames         string `json:"nb_frames"`
+		NBReadFrames     string `json:"nb_read_frames"`
+		CodecTagString   string `json:"codec_tag_string"`
+		ColorRange       string `json:"color_range"`
+		ColorSpace       string `json:"color_space"`
+		ColorTransfer    string `json:"color_transfer"`
+		ColorPrimaries   string `json:"color_primaries"`
 	} `json:"streams"`
 	Format struct {
 		Duration string `json:"duration"`
@@ -212,6 +199,10 @@ func main() {
 		paths, err := gatherInputs(jobArgs, ui)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				if code := missingInputExitCode(cfg); code != 0 {
+					fmt.Fprintln(os.Stderr, ui.red("Error: ")+"no input paths given and stdin reached EOF")
+					os.Exit(code)
+				}
 				return
 			}
 			fmt.Fprintln(os.Stderr, ui.red("Error: ")+err.Error())
@@ -223,6 +214,9 @@ func main() {
 		}
 		if len(paths) == 0 {
 			fmt.Println(ui.dim("No files selected."))
+			if code := missingInputExitCode(cfg); code != 0 {
+				os.Exit(code)
+			}
 			return
 		}
 
@@ -241,6 +235,9 @@ func main() {
 
 		opts, err := collectOptions(cfg, ui, engine, infos)
 		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return
+			}
 			fmt.Fprintln(os.Stderr, ui.red("Error: ")+err.Error())
 			if cfg.yes {
 				os.Exit(1)
@@ -250,14 +247,21 @@ func main() {
 		}
 
 		printPlan(ui, infos, opts)
-		if !cfg.yes && !askYesNo("Start conversion?", true) {
-			fmt.Println(ui.dim("Cancelled."))
-			if !askYesNo("Start a new job?", true) {
+		if !cfg.yes {
+			start, err := askYesNo("Start conversion?", true)
+			if err != nil {
 				return
 			}
-			jobArgs = nil
-			cfg = resetInteractiveJob(cfg)
-			continue
+			if !start {
+				fmt.Println(ui.dim("Cancelled."))
+				again, err := askYesNo("Start a new job?", true)
+				if err != nil || !again {
+					return
+				}
+				jobArgs = nil
+				cfg = resetInteractiveJob(cfg)
+				continue
+			}
 		}
 
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -277,7 +281,10 @@ func main() {
 			fmt.Println("  1. Convert more clips")
 			fmt.Println("  2. Open last output folder")
 			fmt.Println("  3. Exit")
-			choice := askChoice("Choose", []string{"1", "2", "3"}, "1")
+			choice, err := askChoice("Choose", []string{"1", "2", "3"}, "1")
+			if err != nil {
+				return
+			}
 			switch choice {
 			case "1":
 				jobArgs = nil
@@ -297,6 +304,15 @@ func main() {
 	nextJob:
 		continue
 	}
+}
+
+// missingInputExitCode treats a headless invocation that produced zero inputs
+// as a usage error: automation must not read "did nothing" as success.
+func missingInputExitCode(cfg cliConfig) int {
+	if cfg.yes {
+		return 2
+	}
+	return 0
 }
 
 func headlessExitCode(result BatchResult, cancelled error) int {
@@ -346,6 +362,67 @@ func resetInteractiveJob(c cliConfig) cliConfig {
 	return c
 }
 
+// flagNeedsValue lists every option that consumes a following argument; all
+// other recognised options are booleans.
+var flagNeedsValue = map[string]bool{
+	"preset": true, "timescale": true, "capture-fps": true, "output": true,
+}
+
+var flagBool = map[string]bool{
+	"strip-audio": true, "yes": true, "force-xvid": true, "cpu-prores": true,
+	"plain": true, "version": true, "h": true, "help": true,
+}
+
+// reorderArgs moves recognised options ahead of positional paths before
+// flag.Parse sees them. The standard flag package stops parsing at the first
+// non-flag argument, which would treat `PreRecs file.avi --preset share` as
+// three filenames. Quoting is already resolved by the OS at this point, and
+// `--` terminates option handling so dash-prefixed paths remain usable.
+func reorderArgs(args []string) ([]string, error) {
+	flags := []string{}
+	positional := []string{}
+	endFlags := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if endFlags {
+			positional = append(positional, a)
+			continue
+		}
+		if a == "--" {
+			endFlags = true
+			continue
+		}
+		if len(a) > 1 && a[0] == '-' {
+			name := strings.TrimLeft(a, "-")
+			hasInline := false
+			if eq := strings.IndexByte(name, '='); eq >= 0 {
+				name = name[:eq]
+				hasInline = true
+			}
+			switch {
+			case flagNeedsValue[name]:
+				flags = append(flags, a)
+				if !hasInline {
+					if i+1 >= len(args) {
+						return nil, fmt.Errorf("flag needs an argument: %s", a)
+					}
+					i++
+					flags = append(flags, args[i])
+				}
+			case flagBool[name]:
+				flags = append(flags, a)
+			default:
+				return nil, fmt.Errorf("unknown option %s", a)
+			}
+			continue
+		}
+		positional = append(positional, a)
+	}
+	// Re-insert the end-of-options marker so positionals that begin with '-'
+	// are not re-parsed as flags by flag.Parse.
+	return append(flags, append([]string{"--"}, positional...)...), nil
+}
+
 func parseFlags(args []string) (cliConfig, []string, error) {
 	for _, a := range args {
 		if a == "-h" || a == "--help" {
@@ -366,7 +443,11 @@ func parseFlags(args []string) (cliConfig, []string, error) {
 	fs.BoolVar(&c.cpuProRes, "cpu-prores", false, "disable experimental Vulkan ProRes fast path and force CPU prores_ks")
 	fs.BoolVar(&c.plain, "plain", false, "disable ANSI colors/progress styling")
 	fs.BoolVar(&c.showVersion, "version", false, "print version")
-	if err := fs.Parse(args); err != nil {
+	reordered, err := reorderArgs(args)
+	if err != nil {
+		return c, nil, err
+	}
+	if err := fs.Parse(reordered); err != nil {
 		return c, nil, err
 	}
 	return c, fs.Args(), nil
@@ -532,7 +613,10 @@ func expandInputs(items []string) ([]string, error) {
 				if e.IsDir() {
 					continue
 				}
-				if supportedExt[strings.ToLower(filepath.Ext(e.Name()))] {
+				// Skip files that look like this tool's own generated outputs
+				// (`stem_<preset>.ext`, `stem_<preset>_N.ext`) so a later run
+				// against the same folder does not re-ingest its own results.
+				if supportedExt[strings.ToLower(filepath.Ext(e.Name()))] && !isGeneratedOutputName(e.Name()) {
 					names = append(names, filepath.Join(p, e.Name()))
 				}
 			}
@@ -558,7 +642,7 @@ func expandInputs(items []string) ([]string, error) {
 func printSourceTable(ui theme, infos []MediaInfo) {
 	fmt.Println()
 	fmt.Println(ui.bold("SOURCE"))
-	fmt.Printf("  %-3s %-25s %-11s %-9s %-9s %-11s %-10s %-10s\n", "#", "File", "Size", "FPS", "Frames", "Codec", "File size", "Source")
+	fmt.Printf("  %-3s %-25s %-11s %-9s %-9s %-11s %-10s %-10s\n", "#", "File", "Dimensions", "FPS", "Frames", "Codec", "File size", "Source")
 	fmt.Printf("  %-3s %-25s %-11s %-9s %-9s %-11s %-10s %-10s\n", "---", "-------------------------", "-----------", "---------", "---------", "-----------", "----------", "----------")
 	for i, in := range infos {
 		name := clipName(filepath.Base(in.Path), 25)
@@ -576,6 +660,55 @@ func printSourceTable(ui theme, infos []MediaInfo) {
 			i+1, name, fmt.Sprintf("%dx%d", in.Width, in.Height), fps, frames, codec, humanBytes(in.SizeBytes), sourceClass(in))
 	}
 	fmt.Println()
+}
+
+// generatedOutputSuffixes are the canonical preset tokens PreRecs appends to
+// output filenames: `stem_<preset>.ext` and `stem_<preset>_N.ext`.
+var generatedOutputSuffixes = []string{
+	"xvid_compact", "xvid_max_q2", "xvid_efficient_q2", "xvid_small", "xvid_max",
+	"prores_lt", "prores_422", "prores_hq", "prores_4444",
+	"magicyuv_lossless", "utvideo_lossless",
+}
+
+// isGeneratedOutputName reports whether a filename matches the exact naming
+// convention of a PreRecs output. It only triggers on a trailing
+// `_<preset>` or `_<preset>_<digits>` before an .avi/.mov extension — the
+// precise names this program itself produces — so arbitrary user media with a
+// vaguely similar substring stays eligible. A user file that happens to share
+// the exact generated pattern is indistinguishable from real output and is
+// skipped only inside directory scans; it can still be passed explicitly.
+func isGeneratedOutputName(name string) bool {
+	// Case-fold the whole name: Windows filesystems are case-insensitive, and
+	// generated names always carry lowercase preset tokens.
+	low := strings.ToLower(name)
+	ext := filepath.Ext(low)
+	if ext != ".avi" && ext != ".mov" {
+		return false
+	}
+	stem := low[:len(low)-len(ext)]
+	for _, p := range generatedOutputSuffixes {
+		if strings.HasSuffix(stem, "_"+p) {
+			return true
+		}
+		marker := "_" + p + "_"
+		idx := strings.LastIndex(stem, marker)
+		if idx >= 0 && isDigits(stem[idx+len(marker):]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func frameCountLabel(in MediaInfo) string {
@@ -596,8 +729,12 @@ func sourceClass(in MediaInfo) string {
 		return "compressed"
 	}
 	switch c {
-	case "h264", "hevc", "h265", "av1", "vp9", "vp8", "mpeg4", "mpeg2video", "mpeg1video", "vc1", "wmv3", "msmpeg4v3":
+	case "h264", "hevc", "h265", "av1", "vp9", "vp8", "mpeg4", "mpeg2video", "mpeg1video", "vc1", "wmv3", "msmpeg4v3",
+		"wmv1", "wmv2", "h263", "h263p", "h263i", "flv1", "theora", "vp6", "vp6f", "vp6a", "cinepak":
 		return "compressed"
+		// MJPEG is deliberately absent: it is common as an acquisition/intermediate
+		// codec (capture cards, HDMI recorders), not only as distribution media,
+		// so it must not trigger the "already compressed" skip warning.
 	case "lagarith", "magicyuv", "ffv1", "huffyuv", "utvideo", "rawvideo":
 		return "lossless"
 	case "prores", "dnxhd", "cfhd":
@@ -699,6 +836,18 @@ func recommendedProResPreset(infos []MediaInfo) string {
 
 func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (ConvertOptions, error) {
 	opts := ConvertOptions{OutputDir: cfg.outputDir, StripAudio: cfg.stripAudio, ForceXvid: cfg.forceXvid, CPUProRes: cfg.cpuProRes}
+	// Validate CLI timing flags once up front so a bad value fails fast instead
+	// of failing every item mid-batch.
+	if cfg.timescale != "" {
+		if _, err := parseRat(cfg.timescale); err != nil {
+			return opts, fmt.Errorf("invalid --timescale value: %w", err)
+		}
+	}
+	if cfg.captureFPS != "" {
+		if _, err := parseRat(cfg.captureFPS); err != nil {
+			return opts, fmt.Errorf("invalid --capture-fps value: %w", err)
+		}
+	}
 	if cfg.preset != "" {
 		p, err := normalizePreset(cfg.preset)
 		if err != nil {
@@ -727,7 +876,10 @@ func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (Conv
 				fmt.Println("  1. Skip these files / keep originals " + ui.green("recommended"))
 				fmt.Println("  2. Force Xvid anyway")
 				fmt.Println("  3. Switch this job to ProRes 422 LT")
-				c := askChoice("Choose", []string{"1", "2", "3"}, "1")
+				c, err := askChoice("Choose", []string{"1", "2", "3"}, "1")
+				if err != nil {
+					return opts, err
+				}
 				switch c {
 				case "1":
 					opts.SkipCompressed = true
@@ -756,12 +908,25 @@ func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (Conv
 		opts.CaptureFPS = cfg.captureFPS
 	} else if !cfg.yes {
 		fmt.Println(ui.bold("TIMING"))
-		if askYesNo("Was this captured with reduced in-game timescale?", false) {
+		conform, err := askYesNo("Was this captured with reduced in-game timescale?", false)
+		if err != nil {
+			return opts, err
+		}
+		if conform {
 			opts.Conform = true
-			opts.CaptureFPS = askLine("Capture FPS override (Enter = detected FPS)", "")
-			opts.Timescale = askLine("Game timescale", "0.1")
+			if opts.CaptureFPS, err = askLine("Capture FPS override (Enter = detected FPS)", ""); err != nil {
+				return opts, err
+			}
+			if opts.Timescale, err = askLine("Game timescale", "0.1"); err != nil {
+				return opts, err
+			}
 			if _, err := parseRat(opts.Timescale); err != nil {
 				return opts, err
+			}
+			if opts.CaptureFPS != "" {
+				if _, err := parseRat(opts.CaptureFPS); err != nil {
+					return opts, err
+				}
 			}
 			printEffectiveRates(ui, infos, opts)
 			fmt.Println(ui.dim("  Audio will be stripped when conforming timing; copying it unchanged would desynchronize it."))
@@ -781,7 +946,11 @@ func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (Conv
 			fmt.Println(ui.bold("AUDIO"))
 			fmt.Println("  1. Keep audio unchanged " + ui.green("recommended"))
 			fmt.Println("  2. Strip audio")
-			opts.StripAudio = askChoice("Choose", []string{"1", "2"}, "1") == "2"
+			choice, err := askChoice("Choose", []string{"1", "2"}, "1")
+			if err != nil {
+				return opts, err
+			}
+			opts.StripAudio = choice == "2"
 		}
 		if !opts.StripAudio {
 			bad := incompatibleAudioCopies(opts.Preset, infos)
@@ -794,7 +963,11 @@ func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (Conv
 				fmt.Println(ui.bold("AUDIO COMPATIBILITY"))
 				fmt.Println(ui.yellow("  " + msg))
 				fmt.Println(ui.dim("  PreRecs will not silently remux audio into a container where timing/framing may change."))
-				if askYesNo("Strip audio and continue?", true) {
+				strip, err := askYesNo("Strip audio and continue?", true)
+				if err != nil {
+					return opts, err
+				}
+				if strip {
 					opts.StripAudio = true
 				} else {
 					return opts, errors.New("audio copy cancelled; choose ProRes or strip audio")
@@ -806,7 +979,10 @@ func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (Conv
 	if opts.OutputDir == "" && !cfg.yes {
 		fmt.Println()
 		fmt.Println(ui.bold("OUTPUT"))
-		out := askLine("Folder (Enter = converted_prerecs beside each source)", "")
+		out, err := askLine("Folder (Enter = converted_prerecs beside each source)", "")
+		if err != nil {
+			return opts, err
+		}
 		opts.OutputDir = out
 	}
 	return opts, nil
@@ -831,10 +1007,10 @@ func incompatibleAudioCopies(preset string, infos []MediaInfo) []string {
 	seen := map[string]bool{}
 	for _, in := range infos {
 		for _, a := range in.Audio {
-			if audioCopyCompatible(preset, a.Codec) {
+			if audioCopyCompatible(preset, a) {
 				continue
 			}
-			label := filepath.Base(in.Path) + "=" + strings.ToUpper(a.Codec)
+			label := filepath.Base(in.Path) + "=" + strings.ToUpper(a)
 			if !seen[label] {
 				seen[label] = true
 				bad = append(bad, label)
@@ -967,7 +1143,10 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 		}
 		fmt.Printf("  3. LOSSLESS     %-13s %s\n", magicPrimary, ui.dim("fast lossless intermediate"))
 		fmt.Println("  4. MORE...")
-		c := askChoice("Choose", []string{"1", "2", "3", "4"}, "2")
+		c, err := askChoice("Choose", []string{"1", "2", "3", "4"}, "2")
+		if err != nil {
+			return "", err
+		}
 		switch c {
 		case "1":
 			if !e.caps.HasXvid {
@@ -1017,7 +1196,10 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 			}
 			fmt.Printf("  8. Ut Video Lossless (%s)\n", ut)
 			fmt.Println("  0. Back")
-			a := askChoice("Choose", []string{"0", "1", "2", "3", "4", "5", "6", "7", "8"}, "0")
+			a, err := askChoice("Choose", []string{"0", "1", "2", "3", "4", "5", "6", "7", "8"}, "0")
+			if err != nil {
+				return "", err
+			}
 			switch a {
 			case "1":
 				if e.caps.HasProRes {
@@ -1464,10 +1646,10 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		}
 	}
 	rep.finish()
-	item.Elapsed = time.Since(started)
 
 	if err != nil {
 		_ = os.Remove(out)
+		item.Elapsed = time.Since(started)
 		if errors.Is(err, context.Canceled) {
 			item.Status = "cancelled"
 			return item
@@ -1479,8 +1661,14 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		return item
 	}
 
+	// From here on `out` is a file this run produced. If it cannot pass
+	// verification it must not stay behind under the canonical output name
+	// masquerading as a valid result — remove it. (Pre-existing candidates are
+	// still preserved deliberately in the reuse check above.)
 	outInfo, err := probeMedia(e.caps.FFprobe, out, false)
 	if err != nil {
+		_ = os.Remove(out)
+		item.Elapsed = time.Since(started)
 		item.Status = "failed"
 		item.Message = err.Error()
 		rep.line(ui.red("VERIFY PROBE FAILED"))
@@ -1497,10 +1685,14 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	rep.finish()
 	if err != nil {
 		item.Status = processErrorStatus(err)
+		item.Elapsed = time.Since(started)
 		item.Message = err.Error()
 		if item.Status == "cancelled" {
+			// The encoded output is complete but unverified; keep it so a later
+			// run can re-check and reuse it instead of discarding the work.
 			rep.line(ui.yellow("VERIFY DECODE CANCELLED"))
 		} else {
+			_ = os.Remove(out)
 			rep.line(ui.red("VERIFY DECODE FAILED"))
 		}
 		rep.line(indentError(err.Error(), 2))
@@ -1511,6 +1703,8 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	item.OutputInfo = outInfo
 	problems := verifyOutput(info, outInfo, opts, expectedFPS, expectedDur)
 	if len(problems) > 0 {
+		_ = os.Remove(out)
+		item.Elapsed = time.Since(started)
 		item.Status = "failed"
 		item.Message = strings.Join(problems, "; ")
 		rep.line(ui.red("VERIFY FAILED"))
@@ -1521,6 +1715,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	}
 
 	item.Status = "ok"
+	item.Elapsed = time.Since(started)
 	rep.line(ui.green("VERIFIED"))
 	if info.FrameCount > 0 && outInfo.FrameCount > 0 {
 		msg := fmt.Sprintf("Frames: %d -> %d", info.FrameCount, outInfo.FrameCount)
@@ -1914,47 +2109,60 @@ func finishProgress(ui theme) {
 	}
 }
 
-func askLine(label, def string) string {
+func askLine(label, def string) (string, error) {
 	if def != "" {
 		fmt.Printf("  %s [%s] > ", label, def)
 	} else {
 		fmt.Printf("  %s > ", label)
 	}
-	line, _ := stdinReader.ReadString('\n')
+	line, err := stdinReader.ReadString('\n')
+	if err != nil && line == "" {
+		// A genuinely exhausted stdin (EOF with no pending text) must surface:
+		// swallowing it turns prompts into infinite loops that keep re-applying
+		// the default answer forever.
+		return "", err
+	}
 	line = strings.TrimSpace(line)
 	if line == "" {
-		return def
+		return def, nil
 	}
-	return line
+	return line, nil
 }
-func askChoice(label string, allowed []string, def string) string {
+func askChoice(label string, allowed []string, def string) (string, error) {
 	set := map[string]bool{}
 	for _, a := range allowed {
 		set[a] = true
 	}
 	for {
-		v := askLine(label, def)
+		v, err := askLine(label, def)
+		if err != nil {
+			return "", err
+		}
 		if set[v] {
-			return v
+			return v, nil
 		}
 		fmt.Printf("  Choose one of: %s\n", strings.Join(allowed, ", "))
 	}
 }
-func askYesNo(label string, def bool) bool {
+func askYesNo(label string, def bool) (bool, error) {
 	suffix := "y/N"
 	if def {
 		suffix = "Y/n"
 	}
 	for {
-		v := strings.ToLower(strings.TrimSpace(askLine(label+" ("+suffix+")", "")))
+		v, err := askLine(label+" ("+suffix+")", "")
+		if err != nil {
+			return false, err
+		}
+		v = strings.ToLower(strings.TrimSpace(v))
 		if v == "" {
-			return def
+			return def, nil
 		}
 		if v == "y" || v == "yes" {
-			return true
+			return true, nil
 		}
 		if v == "n" || v == "no" {
-			return false
+			return false, nil
 		}
 	}
 }
@@ -2076,19 +2284,26 @@ func detectCapabilities() (Capabilities, map[string]bool, error) {
 			enc[f[1]] = true
 		}
 	}
-	magic, detail := detectMagicYUV()
+	magic := detectMagicYUV()
 	xvidRaw := findXvidEncRaw()
 	hasNative := xvidRaw != ""
 	hasVulkanProRes := enc["prores_ks_vulkan"] && probeProResVulkan(ffmpeg)
-	return Capabilities{FFmpeg: ffmpeg, FFprobe: ffprobe, Version: versionLine, HasXvid: enc["libxvid"] || hasNative, HasLibXvid: enc["libxvid"], HasNativeXvid: hasNative, XvidEncRaw: xvidRaw, HasProRes: enc["prores_ks"], HasProResVulkan: hasVulkanProRes, HasMagicYUV: enc["magicyuv"], HasUtVideo: enc["utvideo"], MagicInstalled: magic, MagicDetail: detail}, enc, nil
+	return Capabilities{FFmpeg: ffmpeg, FFprobe: ffprobe, Version: versionLine, HasXvid: enc["libxvid"] || hasNative, HasLibXvid: enc["libxvid"], HasNativeXvid: hasNative, XvidEncRaw: xvidRaw, HasProRes: enc["prores_ks"], HasProResVulkan: hasVulkanProRes, HasMagicYUV: enc["magicyuv"], HasUtVideo: enc["utvideo"], MagicInstalled: magic}, enc, nil
 }
+
+// vulkanProbeTimeout bounds the startup capability probe. A wedged Vulkan
+// driver could otherwise block program start forever; a timed-out probe simply
+// means "no GPU fast path", and CPU prores_ks remains available.
+var vulkanProbeTimeout = 10 * time.Second
 
 func probeProResVulkan(ffmpeg string) bool {
 	// The encoder can be compiled into FFmpeg even when the installed driver
 	// cannot create a Vulkan device. A single 16x16 frame catches that at startup
 	// in about half a second on the reference PC, avoiding repeated failed GPU
 	// attempts later in a batch.
-	cmd := exec.Command(ffmpeg,
+	ctx, cancel := context.WithTimeout(context.Background(), vulkanProbeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ffmpeg,
 		"-hide_banner", "-loglevel", "error", "-nostdin",
 		"-init_hw_device", "vulkan=prerecs_probe", "-filter_hw_device", "prerecs_probe",
 		"-f", "lavfi", "-i", "color=size=16x16:rate=1",
@@ -2099,19 +2314,19 @@ func probeProResVulkan(ffmpeg string) bool {
 	return cmd.Run() == nil
 }
 
-func detectMagicYUV() (bool, string) {
+func detectMagicYUV() bool {
 	if runtime.GOOS != "windows" {
-		return false, "Windows system codec detection unavailable on this platform"
+		return false
 	}
 	keys := []string{`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Drivers32`, `HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Drivers32`}
 	for _, k := range keys {
 		out, _ := exec.Command("reg", "query", k).CombinedOutput()
 		low := strings.ToLower(string(out))
 		if strings.Contains(low, "magic") || strings.Contains(low, "vidc.m8") || strings.Contains(low, "vidc.m0") || strings.Contains(low, "vidc.magy") {
-			return true, "MagicYUV VFW codec registration detected"
+			return true
 		}
 	}
-	return false, "MagicYUV system codec/plugin not detected"
+	return false
 }
 
 func parseRat(v string) (*big.Rat, error) {
@@ -2136,6 +2351,21 @@ func ratString(r *big.Rat) string { return r.Num().String() + "/" + r.Denom().St
 func parseFloat(v string) float64 { f, _ := strconv.ParseFloat(v, 64); return f }
 func parseInt64(v string) int64   { n, _ := strconv.ParseInt(v, 10, 64); return n }
 func parseInt(v string) int       { n, _ := strconv.Atoi(v); return n }
+
+// selectFrameRate picks the best available container frame rate. avg_frame_rate
+// is preferred because it reflects the realised stream; when it is missing or
+// 0/0 (common on elementary streams and odd containers) r_frame_rate is a
+// lower-trust fallback. It is only used as the nominal rate — the exact decode
+// scan still governs frame counts and output verification.
+func selectFrameRate(avg, r string) (string, *big.Rat) {
+	if v, err := parseRatAllowZero(avg); err == nil && v != nil {
+		return avg, v
+	}
+	if v, err := parseRatAllowZero(r); err == nil && v != nil {
+		return r, v
+	}
+	return "", nil
+}
 
 func metadataFrameCountTrusted(codec string) bool {
 	switch strings.ToLower(strings.TrimSpace(codec)) {
@@ -2171,7 +2401,7 @@ func probeMedia(ffprobe, path string, count bool) (MediaInfo, error) {
 		return MediaInfo{}, errors.New("no video stream found")
 	}
 	sv := doc.Streams[vi]
-	fpsRat, _ := parseRatAllowZero(sv.AvgFrameRate)
+	fpsStr, fpsRat := selectFrameRate(sv.AvgFrameRate, sv.RFrameRate)
 	fpsFloat := 0.0
 	if fpsRat != nil {
 		fpsFloat = ratFloat(fpsRat)
@@ -2198,16 +2428,12 @@ func probeMedia(ffprobe, path string, count bool) (MediaInfo, error) {
 	if bit == 0 {
 		bit = deriveBitDepth(sv.PixFmt)
 	}
-	info := MediaInfo{Path: path, Codec: sv.CodecName, CodecTag: sv.CodecTagString, Profile: sv.Profile, Width: sv.Width, Height: sv.Height, PixelFormat: sv.PixFmt, BitDepth: bit, FPS: sv.AvgFrameRate, FPSFloat: fpsFloat, Duration: dur, FrameCount: frames, FrameCountExact: frameCountExact, SizeBytes: parseInt64(doc.Format.Size), BitRate: parseInt64(doc.Format.BitRate), ColorRange: sv.ColorRange, ColorSpace: sv.ColorSpace, ColorTransfer: sv.ColorTransfer, ColorPrimaries: sv.ColorPrimaries, HasAlpha: hasAlpha(sv.PixFmt), Chroma: chroma(sv.PixFmt), Audio: []AudioInfo{}}
+	info := MediaInfo{Path: path, Codec: sv.CodecName, CodecTag: sv.CodecTagString, Profile: sv.Profile, Width: sv.Width, Height: sv.Height, PixelFormat: sv.PixFmt, BitDepth: bit, FPS: fpsStr, FPSFloat: fpsFloat, Duration: dur, FrameCount: frames, FrameCountExact: frameCountExact, SizeBytes: parseInt64(doc.Format.Size), BitRate: parseInt64(doc.Format.BitRate), ColorRange: sv.ColorRange, ColorSpace: sv.ColorSpace, ColorTransfer: sv.ColorTransfer, ColorPrimaries: sv.ColorPrimaries, HasAlpha: hasAlpha(sv.PixFmt), Chroma: chroma(sv.PixFmt), Audio: []string{}}
 	for _, sa := range doc.Streams {
 		if sa.CodecType != "audio" {
 			continue
 		}
-		lang := ""
-		if sa.Tags != nil {
-			lang = sa.Tags["language"]
-		}
-		info.Audio = append(info.Audio, AudioInfo{Index: sa.Index, Codec: sa.CodecName, Channels: sa.Channels, SampleRate: parseInt(sa.SampleRate), Language: lang})
+		info.Audio = append(info.Audio, sa.CodecName)
 	}
 	return info, nil
 }
@@ -2488,7 +2714,9 @@ func (e *Engine) buildProResVulkanCommand(info MediaInfo, req ConvertOptions, ou
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	args := []string{"-hide_banner", "-nostdin", "-y", "-init_hw_device", "vulkan=prerecs_vk", "-filter_hw_device", "prerecs_vk", "-i", info.Path, "-map", "0:v:0"}
+	// -xerror + -err_detect explode: a source that reports decoder errors must
+	// fail the encode rather than produce a silently truncated output.
+	args := []string{"-hide_banner", "-nostdin", "-y", "-init_hw_device", "vulkan=prerecs_vk", "-filter_hw_device", "prerecs_vk", "-xerror", "-err_detect", "explode", "-i", info.Path, "-map", "0:v:0"}
 	filters := []string{}
 	if cf := colorFilter(info); cf != "" {
 		filters = append(filters, cf)
@@ -2507,7 +2735,7 @@ func (e *Engine) buildProResVulkanCommand(info MediaInfo, req ConvertOptions, ou
 
 	profile := map[string]string{"prores_lt": "1", "prores_422": "2", "prores_hq": "3", "prores_4444": "4"}[req.Preset]
 	pix := "yuv422p10le"
-	alphaBits := "0"
+	alphaBits := ""
 	if req.Preset == "prores_4444" {
 		pix = "yuv444p10le"
 		if info.HasAlpha {
@@ -2522,7 +2750,13 @@ func (e *Engine) buildProResVulkanCommand(info MediaInfo, req ConvertOptions, ou
 	} else {
 		args = append(args, "-fps_mode", "passthrough")
 	}
-	args = append(args, "-c:v", "prores_ks_vulkan", "-profile:v", profile, "-quant_mat", "auto", "-alpha_bits", alphaBits, "-async_depth", "4")
+	// -alpha_bits is only meaningful when alpha exists; omit it otherwise
+	// rather than forcing an explicit 0 on a young encoder.
+	args = append(args, "-c:v", "prores_ks_vulkan", "-profile:v", profile, "-quant_mat", "auto")
+	if alphaBits != "" {
+		args = append(args, "-alpha_bits", alphaBits)
+	}
+	args = append(args, "-async_depth", "4")
 	args = append(args, e.audioArgs(req)...)
 	args = append(args, "-movflags", "+write_colr")
 	args = append(args, colorOutputArgs(info, req.Preset)...)
@@ -2534,7 +2768,9 @@ func (e *Engine) buildCommand(info MediaInfo, req ConvertOptions, out string) ([
 	if err := validatePresetInputs(req.Preset, []MediaInfo{info}); err != nil {
 		return nil, nil, 0, err
 	}
-	args := []string{"-hide_banner", "-nostdin", "-y", "-i", info.Path, "-map", "0:v:0"}
+	// -xerror + -err_detect explode: a source that reports decoder errors must
+	// fail the encode rather than produce a silently truncated output.
+	args := []string{"-hide_banner", "-nostdin", "-y", "-xerror", "-err_detect", "explode", "-i", info.Path, "-map", "0:v:0"}
 	filters := []string{}
 	if cf := colorFilter(info); cf != "" {
 		filters = append(filters, cf)
@@ -2734,7 +2970,9 @@ func (e *Engine) runFFmpeg(ctx context.Context, args []string, expectedDur float
 			pi.Speed = strings.TrimSpace(v)
 		case "total_size":
 			pi.Bytes = parseInt64(strings.TrimSpace(v))
-		case "out_time_us":
+		case "out_time_us", "out_time_ms":
+			// FFmpeg <5.x emitted the same microsecond value under the
+			// misleading name out_time_ms; accept both keys.
 			us, _ := strconv.ParseFloat(v, 64)
 			pi.Time = us / 1e6
 			if expectedDur > 0 {
@@ -2762,8 +3000,12 @@ func (e *Engine) runFFmpeg(ctx context.Context, args []string, expectedDur float
 }
 
 func (e *Engine) countDecodedFrames(ctx context.Context, info MediaInfo, progress func(progressInfo)) (int64, error) {
+	// -xerror + -err_detect explode make decoder corruption fatal. Without them
+	// FFmpeg logs decode errors but can still exit 0 after silently dropping
+	// frames — which would let a truncated count pass verification as truth.
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-nostdin",
+		"-xerror", "-err_detect", "explode",
 		"-i", info.Path,
 		"-map", "0:v:0", "-an", "-sn", "-dn",
 		"-fps_mode", "passthrough",
@@ -2977,7 +3219,7 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 
 	progress(progressInfo{Percent: 0, TotalFrames: info.FrameCount, Stage: "ENCODE"})
 	xargs := nativeXvidArgs(info, req, tmpVideo, target)
-	cmd := exec.CommandContext(ctx, e.caps.XvidEncRaw, xargs...)
+	cmd := xvidEncrawCommand(ctx, e.caps.XvidEncRaw, xargs...)
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -3054,7 +3296,7 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 	progress(progressInfo{Percent: 1, FPS: fmt.Sprintf("%.2f", float64(max64(finalFrames, info.FrameCount))/math.Max(.001, time.Since(started).Seconds())), Frame: strconv.FormatInt(max64(finalFrames, info.FrameCount), 10), TotalFrames: info.FrameCount, Stage: "ENCODE"})
 
 	needAudio := len(info.Audio) > 0 && !req.StripAudio && !req.Conform
-	remux := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-r", formatFPSFloat(target), "-f", "m4v", "-i", tmpVideo}
+	remux := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-r", ratString(target), "-f", "m4v", "-i", tmpVideo}
 	if needAudio {
 		remux = append(remux, "-i", info.Path, "-map", "0:v:0", "-map", "1:a?")
 	} else {
@@ -3073,6 +3315,12 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 		return nil, 0, fmt.Errorf("AVI wrap/remux failed: %w", err)
 	}
 	return target, expectedDur, nil
+}
+
+// xvidEncrawCommand is a test seam: production code always launches the real
+// xvid_encraw binary, while tests substitute a fake encoder process.
+var xvidEncrawCommand = func(ctx context.Context, path string, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, path, args...)
 }
 
 func max64(a, b int64) int64 {
@@ -3103,17 +3351,64 @@ func outputCandidates(src, custom, preset string) ([]string, string, error) {
 		ext = ".avi"
 	}
 	stem := strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
-	existing := []string{}
-	for n := 1; n < 10000; n++ {
-		name := stem + "_" + preset + ext
-		if n > 1 {
-			name = fmt.Sprintf("%s_%s_%d%s", stem, preset, n, ext)
-		}
-		p := filepath.Join(base, name)
-		if fileExists(p) {
-			existing = append(existing, p)
+	// List the directory once so sparse numbered outputs are discovered for
+	// reuse even when earlier slots are missing (e.g. only clip_p_2.avi exists).
+	prefix := stem + "_" + preset
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil, "", err
+	}
+	taken := map[int]bool{}
+	type candidate struct {
+		n    int
+		path string
+	}
+	found := []candidate{}
+	for _, e := range entries {
+		if e.IsDir() {
 			continue
 		}
+		name := e.Name()
+		rest := strings.TrimPrefix(name, prefix)
+		if rest == name {
+			continue
+		}
+		n := 0
+		if rest == ext {
+			n = 1
+		} else if strings.HasPrefix(rest, "_") && strings.HasSuffix(rest, ext) {
+			mid := rest[1 : len(rest)-len(ext)]
+			if !isDigits(mid) {
+				continue
+			}
+			n = parseInt(mid)
+			if n < 2 || n > 999999 {
+				continue
+			}
+		} else {
+			continue
+		}
+		if taken[n] {
+			continue
+		}
+		taken[n] = true
+		found = append(found, candidate{n: n, path: filepath.Join(base, name)})
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].n < found[j].n })
+	existing := make([]string, 0, len(found))
+	for _, c := range found {
+		existing = append(existing, c.path)
+	}
+	// Reserve the lowest free slot with O_EXCL so parallel runs stay atomic.
+	for n := 1; n <= len(taken)+1 && n < 100000; n++ {
+		if taken[n] {
+			continue
+		}
+		name := prefix + ext
+		if n > 1 {
+			name = fmt.Sprintf("%s_%d%s", prefix, n, ext)
+		}
+		p := filepath.Join(base, name)
 		reservation, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 		if err == nil {
 			if closeErr := reservation.Close(); closeErr != nil {
@@ -3124,6 +3419,7 @@ func outputCandidates(src, custom, preset string) ([]string, string, error) {
 		}
 		if errors.Is(err, os.ErrExist) {
 			existing = append(existing, p)
+			taken[n] = true
 			continue
 		}
 		return existing, "", fmt.Errorf("reserve output %s: %w", p, err)
@@ -3200,8 +3496,8 @@ func verifyOutput(in, out MediaInfo, opts ConvertOptions, expected *big.Rat, exp
 			// Normal-timing audio is stream-copied. Verify that "keep audio" really
 			// means the same codec came through, not a silent transcode or omission.
 			for i := range in.Audio {
-				if !strings.EqualFold(in.Audio[i].Codec, out.Audio[i].Codec) {
-					p = append(p, fmt.Sprintf("audio codec mismatch on track %d: expected %s got %s", i+1, in.Audio[i].Codec, out.Audio[i].Codec))
+				if !strings.EqualFold(in.Audio[i], out.Audio[i]) {
+					p = append(p, fmt.Sprintf("audio codec mismatch on track %d: expected %s got %s", i+1, in.Audio[i], out.Audio[i]))
 				}
 			}
 		}
