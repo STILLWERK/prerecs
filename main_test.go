@@ -2514,6 +2514,13 @@ func TestWantsHelp(t *testing.T) {
 		{"help consumed as option value", []string{"--output", "--help", "clip.avi"}, false},
 		{"h consumed as preset value", []string{"--preset", "-h", "clip.avi"}, false},
 		{"positional named like an option", []string{"output", "--", "--help"}, false},
+		{"single-dash long help", []string{"-help"}, true},
+		{"double-dash short help", []string{"--h"}, true},
+		{"help with inline value", []string{"-h=x"}, true},
+		{"long help with inline value", []string{"--help=x"}, true},
+		{"triple dash is not help", []string{"---h"}, false},
+		{"help spelling consumed as value", []string{"--timescale", "-help", "clip.avi"}, false},
+		{"help after parsed option", []string{"--timescale", "0.5", "-help"}, true},
 		{"no help", []string{"file.avi", "--yes"}, false},
 		{"empty", nil, false},
 	} {
@@ -2580,5 +2587,185 @@ func TestMainYesEOFNonzero(t *testing.T) {
 	}
 	if code := run("--yes", src); code == 0 {
 		t.Fatal("--yes with a file but no preset selection exited 0 on EOF")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Final-review regressions
+// ---------------------------------------------------------------------------
+
+func TestHeadlessExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		res  BatchResult
+		want int
+	}{
+		{"successes", BatchResult{Successes: 1, Items: []ItemResult{{Status: "ok", Output: "o.avi"}}}, 0},
+		{"failures", BatchResult{Failures: 1, Items: []ItemResult{{Status: "failed"}}}, 1},
+		{"input failures", BatchResult{InputFailures: 1}, 1},
+		// Every input skipped by policy (e.g. distribution-compressed under
+		// --yes) produced no output at all — automation must see nonzero.
+		{"all skipped nothing produced", BatchResult{Skipped: 2, Items: []ItemResult{{Status: "skipped"}, {Status: "skipped"}}}, 2},
+		// A skip that resolved to an already-verified output did deliver the
+		// requested end state — that is success.
+		{"skip resolved to verified output", BatchResult{Skipped: 1, Items: []ItemResult{{Status: "skipped", Output: "o.avi"}}}, 0},
+		{"mixed success and bare skip", BatchResult{Successes: 1, Skipped: 1, Items: []ItemResult{{Status: "ok", Output: "o.avi"}, {Status: "skipped"}}}, 0},
+		{"nothing processed", BatchResult{}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := headlessExitCode(tc.res, nil); got != tc.want {
+				t.Fatalf("headlessExitCode=%d, want %d", got, tc.want)
+			}
+		})
+	}
+	if c := headlessExitCode(BatchResult{}, context.Canceled); c != 130 {
+		t.Fatalf("cancelled exit code=%d, want 130", c)
+	}
+}
+
+func TestAskLineWhitespaceThenEOF(t *testing.T) {
+	old := stdinReader
+	defer func() { stdinReader = old }()
+	// A whitespace-only fragment at EOF must not silently become the default —
+	// under --yes that would convert "no answer" into an accepted choice.
+	stdinReader = bufio.NewReader(strings.NewReader(" "))
+	if _, err := askLine("X", "def"); !errors.Is(err, io.EOF) {
+		t.Fatalf("whitespace-only EOF should surface EOF, got %v", err)
+	}
+	// A real token at EOF is still consumed as an answer.
+	stdinReader = bufio.NewReader(strings.NewReader("  5"))
+	if v, err := askLine("X", "def"); err != nil || v != "5" {
+		t.Fatalf("partial line at EOF: v=%q err=%v", v, err)
+	}
+	// Whitespace terminated by a newline is an explicit empty answer → default.
+	stdinReader = bufio.NewReader(strings.NewReader("   \n"))
+	if v, err := askLine("X", "def"); err != nil || v != "def" {
+		t.Fatalf("blank line should yield default: v=%q err=%v", v, err)
+	}
+}
+
+func TestRatStringSane(t *testing.T) {
+	good := []string{"30", "30000/1001", "0.1", "23.976", "1e-3", "1E2"}
+	for _, s := range good {
+		if !ratStringSane(s) {
+			t.Fatalf("ratStringSane(%q)=false, want true", s)
+		}
+		if _, err := parseRat(s); err != nil {
+			t.Fatalf("parseRat(%q): %v", s, err)
+		}
+	}
+	// The short string 1e999999999 would make big.Rat.SetString materialize a
+	// ~10^9-digit numerator — reject before parsing, not after.
+	bad := []string{"1e999999999", "1e-999999999", "1e1001", "0x1p99", strings.Repeat("9", 65), "", "abc"}
+	for _, s := range bad {
+		if ratStringSane(s) {
+			t.Fatalf("ratStringSane(%q)=true, want false", s)
+		}
+		if _, err := parseRat(s); err == nil {
+			t.Fatalf("parseRat(%q) accepted", s)
+		}
+	}
+}
+
+func TestHasDuplicateOutputStems(t *testing.T) {
+	mk := func(p string) MediaInfo { return MediaInfo{Path: p} }
+	// Same stem + same effective output dir (default converted_prerecs) → dup.
+	if !hasDuplicateOutputStems("", []MediaInfo{mk("/a/clip.avi"), mk("/a/clip.mov")}) {
+		t.Fatal("same-dir same-stem not detected")
+	}
+	// Same stem but different source dirs → different default output dirs → ok.
+	if hasDuplicateOutputStems("", []MediaInfo{mk("/a/clip.avi"), mk("/b/clip.mov")}) {
+		t.Fatal("different-dir same-stem falsely detected")
+	}
+	// A shared custom output dir makes cross-dir same-stem sources collide.
+	if !hasDuplicateOutputStems("/out", []MediaInfo{mk("/a/clip.avi"), mk("/b/clip.mov")}) {
+		t.Fatal("custom-outdir same-stem not detected")
+	}
+	// Case-insensitive stem match (Windows filesystems).
+	if !hasDuplicateOutputStems("", []MediaInfo{mk("/a/Clip.avi"), mk("/a/CLIP.mkv")}) {
+		t.Fatal("case-variant same-stem not detected")
+	}
+	if hasDuplicateOutputStems("/out", []MediaInfo{mk("/a/one.avi"), mk("/b/two.avi")}) {
+		t.Fatal("distinct stems falsely detected")
+	}
+}
+
+func TestExpandInputsSkipsTempStream(t *testing.T) {
+	td := t.TempDir()
+	for _, n := range []string{"clip.avi", "clip_xvid_compact.video.tmp.m4v", "clip_xvid_compact.avi"} {
+		if err := os.WriteFile(filepath.Join(td, n), []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := expandInputs([]string{td})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || filepath.Base(got[0]) != "clip.avi" {
+		t.Fatalf("expandInputs=%v, want only clip.avi", got)
+	}
+}
+
+// TestProcessItemHoldsReservationThroughFallback drives a real conversion where
+// the first backend fails: the O_EXCL reservation file must still exist when
+// the fallback ffmpeg starts, otherwise a concurrent same-stem run could claim
+// the destination mid-switch. A wrapper around the real ffmpeg records, per
+// invocation, whether the trailing output path already exists.
+func TestProcessItemHoldsReservationThroughFallback(t *testing.T) {
+	e := nativeTestEngine(t)
+	td := t.TempDir()
+	src := filepath.Join(td, "clip.avi")
+	if b, err := exec.Command(e.caps.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30",
+		"-frames:v", "15", "-c:v", "ffv1", src,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("fixture: %v %s", err, b)
+	}
+	es, _ := makeRealM4V(t, e.caps.FFmpeg, td, 15)
+	installFakeXvid(t, es, map[string]string{"PRERECS_FAKE_XVID_EXIT": "3"})
+
+	rec := filepath.Join(td, "ffmpeg-calls.txt")
+	wrap := filepath.Join(td, "ffmpeg-wrap.sh")
+	script := "#!/bin/sh\n" +
+		"last=\"\"\nfor a in \"$@\"; do last=\"$a\"; done\n" +
+		"if [ -f \"$last\" ]; then s=present; else s=missing; fi\n" +
+		"echo \"$s $last\" >> \"" + rec + "\"\n" +
+		"exec \"" + e.caps.FFmpeg + "\" \"$@\"\n"
+	if err := os.WriteFile(wrap, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	e.caps.FFmpeg = wrap
+
+	info, err := probeMedia(e.caps.FFprobe, src, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, _ := captureReporter()
+	item := processItem(context.Background(), theme{}, e, info, ConvertOptions{Preset: "xvid_compact", OutputDir: td, StripAudio: true}, rep)
+	if item.Status != "ok" {
+		t.Fatalf("fallback conversion failed: status=%q msg=%q", item.Status, item.Message)
+	}
+	data, err := os.ReadFile(rec)
+	if err != nil {
+		t.Fatalf("wrapper log missing: %v", err)
+	}
+	checked := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(f[1]))
+		if ext != ".avi" && ext != ".mov" {
+			continue // scan/verify invocations end in "-", not an output path
+		}
+		checked++
+		if f[0] != "present" {
+			t.Fatalf("output path did not exist when ffmpeg ran — reservation was released early: %s\nall calls:\n%s", line, data)
+		}
+	}
+	if checked == 0 {
+		t.Fatalf("no output-writing ffmpeg invocation recorded:\n%s", data)
 	}
 }

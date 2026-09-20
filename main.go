@@ -333,6 +333,20 @@ func headlessExitCode(result BatchResult, cancelled error) int {
 	if result.Failures > 0 || result.InputFailures > 0 {
 		return 1
 	}
+	// "Did nothing" must not read as success to automation: a --yes run in
+	// which no item produced or confirmed an output (e.g. every input was
+	// skipped as already distribution-compressed) exits nonzero. A skip that
+	// resolved to a verified existing output counts as delivered — the
+	// requested end state already exists on disk.
+	produced := result.Successes
+	for _, it := range result.Items {
+		if it.Status == "skipped" && it.Output != "" {
+			produced++
+		}
+	}
+	if produced == 0 && len(result.Items) > 0 {
+		return 2
+	}
 	return 0
 }
 
@@ -451,12 +465,25 @@ func wantsHelp(args []string) bool {
 		if a == "--" {
 			return false
 		}
-		if a == "-h" || a == "--help" {
-			return true
-		}
 		if len(a) > 1 && a[0] == '-' {
-			name := strings.TrimLeft(a, "-")
-			if !strings.Contains(name, "=") && flagNeedsValue[name] {
+			// The flag package accepts one or two dashes; a third would be a
+			// syntax error, not help, so strip at most two.
+			tok := a[1:]
+			if tok[0] == '-' {
+				tok = tok[1:]
+			}
+			name := tok
+			hasValue := false
+			if i := strings.IndexByte(tok, '='); i >= 0 {
+				name, hasValue = tok[:i], true
+			}
+			// flag.Parse treats every undefined -h/-help spelling (-help,
+			// --h, -h=x) as a help request; match the same names so the
+			// pre-scan and the real parser agree on exit codes.
+			if name == "h" || name == "help" {
+				return true
+			}
+			if !hasValue && flagNeedsValue[name] {
 				expectValue = true
 			}
 		}
@@ -655,6 +682,12 @@ func expandInputs(items []string) ([]string, error) {
 				// Skip files that look like this tool's own generated outputs
 				// (`stem_<preset>.ext`, `stem_<preset>_N.ext`) so a later run
 				// against the same folder does not re-ingest its own results.
+				// The native-Xvid raw stream (`*.video.tmp.m4v`) can survive an
+				// interrupted run and ends in a supported extension — never
+				// ingest it as a source either.
+				if strings.HasSuffix(strings.ToLower(e.Name()), ".video.tmp.m4v") {
+					continue
+				}
 				if supportedExt[strings.ToLower(filepath.Ext(e.Name()))] && !isGeneratedOutputName(e.Name()) {
 					names = append(names, filepath.Join(p, e.Name()))
 				}
@@ -1494,16 +1527,22 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		info.FrameCount = count
 		info.FrameCountExact = true
 		oldDuration := info.Duration
-		if info.FPSFromFallback {
-			// The scan produced a trusted frame count; re-evaluate the
-			// lower-trust r_frame_rate guess against it before it can drive
-			// the constant-rate timeline rebuild below. Once corroborated it
-			// is no longer a fallback.
-			if _, rat := selectFrameRate("", info.FPS, count, info.Duration); rat == nil {
-				info.FPS, info.FPSFloat = "", 0
+		// The scan produced a trusted frame count; re-evaluate the selected
+		// container rate against it before it can drive the constant-rate
+		// timeline rebuild below. This covers avg_frame_rate too: on the
+		// compressed containers scanned here it is header-derived, the same
+		// stale-metadata class as the untrusted frame tables — a stale header
+		// rate would silently retime the output while verification still
+		// passes against the same wrong value. A rate that disagrees with the
+		// decoded stream is discarded so passthrough preserves real timing
+		// instead of inventing one.
+		if _, rat := selectFrameRate("", info.FPS, count, info.Duration); rat == nil {
+			if info.FPS != "" {
+				rep.line(ui.yellow(fmt.Sprintf("Container frame rate %s does not match the decoded stream; preserving source timing.", info.FPS)))
 			}
-			info.FPSFromFallback = false
+			info.FPS, info.FPSFloat = "", 0
 		}
+		info.FPSFromFallback = false
 		if info.FPSFloat > 0 {
 			info.Duration = float64(count) / info.FPSFloat
 		}
@@ -1554,7 +1593,9 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 				rep.finish()
 				if decodeErr != nil {
 					if errors.Is(decodeErr, context.Canceled) {
-						releaseOutputReservation(out)
+						if relErr := releaseOutputReservation(out); relErr != nil {
+							rep.line(ui.yellow("WARNING: could not release reserved output name: " + relErr.Error()))
+						}
 						item.Status = "cancelled"
 						return item
 					}
@@ -1565,12 +1606,16 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 				outInfo.FrameCountExact = true
 				problems := verifyOutput(info, outInfo, opts, expectedFPS0, expectedDur0)
 				if len(problems) == 0 {
-					releaseOutputReservation(out)
 					item.Output = cand
 					item.OutputInfo = outInfo
 					item.Status = "skipped"
 					item.Backend = "existing verified output"
 					item.Message = "existing output already verified"
+					if relErr := releaseOutputReservation(out); relErr != nil {
+						msg := "cleanup failed: " + relErr.Error()
+						rep.line(ui.yellow("WARNING: " + msg))
+						item.Message += "; " + msg
+					}
 					rep.line(ui.green("EXISTS / VERIFIED") + " — skipping re-encode.")
 					rep.line(fmt.Sprintf("Frames: %d -> %d   Size: %s -> %s", info.FrameCount, outInfo.FrameCount, humanBytes(info.SizeBytes), humanBytes(outInfo.SizeBytes)))
 					return item
@@ -1885,23 +1930,30 @@ func batchWorkerCount(opts ConvertOptions, infos []MediaInfo) int {
 	if workers > len(infos) {
 		workers = len(infos)
 	}
-	if opts.OutputDir != "" && hasDuplicateOutputStems(infos) {
-		// A custom shared folder plus identical basenames from different source
-		// directories can race for the same numbered filename. Serialize that
-		// unusual case rather than weakening collision/recovery guarantees.
+	if hasDuplicateOutputStems(opts.OutputDir, infos) {
+		// Identical basenames landing in the same effective output directory
+		// race for the same numbered filename — this includes the default
+		// converted_prerecs folder when two same-stem sources share a source
+		// directory, not only a custom --output folder. Serialize that case
+		// rather than weakening collision/recovery guarantees.
 		workers = 1
 	}
 	return workers
 }
 
-func hasDuplicateOutputStems(infos []MediaInfo) bool {
+func hasDuplicateOutputStems(customDir string, infos []MediaInfo) bool {
 	seen := map[string]bool{}
 	for _, in := range infos {
+		dir := customDir
+		if dir == "" {
+			dir = filepath.Join(filepath.Dir(in.Path), "converted_prerecs")
+		}
 		stem := strings.ToLower(strings.TrimSuffix(filepath.Base(in.Path), filepath.Ext(in.Path)))
-		if seen[stem] {
+		key := filepath.Clean(dir) + "|" + stem
+		if seen[key] {
 			return true
 		}
-		seen[stem] = true
+		seen[key] = true
 	}
 	return false
 }
@@ -2186,13 +2238,13 @@ func askLine(label, def string) (string, error) {
 		fmt.Printf("  %s > ", label)
 	}
 	line, err := stdinReader.ReadString('\n')
+	line = strings.TrimSpace(line)
 	if err != nil && line == "" {
-		// A genuinely exhausted stdin (EOF with no pending text) must surface:
-		// swallowing it turns prompts into infinite loops that keep re-applying
-		// the default answer forever.
+		// A genuinely exhausted stdin must surface — including a trailing
+		// whitespace-only fragment — because swallowing it turns prompts into
+		// infinite loops and lets --yes silently accept the default answer.
 		return "", err
 	}
-	line = strings.TrimSpace(line)
 	if line == "" {
 		return def, nil
 	}
@@ -2399,9 +2451,36 @@ func detectMagicYUV() bool {
 	return false
 }
 
+// ratStringSane bounds the strings handed to big.Rat.SetString: the parser
+// honours decimal exponents, so a short string like 1e999999999 would
+// materialize a ~10^9-digit numerator in memory. Whitelisting the charset
+// also rejects exotic forms (hex floats with 'p' exponents) that carry the
+// same hazard. Rates, timescales and durations never need more than this.
+func ratStringSane(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c == '/' || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') {
+			return false
+		}
+	}
+	if i := strings.IndexAny(s, "eE"); i >= 0 {
+		exp, err := strconv.Atoi(s[i+1:])
+		if err != nil || exp > 1000 || exp < -1000 {
+			return false
+		}
+	}
+	return true
+}
+
 func parseRat(v string) (*big.Rat, error) {
+	s := strings.TrimSpace(v)
+	if !ratStringSane(s) {
+		return nil, fmt.Errorf("invalid positive number/fraction %q", v)
+	}
 	r := new(big.Rat)
-	if _, ok := r.SetString(strings.TrimSpace(v)); !ok || r.Sign() <= 0 {
+	if _, ok := r.SetString(s); !ok || r.Sign() <= 0 {
 		return nil, fmt.Errorf("invalid positive number/fraction %q", v)
 	}
 	return r, nil
@@ -2409,6 +2488,9 @@ func parseRat(v string) (*big.Rat, error) {
 func parseRatAllowZero(v string) (*big.Rat, error) {
 	if v == "" || v == "0/0" || v == "N/A" {
 		return nil, nil
+	}
+	if !ratStringSane(v) {
+		return nil, errors.New("bad rational")
 	}
 	r := new(big.Rat)
 	if _, ok := r.SetString(v); !ok || r.Sign() <= 0 {
@@ -3331,6 +3413,7 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 	lastFrames := int64(-1)
 	var waitErr error
 	finished := false
+	reapTimedOut := false
 
 	for !finished {
 		select {
@@ -3342,6 +3425,7 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 			select {
 			case <-done:
 			case <-time.After(5 * time.Second):
+				reapTimedOut = true
 			}
 			finished = true
 		case err := <-done:
@@ -3380,6 +3464,9 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 		}
 	}
 	if ctx.Err() != nil {
+		if reapTimedOut {
+			return nil, 0, fmt.Errorf("%w (encoder did not exit within 5s of cancellation; %s may remain locked)", ctx.Err(), tmpVideo)
+		}
 		return nil, 0, ctx.Err()
 	}
 	if waitErr != nil {
@@ -3530,8 +3617,11 @@ func outputCandidates(src, custom, preset string) ([]string, string, error) {
 	return existing, "", errors.New("could not choose unused output filename")
 }
 
-func releaseOutputReservation(path string) {
-	_ = os.Remove(path)
+func releaseOutputReservation(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func presetCodecMatches(preset string, out MediaInfo) bool {
