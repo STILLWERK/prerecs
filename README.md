@@ -67,7 +67,7 @@ Aliases are `xvid-efficient`, `xvid-q2-efficient`, and `efficient`.
 
 ## Requirements and installation
 
-PreRecs is a Windows console application. The release ZIP contains the PreRecs executable and project documentation, not third-party codec installers or FFmpeg binaries.
+PreRecs is a Windows console application. Each GitHub release publishes a versioned ZIP, a standalone `PreRecs.exe`, and `SHA256SUMS.txt`. The ZIP contains the executable and project documentation, not third-party codec installers or FFmpeg binaries.
 
 Required:
 
@@ -86,7 +86,7 @@ Native Xvid is optional. Install a compatible Xvid reference encoder and make `x
 
 MagicYUV is optional, proprietary, and never bundled. Its preset is offered only when the Windows codec/plugin registration and the FFmpeg encoder are both detected. Ut Video is the free lossless alternative.
 
-Download the release ZIP, install the external tools you need, and run `PreRecs.exe` from PowerShell or a console. No installer is required.
+Download the release ZIP or standalone executable, install the external tools you need, and run `PreRecs.exe` from PowerShell or a console. Use `SHA256SUMS.txt` to verify either release asset. No installer is required.
 
 ## Usage
 
@@ -151,6 +151,8 @@ The workflow is intentionally staged:
 
 Verification checks the exact decoded frame count, frame rate, normalized duration, dimensions, requested codec/tag, expected Xvid or lossless pixel format, audio presence and track count, and the copied audio codec when audio is retained. A mismatch fails the job.
 
+ProRes verification also checks the encoded profile and pixel format: LT/422/HQ require `yuv422p10le`, while 4444 requests `yuv444p10le` without alpha or an alpha-capable 4444 format when the source has alpha. Current FFmpeg `prores_ks` builds may report non-alpha profile-4444 output as `yuv444p12le`; that encoder-normalized result is accepted. Non-4444 ProRes presets reject alpha sources instead of silently discarding the alpha plane.
+
 When a matching output already exists, PreRecs decodes and verifies it first. A current valid output is reused. A stale, truncated, wrong-codec, or otherwise invalid output is preserved and the new conversion receives the next numbered filename.
 
 For a timing conform, PreRecs assigns frame-number timestamps in the target timebase and strips audio to avoid desynchronization. It does not use optical-flow interpolation or create new pictures.
@@ -185,6 +187,7 @@ On Windows, `build_windows.ps1` runs the unit tests and vet before producing `Pr
 - The supported runtime target is Windows amd64. The non-Windows build tags exist to make development and tests possible on Linux/WSL; native VfW Xvid and MagicYUV detection are Windows-specific.
 - FFmpeg and ffprobe are required at runtime and are not redistributed by this repository.
 - Native Xvid is an optional acceleration/quality path, not a requirement. Its direct path is limited to compatible lossless AVI masters and the installed Windows VfW stack.
+- Lossless AVI metadata keeps the fast path only when its frame count agrees with the rounded duration/frame-rate estimate. Missing or inconsistent timing metadata triggers an exact decode scan before native Xvid uses the count for VfW preflight, encoder limits, or verification.
 - MagicYUV is optional commercial software and is not included.
 - The tested MagicYUV and Ut Video FFmpeg paths accept 8-bit source layouts. Higher-bit-depth sources are rejected rather than silently reduced under a “lossless” label; use an appropriate ProRes tier instead.
 - Lagarith is supported as an input when FFmpeg can decode it, but the tested FFmpeg builds do not provide a Lagarith encoder.

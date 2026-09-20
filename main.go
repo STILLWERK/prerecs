@@ -44,6 +44,7 @@ type MediaInfo struct {
 	Path            string
 	Codec           string
 	CodecTag        string
+	Profile         string
 	Width           int
 	Height          int
 	PixelFormat     string
@@ -69,6 +70,7 @@ type Capabilities struct {
 	FFprobe         string
 	Version         string
 	HasXvid         bool
+	HasLibXvid      bool
 	HasProRes       bool
 	HasProResVulkan bool
 	HasMagicYUV     bool
@@ -119,6 +121,7 @@ type ffprobeDoc struct {
 	Streams []struct {
 		Index            int               `json:"index"`
 		CodecName        string            `json:"codec_name"`
+		Profile          string            `json:"profile"`
 		CodecType        string            `json:"codec_type"`
 		Width            int               `json:"width"`
 		Height           int               `json:"height"`
@@ -275,10 +278,7 @@ func main() {
 		printBatchSummary(ui, result, cancelled)
 
 		if cfg.yes {
-			if result.Failures > 0 {
-				os.Exit(1)
-			}
-			return
+			os.Exit(headlessExitCode(result, cancelled))
 		}
 
 		for {
@@ -307,6 +307,16 @@ func main() {
 	nextJob:
 		continue
 	}
+}
+
+func headlessExitCode(result BatchResult, cancelled error) int {
+	if cancelled != nil {
+		return 130
+	}
+	if result.Failures > 0 {
+		return 1
+	}
+	return 0
 }
 
 func resetInteractiveJob(c cliConfig) cliConfig {
@@ -367,7 +377,7 @@ Options:
 
 Examples:
   PreRecs.exe "clip.mp4"
-  PreRecs.exe --preset share --yes "clip.mp4"
+  PreRecs.exe --preset share --yes "master.avi"
   PreRecs.exe --preset edit --timescale 0.1 --capture-fps 30 "cinematic.mp4"`)
 }
 
@@ -627,7 +637,9 @@ func printRecommendation(ui theme, infos []MediaInfo, caps Capabilities) {
 		fmt.Println(ui.dim("  Transcoding cannot restore detail already lost to H.264/HEVC/Xvid/AV1 and the intermediate will usually be much larger."))
 	case masters == len(infos):
 		backend := "FFmpeg Xvid"
-		if caps.HasNativeXvid {
+		if available, missing := xvidAvailableForInputs(caps, infos, false); !available {
+			backend = "Xvid unavailable for " + strings.Join(missing, ", ") + "; use ProRes or install FFmpeg libxvid"
+		} else if caps.HasNativeXvid {
 			nativeEligible := 0
 			for _, in := range infos {
 				if nativeXvidEligible(in) {
@@ -680,12 +692,12 @@ func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (Conv
 		}
 		opts.Preset = p
 	} else {
-		opts.Preset = choosePreset(ui, e, infos)
+		var chooseErr error
+		opts.Preset, chooseErr = choosePreset(ui, e, infos)
+		if chooseErr != nil {
+			return opts, chooseErr
+		}
 	}
-	if err := validatePresetInputs(opts.Preset, infos); err != nil {
-		return opts, err
-	}
-
 	if strings.HasPrefix(opts.Preset, "xvid") {
 		compressed := compressedInputs(infos)
 		if len(compressed) > 0 && !opts.ForceXvid {
@@ -712,6 +724,15 @@ func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (Conv
 				}
 				fmt.Println()
 			}
+		}
+	}
+	if err := validatePresetInputs(opts.Preset, infos); err != nil {
+		return opts, err
+	}
+	if isXvidPreset(opts.Preset) {
+		skipCompressed := opts.SkipCompressed && !opts.ForceXvid
+		if ok, missing := xvidAvailableForInputs(e.caps, infos, skipCompressed); !ok {
+			return opts, fmt.Errorf("selected Xvid preset cannot run for %s: install FFmpeg libxvid or choose a compatible preset", strings.Join(missing, ", "))
 		}
 	}
 
@@ -845,6 +866,13 @@ func normalizePreset(v string) (string, error) {
 func validatePresetInputs(preset string, infos []MediaInfo) error {
 	codec := ""
 	switch preset {
+	case "prores_lt", "prores_422", "prores_hq":
+		for _, in := range infos {
+			if in.HasAlpha {
+				return fmt.Errorf("%s: source contains alpha; use ProRes 4444 to preserve it", filepath.Base(in.Path))
+			}
+		}
+		return nil
 	case "magicyuv_lossless":
 		codec = "MagicYUV"
 	case "utvideo_lossless":
@@ -860,7 +888,24 @@ func validatePresetInputs(preset string, infos []MediaInfo) error {
 	return nil
 }
 
-func choosePreset(ui theme, e *Engine, infos []MediaInfo) string {
+func xvidAvailableForInputs(caps Capabilities, infos []MediaInfo, skipCompressed bool) (bool, []string) {
+	missing := []string{}
+	for _, in := range infos {
+		if skipCompressed && isDistributionCompressed(in) {
+			continue
+		}
+		if nativeXvidEligible(in) && caps.HasNativeXvid {
+			continue
+		}
+		if caps.HasLibXvid {
+			continue
+		}
+		missing = append(missing, filepath.Base(in.Path))
+	}
+	return len(missing) == 0, missing
+}
+
+func choosePreset(ui theme, e *Engine, infos []MediaInfo) (string, error) {
 	for {
 		fmt.Println(ui.bold("PRESET"))
 		fmt.Println("  1. SHARE        Xvid Q2       " + ui.green("tuned VHQ4/B2 default"))
@@ -880,14 +925,20 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) string {
 				fmt.Println()
 				continue
 			}
-			return "xvid_max_q2"
+			if ok, missing := xvidAvailableForInputs(e.caps, infos, false); !ok {
+				return "", fmt.Errorf("SHARE/Xvid is unavailable for %s: install FFmpeg libxvid or choose ProRes", strings.Join(missing, ", "))
+			}
+			return "xvid_max_q2", nil
 		case "2":
 			if !e.caps.HasProRes {
 				fmt.Println(ui.yellow("  This FFmpeg build does not include prores_ks."))
 				fmt.Println()
 				continue
 			}
-			return "prores_lt"
+			if err := validatePresetInputs("prores_lt", infos); err != nil {
+				return "", err
+			}
+			return "prores_lt", nil
 		case "3":
 			if !(e.caps.HasMagicYUV && e.caps.MagicInstalled && magicCompatible) {
 				fmt.Println(ui.yellow("  MagicYUV is not available. Install/licence MagicYUV and use an FFmpeg build with the encoder."))
@@ -897,7 +948,7 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) string {
 				fmt.Println()
 				continue
 			}
-			return "magicyuv_lossless"
+			return "magicyuv_lossless", nil
 		case "4":
 			fmt.Println()
 			fmt.Println(ui.bold("MORE PRESETS"))
@@ -918,49 +969,71 @@ func choosePreset(ui theme, e *Engine, infos []MediaInfo) string {
 			switch a {
 			case "1":
 				if e.caps.HasProRes {
-					return "prores_422"
+					if err := validatePresetInputs("prores_422", infos); err != nil {
+						return "", err
+					}
+					return "prores_422", nil
 				}
 				fmt.Println(ui.yellow("  prores_ks is unavailable."))
 				fmt.Println()
 			case "2":
 				if e.caps.HasProRes {
-					return "prores_hq"
+					if err := validatePresetInputs("prores_hq", infos); err != nil {
+						return "", err
+					}
+					return "prores_hq", nil
 				}
 				fmt.Println(ui.yellow("  prores_ks is unavailable."))
 				fmt.Println()
 			case "3":
 				if e.caps.HasXvid {
-					return "xvid_efficient_q2"
+					if ok, missing := xvidAvailableForInputs(e.caps, infos, false); ok {
+						return "xvid_efficient_q2", nil
+					} else {
+						return "", fmt.Errorf("xvid is unavailable for %s: install FFmpeg libxvid or choose ProRes", strings.Join(missing, ", "))
+					}
 				}
 				fmt.Println(ui.yellow("  Xvid is unavailable."))
 				fmt.Println()
 			case "4":
 				if e.caps.HasXvid {
-					return "xvid_compact"
+					if ok, missing := xvidAvailableForInputs(e.caps, infos, false); ok {
+						return "xvid_compact", nil
+					} else {
+						return "", fmt.Errorf("xvid is unavailable for %s: install FFmpeg libxvid or choose ProRes", strings.Join(missing, ", "))
+					}
 				}
 				fmt.Println(ui.yellow("  Xvid is unavailable."))
 				fmt.Println()
 			case "5":
 				if e.caps.HasXvid {
-					return "xvid_small"
+					if ok, missing := xvidAvailableForInputs(e.caps, infos, false); ok {
+						return "xvid_small", nil
+					} else {
+						return "", fmt.Errorf("xvid is unavailable for %s: install FFmpeg libxvid or choose ProRes", strings.Join(missing, ", "))
+					}
 				}
 				fmt.Println(ui.yellow("  Xvid is unavailable."))
 				fmt.Println()
 			case "6":
 				if e.caps.HasXvid {
-					return "xvid_max"
+					if ok, missing := xvidAvailableForInputs(e.caps, infos, false); ok {
+						return "xvid_max", nil
+					} else {
+						return "", fmt.Errorf("xvid is unavailable for %s: install FFmpeg libxvid or choose ProRes", strings.Join(missing, ", "))
+					}
 				}
 				fmt.Println(ui.yellow("  Xvid is unavailable."))
 				fmt.Println()
 			case "7":
 				if e.caps.HasProRes {
-					return "prores_4444"
+					return "prores_4444", nil
 				}
 				fmt.Println(ui.yellow("  prores_ks is unavailable."))
 				fmt.Println()
 			case "8":
 				if e.caps.HasUtVideo && validatePresetInputs("utvideo_lossless", infos) == nil {
-					return "utvideo_lossless"
+					return "utvideo_lossless", nil
 				}
 				if !e.caps.HasUtVideo {
 					fmt.Println(ui.yellow("  FFmpeg build does not include the Ut Video encoder."))
@@ -1118,6 +1191,10 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		return item
 	}
 
+	if nativeXvidNeedsExactFrameScan(info) {
+		info.FrameCountExact = false
+		rep.line("Lossless AVI metadata does not agree with its duration; doing one exact decode scan before native Xvid.")
+	}
 	if !info.FrameCountExact {
 		rep.line("Source frame count is estimated; doing one exact decode scan before conversion.")
 		count, scanErr := e.countDecodedFrames(ctx, info, func(p progressInfo) {
@@ -1192,6 +1269,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 				outInfo.FrameCountExact = true
 				problems := verifyOutput(info, outInfo, opts, expectedFPS0, expectedDur0)
 				if len(problems) == 0 {
+					releaseOutputReservation(out)
 					item.Output = cand
 					item.OutputInfo = outInfo
 					item.Status = "skipped"
@@ -1925,7 +2003,7 @@ func detectCapabilities() (Capabilities, map[string]bool, error) {
 	xvidRaw := findXvidEncRaw()
 	hasNative := xvidRaw != ""
 	hasVulkanProRes := enc["prores_ks_vulkan"] && probeProResVulkan(ffmpeg)
-	return Capabilities{FFmpeg: ffmpeg, FFprobe: ffprobe, Version: versionLine, HasXvid: enc["libxvid"] || hasNative, HasNativeXvid: hasNative, XvidEncRaw: xvidRaw, HasProRes: enc["prores_ks"], HasProResVulkan: hasVulkanProRes, HasMagicYUV: enc["magicyuv"], HasUtVideo: enc["utvideo"], MagicInstalled: magic, MagicDetail: detail}, enc, nil
+	return Capabilities{FFmpeg: ffmpeg, FFprobe: ffprobe, Version: versionLine, HasXvid: enc["libxvid"] || hasNative, HasLibXvid: enc["libxvid"], HasNativeXvid: hasNative, XvidEncRaw: xvidRaw, HasProRes: enc["prores_ks"], HasProResVulkan: hasVulkanProRes, HasMagicYUV: enc["magicyuv"], HasUtVideo: enc["utvideo"], MagicInstalled: magic, MagicDetail: detail}, enc, nil
 }
 
 func probeProResVulkan(ffmpeg string) bool {
@@ -2043,7 +2121,7 @@ func probeMedia(ffprobe, path string, count bool) (MediaInfo, error) {
 	if bit == 0 {
 		bit = deriveBitDepth(sv.PixFmt)
 	}
-	info := MediaInfo{Path: path, Codec: sv.CodecName, CodecTag: sv.CodecTagString, Width: sv.Width, Height: sv.Height, PixelFormat: sv.PixFmt, BitDepth: bit, FPS: sv.AvgFrameRate, FPSFloat: fpsFloat, Duration: dur, FrameCount: frames, FrameCountExact: frameCountExact, SizeBytes: parseInt64(doc.Format.Size), BitRate: parseInt64(doc.Format.BitRate), ColorRange: sv.ColorRange, ColorSpace: sv.ColorSpace, ColorTransfer: sv.ColorTransfer, ColorPrimaries: sv.ColorPrimaries, HasAlpha: hasAlpha(sv.PixFmt), Chroma: chroma(sv.PixFmt), Audio: []AudioInfo{}}
+	info := MediaInfo{Path: path, Codec: sv.CodecName, CodecTag: sv.CodecTagString, Profile: sv.Profile, Width: sv.Width, Height: sv.Height, PixelFormat: sv.PixFmt, BitDepth: bit, FPS: sv.AvgFrameRate, FPSFloat: fpsFloat, Duration: dur, FrameCount: frames, FrameCountExact: frameCountExact, SizeBytes: parseInt64(doc.Format.Size), BitRate: parseInt64(doc.Format.BitRate), ColorRange: sv.ColorRange, ColorSpace: sv.ColorSpace, ColorTransfer: sv.ColorTransfer, ColorPrimaries: sv.ColorPrimaries, HasAlpha: hasAlpha(sv.PixFmt), Chroma: chroma(sv.PixFmt), Audio: []AudioInfo{}}
 	for _, sa := range doc.Streams {
 		if sa.CodecType != "audio" {
 			continue
@@ -2071,7 +2149,7 @@ func deriveBitDepth(p string) int {
 }
 func hasAlpha(p string) bool {
 	low := strings.ToLower(p)
-	return strings.HasPrefix(low, "rgba") || strings.HasPrefix(low, "bgra") || strings.Contains(low, "yuva") || strings.Contains(low, "gbrap")
+	return strings.HasPrefix(low, "rgba") || strings.HasPrefix(low, "bgra") || strings.HasPrefix(low, "argb") || strings.HasPrefix(low, "abgr") || strings.Contains(low, "yuva") || strings.Contains(low, "gbrap")
 }
 func isRGBPixelFormat(p string) bool {
 	low := strings.ToLower(strings.TrimSpace(p))
@@ -2232,6 +2310,9 @@ func (e *Engine) canUseVulkanProRes(info MediaInfo, req ConvertOptions) bool {
 	if req.CPUProRes || !e.caps.HasProResVulkan || !isProResPreset(req.Preset) {
 		return false
 	}
+	if info.HasAlpha && req.Preset != "prores_4444" {
+		return false
+	}
 	if isRGBPixelFormat(info.PixelFormat) || strings.EqualFold(info.ColorSpace, "gbr") || strings.EqualFold(info.ColorRange, "pc") {
 		return false
 	}
@@ -2239,6 +2320,9 @@ func (e *Engine) canUseVulkanProRes(info MediaInfo, req ConvertOptions) bool {
 }
 
 func (e *Engine) buildProResVulkanCommand(info MediaInfo, req ConvertOptions, out string) ([]string, *big.Rat, float64, error) {
+	if err := validatePresetInputs(req.Preset, []MediaInfo{info}); err != nil {
+		return nil, nil, 0, err
+	}
 	if !e.caps.HasProResVulkan {
 		return nil, nil, 0, errors.New("FFmpeg build does not include prores_ks_vulkan")
 	}
@@ -2293,6 +2377,9 @@ func (e *Engine) buildProResVulkanCommand(info MediaInfo, req ConvertOptions, ou
 }
 
 func (e *Engine) buildCommand(info MediaInfo, req ConvertOptions, out string) ([]string, *big.Rat, float64, error) {
+	if err := validatePresetInputs(req.Preset, []MediaInfo{info}); err != nil {
+		return nil, nil, 0, err
+	}
 	args := []string{"-hide_banner", "-nostdin", "-y", "-i", info.Path, "-map", "0:v:0"}
 	filters := []string{}
 	if cf := colorFilter(info); cf != "" {
@@ -2375,7 +2462,7 @@ func (e *Engine) buildCommand(info MediaInfo, req ConvertOptions, out string) ([
 			return nil, nil, 0, err
 		}
 		if pix == "yuva444p" || pix == "gray" {
-			return nil, nil, 0, fmt.Errorf("Ut Video cannot preserve source pixel format %s with this FFmpeg build", info.PixelFormat)
+			return nil, nil, 0, fmt.Errorf("ut video cannot preserve source pixel format %s with this FFmpeg build", info.PixelFormat)
 		}
 		args = append(args, "-c:v", "utvideo", "-pred", "left", "-pix_fmt", pix)
 		args = append(args, e.audioArgs(info, req, sourceFPS, target, false)...)
@@ -2604,6 +2691,17 @@ func nativeXvidEligible(info MediaInfo) bool {
 	return class == "lossless" || strings.EqualFold(info.Codec, "rawvideo")
 }
 
+func nativeXvidNeedsExactFrameScan(info MediaInfo) bool {
+	if !nativeXvidEligible(info) || !info.FrameCountExact || info.FrameCount <= 0 {
+		return false
+	}
+	if info.FPSFloat <= 0 || info.Duration <= 0 {
+		return true
+	}
+	expected := int64(math.Round(info.Duration * info.FPSFloat))
+	return expected <= 0 || expected != info.FrameCount
+}
+
 func nativeXvidArgs(info MediaInfo, req ConvertOptions, tmpVideo string, target *big.Rat) []string {
 	threads, slices := nativeXvidThreads()
 	q := xvidQuant(req.Preset)
@@ -2637,23 +2735,6 @@ func nativeXvidArgs(info MediaInfo, req ConvertOptions, tmpVideo string, target 
 		xargs = append(xargs, "-frames", strconv.FormatInt(info.FrameCount, 10))
 	}
 	return xargs
-}
-
-func splitCRLF(data []byte, atEOF bool) (advance int, token []byte, err error) {
-	for i, b := range data {
-		if b != '\r' && b != '\n' {
-			continue
-		}
-		j := i + 1
-		for j < len(data) && (data[j] == '\r' || data[j] == '\n') {
-			j++
-		}
-		return j, data[:i], nil
-	}
-	if atEOF && len(data) > 0 {
-		return len(data), data, nil
-	}
-	return 0, nil, nil
 }
 
 func parseXvidProgressLine(line string) (frames int64, percent float64, fps string, ok bool) {
@@ -2878,25 +2959,43 @@ func outputCandidates(src, custom, preset string) ([]string, string, error) {
 			name = fmt.Sprintf("%s_%s_%d%s", stem, preset, n, ext)
 		}
 		p := filepath.Join(base, name)
-		if !fileExists(p) {
+		if fileExists(p) {
+			existing = append(existing, p)
+			continue
+		}
+		reservation, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err == nil {
+			if closeErr := reservation.Close(); closeErr != nil {
+				_ = os.Remove(p)
+				return existing, "", closeErr
+			}
 			return existing, p, nil
 		}
-		existing = append(existing, p)
+		if errors.Is(err, os.ErrExist) {
+			existing = append(existing, p)
+			continue
+		}
+		return existing, "", fmt.Errorf("reserve output %s: %w", p, err)
 	}
 	return existing, "", errors.New("could not choose unused output filename")
 }
 
-func outputPath(src, custom, preset string) (string, error) {
-	_, next, err := outputCandidates(src, custom, preset)
-	return next, err
+func releaseOutputReservation(path string) {
+	_ = os.Remove(path)
 }
 
 func presetCodecMatches(preset string, out MediaInfo) bool {
 	switch preset {
 	case "xvid_compact", "xvid_max_q2", "xvid_efficient_q2", "xvid_small", "xvid_max":
 		return strings.EqualFold(out.Codec, "mpeg4") && strings.EqualFold(out.CodecTag, "XVID")
-	case "prores_lt", "prores_422", "prores_hq", "prores_4444":
-		return strings.EqualFold(out.Codec, "prores")
+	case "prores_lt":
+		return strings.EqualFold(out.Codec, "prores") && strings.EqualFold(out.Profile, "LT") && strings.EqualFold(out.PixelFormat, "yuv422p10le")
+	case "prores_422":
+		return strings.EqualFold(out.Codec, "prores") && strings.EqualFold(out.Profile, "Standard") && strings.EqualFold(out.PixelFormat, "yuv422p10le")
+	case "prores_hq":
+		return strings.EqualFold(out.Codec, "prores") && strings.EqualFold(out.Profile, "HQ") && strings.EqualFold(out.PixelFormat, "yuv422p10le")
+	case "prores_4444":
+		return strings.EqualFold(out.Codec, "prores") && strings.EqualFold(out.Profile, "4444") && prores4444PixelFormat(out.PixelFormat)
 	case "magicyuv_lossless":
 		return strings.EqualFold(out.Codec, "magicyuv")
 	case "utvideo_lossless":
@@ -2906,13 +3005,36 @@ func presetCodecMatches(preset string, out MediaInfo) bool {
 	}
 }
 
+func prores4444PixelFormat(pixFmt string) bool {
+	low := strings.ToLower(strings.TrimSpace(pixFmt))
+	// Current FFmpeg prores_ks builds report non-alpha profile-4444 output as
+	// yuv444p12le even when yuv444p10le is requested. Keep the requested
+	// encoder format, but accept that encoder-normalized profile-4444 result.
+	return low == "yuv444p10le" || low == "yuv444p12le" || strings.HasPrefix(low, "yuva444p")
+}
+
+func proresOutputMatchesInput(preset string, in, out MediaInfo) bool {
+	if !presetCodecMatches(preset, out) {
+		return false
+	}
+	if preset == "prores_4444" {
+		if in.HasAlpha {
+			return hasAlpha(out.PixelFormat)
+		}
+		return strings.EqualFold(out.PixelFormat, "yuv444p10le") || strings.EqualFold(out.PixelFormat, "yuv444p12le")
+	}
+	return true
+}
+
 func verifyOutput(in, out MediaInfo, opts ConvertOptions, expected *big.Rat, expectedDur float64) []string {
 	p := verify(in, out, expected, expectedDur)
 	if in.Width > 0 && in.Height > 0 && (out.Width != in.Width || out.Height != in.Height) {
 		p = append(p, fmt.Sprintf("dimension mismatch: %dx%d input vs %dx%d output", in.Width, in.Height, out.Width, out.Height))
 	}
 	if !presetCodecMatches(opts.Preset, out) {
-		p = append(p, fmt.Sprintf("codec mismatch: output is %s/%s for preset %s", out.Codec, out.CodecTag, opts.Preset))
+		p = append(p, fmt.Sprintf("codec/profile/pixel format mismatch: output is %s/%s/%s/%s for preset %s", out.Codec, out.Profile, out.CodecTag, out.PixelFormat, opts.Preset))
+	} else if isProResPreset(opts.Preset) && !proresOutputMatchesInput(opts.Preset, in, out) {
+		p = append(p, fmt.Sprintf("ProRes profile/pixel format mismatch: output is %s/%s", out.Profile, out.PixelFormat))
 	}
 
 	wantAudio := len(in.Audio) > 0 && !opts.StripAudio && !opts.Conform

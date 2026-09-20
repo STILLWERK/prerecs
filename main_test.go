@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -95,6 +96,9 @@ func TestIntegrationProResConform(t *testing.T) {
 	outInfo, err := probeMedia(caps.FFprobe, dst, true)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.EqualFold(outInfo.Profile, "Standard") || !strings.EqualFold(outInfo.PixelFormat, "yuv422p10le") {
+		t.Fatalf("ProRes 422 probe profile/pixel format=%s/%s", outInfo.Profile, outInfo.PixelFormat)
 	}
 	if p := verify(info, outInfo, fps, dur); len(p) != 0 {
 		t.Fatalf("verify: %v", p)
@@ -463,23 +467,47 @@ func TestEditPresetDefaultsToProResLT(t *testing.T) {
 	}
 }
 
+func TestNon4444ProResRejectsAlphaInputs(t *testing.T) {
+	alpha := []MediaInfo{{Path: "alpha.mkv", HasAlpha: true}}
+	for _, preset := range []string{"prores_lt", "prores_422", "prores_hq"} {
+		if err := validatePresetInputs(preset, alpha); err == nil || !strings.Contains(err.Error(), "ProRes 4444") {
+			t.Fatalf("%s accepted alpha input without a ProRes 4444 error: %v", preset, err)
+		}
+	}
+	if err := validatePresetInputs("prores_4444", alpha); err != nil {
+		t.Fatalf("ProRes 4444 rejected alpha input: %v", err)
+	}
+
+	e := &Engine{enc: map[string]bool{"prores_ks": true}}
+	info := alpha[0]
+	info.FPS = "30/1"
+	info.FPSFloat = 30
+	info.Duration = 1
+	if _, _, _, err := e.buildCommand(info, ConvertOptions{Preset: "prores_lt"}, "out.mov"); err == nil {
+		t.Fatal("buildCommand silently accepted alpha input for ProRes LT")
+	}
+}
+
 func TestPresetMenuMapsShareAndFastCorrectly(t *testing.T) {
 	old := stdinReader
 	defer func() { stdinReader = old }()
 
 	e := &Engine{caps: Capabilities{HasXvid: true}}
 	stdinReader = bufio.NewReader(strings.NewReader("1\n"))
-	if got := choosePreset(theme{}, e, nil); got != "xvid_max_q2" {
+	got, err := choosePreset(theme{}, e, nil)
+	if err != nil || got != "xvid_max_q2" {
 		t.Fatalf("main SHARE menu=%q, want xvid_max_q2", got)
 	}
 
 	stdinReader = bufio.NewReader(strings.NewReader("4\n3\n"))
-	if got := choosePreset(theme{}, e, nil); got != "xvid_efficient_q2" {
+	got, err = choosePreset(theme{}, e, nil)
+	if err != nil || got != "xvid_efficient_q2" {
 		t.Fatalf("MORE Xvid Q2 Efficient=%q, want xvid_efficient_q2", got)
 	}
 
 	stdinReader = bufio.NewReader(strings.NewReader("4\n4\n"))
-	if got := choosePreset(theme{}, e, nil); got != "xvid_compact" {
+	got, err = choosePreset(theme{}, e, nil)
+	if err != nil || got != "xvid_compact" {
 		t.Fatalf("MORE Xvid Q2 Fast=%q, want xvid_compact", got)
 	}
 }
@@ -577,6 +605,18 @@ func TestETAWaitsForWarmup(t *testing.T) {
 	}
 }
 
+func TestHeadlessExitCodeOnCancellation(t *testing.T) {
+	if got := headlessExitCode(BatchResult{}, context.Canceled); got != 130 {
+		t.Fatalf("cancelled headless job exit code=%d, want 130", got)
+	}
+	if got := headlessExitCode(BatchResult{Failures: 1}, nil); got != 1 {
+		t.Fatalf("failed headless job exit code=%d, want 1", got)
+	}
+	if got := headlessExitCode(BatchResult{Successes: 1}, nil); got != 0 {
+		t.Fatalf("successful headless job exit code=%d, want 0", got)
+	}
+}
+
 func TestMetadataFrameCountTrust(t *testing.T) {
 	trusted := []string{"lagarith", "magicyuv", "ffv1", "huffyuv", "utvideo", "rawvideo", "prores", "dnxhd", "cfhd"}
 	for _, codec := range trusted {
@@ -589,6 +629,65 @@ func TestMetadataFrameCountTrust(t *testing.T) {
 		if metadataFrameCountTrusted(codec) {
 			t.Fatalf("%s metadata frame count must be treated as estimated", codec)
 		}
+	}
+}
+
+func TestXvidAvailabilityUsesSourceEligibility(t *testing.T) {
+	caps := Capabilities{HasXvid: true, HasNativeXvid: true, HasLibXvid: false}
+	eligible := []MediaInfo{{Path: `C:\clips\master.avi`, Codec: "lagarith"}}
+	nonEligible := []MediaInfo{{Path: `C:\clips\master.mkv`, Codec: "ffv1"}}
+	mixed := append(append([]MediaInfo{}, eligible...), nonEligible...)
+
+	if ok, _ := xvidAvailableForInputs(caps, eligible, false); !ok {
+		t.Fatal("native-only eligible AVI should be available without libxvid")
+	}
+	if ok, _ := xvidAvailableForInputs(caps, nonEligible, false); ok {
+		t.Fatal("native-only capability should not be available for non-eligible input")
+	}
+	if ok, _ := xvidAvailableForInputs(caps, mixed, false); ok {
+		t.Fatal("native-only capability should not be available for a mixed batch")
+	}
+}
+
+func TestCollectOptionsRejectsUnsupportedXvidInputEarly(t *testing.T) {
+	e := &Engine{
+		caps: Capabilities{HasXvid: true, HasNativeXvid: true, HasLibXvid: false},
+		enc:  map[string]bool{},
+	}
+	info := MediaInfo{Path: `C:\clips\master.mkv`, Codec: "ffv1"}
+	_, err := collectOptions(cliConfig{preset: "share", yes: true, forceXvid: true}, theme{}, e, []MediaInfo{info})
+	if err == nil || !strings.Contains(err.Error(), "libxvid") {
+		t.Fatalf("unsupported native-only Xvid input was not rejected early: %v", err)
+	}
+}
+
+func TestHasAlphaRecognizesPackedARGBFormats(t *testing.T) {
+	for _, pixFmt := range []string{"rgba", "bgra", "argb", "abgr", "yuva420p", "yuva444p", "gbrap"} {
+		if !hasAlpha(pixFmt) {
+			t.Fatalf("hasAlpha(%q)=false, want true", pixFmt)
+		}
+	}
+	for _, pixFmt := range []string{"rgb24", "bgr24", "yuv420p", "yuv444p"} {
+		if hasAlpha(pixFmt) {
+			t.Fatalf("hasAlpha(%q)=true, want false", pixFmt)
+		}
+	}
+}
+
+func TestNativeXvidFrameCountConsistencyGuard(t *testing.T) {
+	consistent := MediaInfo{Path: `C:\clips\master.avi`, Codec: "lagarith", FrameCount: 90, FrameCountExact: true, FPSFloat: 30, Duration: 3}
+	if nativeXvidNeedsExactFrameScan(consistent) {
+		t.Fatal("consistent lossless AVI metadata should keep the fast path")
+	}
+	suspicious := consistent
+	suspicious.FrameCount = 80
+	if !nativeXvidNeedsExactFrameScan(suspicious) {
+		t.Fatal("duration/frame mismatch should require an exact scan")
+	}
+	unknownDuration := consistent
+	unknownDuration.Duration = 0
+	if !nativeXvidNeedsExactFrameScan(unknownDuration) {
+		t.Fatal("missing duration should require an exact scan")
 	}
 }
 
@@ -805,6 +904,52 @@ func TestOutputCollisionFamily(t *testing.T) {
 	}
 }
 
+func TestSameStemDefaultOutputReservationIsAtomic(t *testing.T) {
+	d := t.TempDir()
+	paths := []string{filepath.Join(d, "clip.avi"), filepath.Join(d, "clip.mov")}
+	for _, path := range paths {
+		if err := os.WriteFile(path, []byte("source"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	start := make(chan struct{})
+	type result struct {
+		path string
+		err  error
+	}
+	results := make(chan result, len(paths))
+	var wg sync.WaitGroup
+	for _, path := range paths {
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+			<-start
+			_, next, err := outputCandidates(path, "", "xvid_max_q2")
+			results <- result{path: next, err: err}
+		}(path)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var got []result
+	for result := range results {
+		got = append(got, result)
+	}
+	if len(got) != 2 || got[0].err != nil || got[1].err != nil {
+		t.Fatalf("reservations=%+v", got)
+	}
+	if got[0].path == got[1].path {
+		t.Fatalf("same-stem sources reserved the same output: %q", got[0].path)
+	}
+	for _, result := range got {
+		if !fileExists(result.path) {
+			t.Fatalf("reservation did not hold final target %q", result.path)
+		}
+	}
+}
+
 func TestEfficientOutputSuffix(t *testing.T) {
 	d := t.TempDir()
 	src := filepath.Join(d, "clip.avi")
@@ -827,11 +972,37 @@ func TestPresetCodecMatches(t *testing.T) {
 	if presetCodecMatches("xvid_compact", MediaInfo{Codec: "mpeg4", CodecTag: "FMP4"}) {
 		t.Fatal("wrong mpeg4 tag must not match")
 	}
-	if !presetCodecMatches("prores_lt", MediaInfo{Codec: "prores"}) {
+	if !presetCodecMatches("prores_lt", MediaInfo{Codec: "prores", Profile: "LT", PixelFormat: "yuv422p10le"}) {
 		t.Fatal("prores should match")
+	}
+	if presetCodecMatches("prores_lt", MediaInfo{Codec: "prores", Profile: "4444", PixelFormat: "yuv444p10le"}) {
+		t.Fatal("wrong ProRes profile must not match LT")
 	}
 	if !presetCodecMatches("magicyuv_lossless", MediaInfo{Codec: "magicyuv"}) {
 		t.Fatal("magicyuv should match")
+	}
+}
+
+func TestProResPresetMatchesProfileAndPixelFormat(t *testing.T) {
+	if presetCodecMatches("prores_lt", MediaInfo{Codec: "prores", Profile: "4444", PixelFormat: "yuv444p10le"}) {
+		t.Fatal("ProRes LT accepted a 4444-format output")
+	}
+	if presetCodecMatches("prores_4444", MediaInfo{Codec: "prores", Profile: "Standard", PixelFormat: "yuv422p10le"}) {
+		t.Fatal("ProRes 4444 accepted a 422-format output")
+	}
+	if !presetCodecMatches("prores_4444", MediaInfo{Codec: "prores", Profile: "4444", PixelFormat: "yuv444p10le"}) {
+		t.Fatal("ProRes 4444 rejected a non-alpha 4444 output")
+	}
+	if !presetCodecMatches("prores_4444", MediaInfo{Codec: "prores", Profile: "4444", PixelFormat: "yuv444p12le"}) {
+		t.Fatal("ProRes 4444 rejected FFmpeg's encoder-normalized non-alpha output")
+	}
+	alphaIn := MediaInfo{HasAlpha: true}
+	alphaOut := MediaInfo{Codec: "prores", Profile: "4444", PixelFormat: "yuva444p10le", HasAlpha: true}
+	if !proresOutputMatchesInput("prores_4444", alphaIn, alphaOut) {
+		t.Fatal("ProRes 4444 rejected an alpha-capable output")
+	}
+	if proresOutputMatchesInput("prores_4444", MediaInfo{}, alphaOut) {
+		t.Fatal("non-alpha ProRes 4444 input accepted an alpha output")
 	}
 }
 

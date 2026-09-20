@@ -250,7 +250,7 @@ Same four real 2560x1440 Lagarith masters, same native Xvid Q2 settings, full Pr
 - all jobs exited 0;
 - corresponding sequential/parallel AVI outputs had identical sizes and identical SHA-256 hashes.
 
-Thread/slice tuning on 300 real frames showed the existing 8-thread / 4-slice single-job configuration is already close to the useful ceiling: 22.9 fps at 8/4 versus 23.3 fps at 24/24. Six concurrent Xvid jobs were slower than four on the tested i7-13700K, so the release caps Xvid workers at four.
+Historical thread/slice tuning for the older Compact path on 300 real frames showed 22.9 fps at 8/4 versus 23.3 fps at 24/24. Current SHARE/Efficient native Xvid uses one slice; six concurrent jobs were slower than four on the tested i7-13700K, so the release caps Xvid workers at four.
 
 A mixed seven-file `xpr_slums` stress run exercised native Xvid and large-AVI FFmpeg fallback simultaneously:
 
@@ -412,6 +412,11 @@ Four real 2560x1440 Lagarith masters totaled 2,998,126,970 bytes (~2.79 GiB).
 **Windows VfW preflight**
 
 The real `vdub` corpus contains several large Lagarith AVIs that FFmpeg can decode completely but the legacy VfW/AVIFile path used by `xvid_encraw` cannot seek to the final frame. The release probes the final VfW frame before starting native Xvid and routes those files directly to FFmpeg libxvid instead of wasting a partial native encode.
+
+**Lossless AVI metadata guard**
+
+Normal lossless AVI metadata stays on the fast path when frame count agrees with rounded duration/frame-rate timing. Missing or inconsistent timing metadata triggers one exact decode scan before native Xvid uses the count for VfW preflight, `-frames`, or verification. The representative `nade_cine_green.avi` source reported and decoded 641 frames at 30 fps.
+
 ## Final release-gate stress run
 
 Real corpus: 30 Lagarith masters across five actual `vdub` project folders (`ballista_yemen`, `dsr_skate`, `nade_raid`, `shotgun_frost`, `xpr_slums`), 38.2 GiB total. Every source was 2560x1440 / 30 fps / YUV420 and was conformed to 300 fps with Xvid Q2.

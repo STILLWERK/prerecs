@@ -55,7 +55,7 @@ The encoder's default minimum I/P quantizer is 2, so PreRecs explicitly sets the
 - **ME quality 6** through FFmpeg: rejected for default. About 20% slower for ~0.27% size reduction on the sample.
 - **Full RD (`mbd=rd`)** through FFmpeg: rejected for default. About 11% smaller but roughly 7.6× slower.
 - **Forced FFmpeg Xvid thread counts**: no meaningful speed change in the tested build.
-- **Xvid app-level multi-instance mode**: rejected for the main path. It encoded the full test at ~22 fps versus ~24.7 fps for the chosen explicit 8-thread/4-slice direct-AVI path, then still required remuxing.
+- **Xvid app-level multi-instance mode**: rejected for the main path. It encoded the full historical Compact benchmark at ~22 fps versus ~24.7 fps for that older explicit 8-thread/4-slice direct-AVI path, then still required remuxing. Current SHARE/Efficient native Xvid uses one slice.
 - **Raw YUV stdin to the Windows reference encoder**: rejected. A long binary stream terminated early when the C runtime interpreted a byte as text EOF. Native Xvid therefore reads eligible AVI masters through VfW, but the release first verifies that the legacy VfW path can actually reach the final advertised frame. Large/OpenDML AVIs that fail that preflight go directly to FFmpeg libxvid.
 
 ## Native Xvid quality-search tradeoff
@@ -195,6 +195,13 @@ The final stream is wrapped by FFmpeg with `-c:v copy -vtag XVID`. A 90-frame A/
 Downloaded community AVIs can contain internally inconsistent metadata. One H.264 AVI advertised 2,046 frames and 3.410 s at 600 fps but decoded to 1,997 pictures. Its decoded timestamps were also incomplete/gapped. PreRecs now treats compressed-source metadata counts as estimates, decodes once to determine the real picture count, and constructs a clean CFR editing timeline from frame number at the nominal rate. The correct intermediate in this case is 1,997 frames / 600 fps = 3.3283 s.
 
 MagicYUV testing also established that the tested FFmpeg encoder exposes 8-bit planar formats. YUV444 must remain YUV444; converting it to RGB would be an unnecessary color-representation change. A 45-frame FFV1 YUV444 test round-tripped through both MagicYUV and Ut Video with all decoded frame hashes identical. Higher-bit-depth inputs are rejected for these two presets rather than silently reduced to 8-bit.
+
+## Lossless AVI frame-count guard
+
+Lossless AVI metadata remains a fast path when its advertised frame count agrees with the rounded duration/frame-rate estimate. Before native Xvid uses that count for VfW final-frame preflight, the `-frames` limit, or final verification, missing timing metadata or a count/duration mismatch now triggers one exact decode scan. This keeps the normal corpus fast while preventing an obviously inconsistent AVI from validating the native path against its own bad count.
+
+The representative `vdub` material checked during this pass was internally consistent: `nade_cine_green.avi` reported and decoded 641 frames at 30 fps, and the existing stress evidence covers the large/OpenDML files that require the VfW fallback.
+
 ## Stability findings
 
 A full real-folder stress run covered 30 Lagarith masters across `ballista_yemen`, `dsr_skate`, `nade_raid`, `shotgun_frost`, and `xpr_slums`: 38.2 GiB total, all 2560x1440/30 fps/YUV420, conformed to 300 fps. The packaged Windows build finished 30/30 verified with zero failures. Five large/OpenDML AVIs could not expose their final frame through the legacy VfW path; the new final-frame preflight identified all five before native Xvid was started and routed them directly to FFmpeg libxvid. There were zero unexpected native-Xvid runtime failures.
@@ -208,7 +215,7 @@ Audio behavior was deliberately kept simple. At normal timing, compatible audio 
 
 ## Batch performance research
 
-- Native Xvid single-job thread/slice scaling on the i7-13700K plateaued around the existing 8 threads / 4 slices. Increasing to 24/24 improved 300-frame throughput by only ~1.8% and slightly changed size, so the stable 8/4 per-job settings were retained.
+- Earlier single-job thread/slice scaling for the historical Compact path on the i7-13700K plateaued around 8 threads / 4 slices. Current SHARE/Efficient native Xvid uses up to 8 threads and one slice; the old 8/4 result is retained only as benchmark context.
 - Batch-level native-Xvid concurrency was the large safe win: four real clips completed end-to-end through PreRecs in 37.03 s versus 104.10 s sequentially (2.81x), with byte-identical sequential/parallel outputs. Six concurrent Xvid jobs were slower than four.
 - Full decoded Xvid verification was cheap (~1.48 s total for four outputs), so verification remains mandatory.
 - MagicYUV `gradient` remained the best tested predictor balance; two concurrent jobs helped, four did not.
