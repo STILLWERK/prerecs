@@ -2968,3 +2968,40 @@ func TestProcessItemStaleFrameCountRescansAndVerifies(t *testing.T) {
 		t.Fatalf("output duration %.3fs — timing was not preserved (~1.0s expected)", outInfo.Duration)
 	}
 }
+
+// The same stale-count rescue must NOT rescue a conform output when the rate
+// it was built from is impeached and the timing cannot be recomputed: the
+// timeline is unverifiable, so the job fails rather than report VERIFIED.
+func TestProcessItemStaleFrameCountConformFails(t *testing.T) {
+	caps, enc, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	if !enc["libxvid"] {
+		t.Skip("libxvid unavailable")
+	}
+	td := t.TempDir()
+	src := filepath.Join(td, "clip.avi")
+	if b, err := exec.Command(caps.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30",
+		"-frames:v", "30", "-c:v", "ffv1", src,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("fixture: %v %s", err, b)
+	}
+	patchStrhLength(t, src, 90)
+	info, err := probeMedia(caps.FFprobe, src, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outDir := filepath.Join(td, "out")
+	rep, _ := captureReporter()
+	item := processItem(context.Background(), theme{}, &Engine{caps: caps, enc: enc}, info,
+		ConvertOptions{Preset: "xvid_compact", OutputDir: outDir, StripAudio: true, Conform: true, Timescale: "0.1"}, rep)
+	if item.Status != "failed" {
+		t.Fatalf("unverifiable conform output must fail, got status=%q msg=%q", item.Status, item.Message)
+	}
+	if !strings.Contains(item.Message, "timing cannot be verified") {
+		t.Fatalf("expected unverifiable-timing failure message, got %q", item.Message)
+	}
+}
