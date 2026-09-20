@@ -1592,6 +1592,8 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 			rep.line(ui.yellow("WARNING: " + msg))
 			if item.Message != "" {
 				item.Message += "; " + msg
+			} else {
+				item.Message = msg
 			}
 		}
 	}
@@ -1634,7 +1636,10 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 			rep.finish()
 			rep.line(ui.yellow("Native Xvid failed its frame-integrity check; retrying with FFmpeg libxvid."))
 			rep.line(ui.dim(err.Error()))
-			removeOut()
+			// Keep `out` occupied: it is the O_EXCL reservation guarding this
+			// destination against concurrent same-stem runs. Removing it here
+			// would briefly release the reservation before the fallback encode;
+			// ffmpeg -y overwrites the placeholder/partial output itself.
 			if opts.Preset == "xvid_max_q2" {
 				item.Backend = "FFmpeg libxvid Share fallback (strict Q2 full RD/B0)"
 			} else if opts.Preset == "xvid_efficient_q2" {
@@ -1670,7 +1675,8 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 			rep.finish()
 			rep.line(ui.yellow("Vulkan ProRes failed; retrying with CPU prores_ks."))
 			rep.line(ui.dim(err.Error()))
-			removeOut()
+			// Same reservation rule: `out` must stay occupied through the
+			// backend switch; ffmpeg -y truncates whatever the GPU attempt left.
 			item.Backend = "CPU prores_ks fallback"
 			args, expectedFPS, expectedDur, err = e.buildCommand(info, opts, out)
 			if err == nil {
@@ -1711,14 +1717,15 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	rep.finish()
 
 	if err != nil {
-		removeOut()
 		item.Elapsed = time.Since(started)
 		if errors.Is(err, context.Canceled) {
 			item.Status = "cancelled"
+			removeOut()
 			return item
 		}
 		item.Status = "failed"
 		item.Message = err.Error()
+		removeOut()
 		rep.line(ui.red("ENCODE FAILED"))
 		rep.line(indentError(err.Error(), 2))
 		return item
@@ -1730,10 +1737,10 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	// still preserved deliberately in the reuse check above.)
 	outInfo, err := probeMedia(e.caps.FFprobe, out, false)
 	if err != nil {
-		removeOut()
 		item.Elapsed = time.Since(started)
 		item.Status = "failed"
 		item.Message = err.Error()
+		removeOut()
 		rep.line(ui.red("VERIFY PROBE FAILED"))
 		rep.line(indentError(err.Error(), 2))
 		return item
@@ -1766,10 +1773,10 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	item.OutputInfo = outInfo
 	problems := verifyOutput(info, outInfo, opts, expectedFPS, expectedDur)
 	if len(problems) > 0 {
-		removeOut()
 		item.Elapsed = time.Since(started)
 		item.Status = "failed"
 		item.Message = strings.Join(problems, "; ")
+		removeOut()
 		rep.line(ui.red("VERIFY FAILED"))
 		for _, problem := range problems {
 			rep.line("- " + problem)
