@@ -1,6 +1,6 @@
 # PreRecs
 
-PreRecs is a Windows console application for preparing high-frame-rate game captures and other prerequisite video for editing workflows. The current source version is **v1.0.1**; v1.0.0 remains frozen.
+PreRecs is a Windows console application for preparing high-frame-rate game captures and other prerequisite video for editing workflows. The current source version is **v1.0.2**; v1.0.0 and v1.0.1 remain frozen.
 
 It has two complementary jobs:
 
@@ -138,6 +138,7 @@ Useful options:
 --cpu-prores          Disable the experimental Vulkan ProRes path.
 --plain               Disable ANSI styling.
 --version             Print the application version.
+-h, --help            Show usage.
 ```
 
 ## Conversion and verification behavior
@@ -149,11 +150,13 @@ The workflow is intentionally staged:
 3. the selected encoder is run with the tested timing and codec path;
 4. the output is fully decoded and checked before it is reported as successful.
 
+All FFmpeg decode stages (source scan, conversion input, and output verification) run with strict decoder-error handling (`-xerror -err_detect explode`). FFmpeg can otherwise log decode errors yet still exit 0 after silently dropping frames; a bitstream-corrupt source now fails loudly instead of producing a verified truncated output.
+
 Verification checks the exact decoded frame count, frame rate, normalized duration, dimensions, requested codec/tag, expected Xvid or lossless pixel format, audio presence and track count, and the copied audio codec when audio is retained. A mismatch fails the job.
 
 ProRes verification also checks the encoded profile and pixel format: LT/422/HQ require `yuv422p10le`, while 4444 requests `yuv444p10le` without alpha or an alpha-capable 4444 format when the source has alpha. Current FFmpeg `prores_ks` builds may report non-alpha profile-4444 output as `yuv444p12le`; that encoder-normalized result is accepted. Non-4444 ProRes presets reject alpha sources instead of silently discarding the alpha plane.
 
-When a matching output already exists, PreRecs decodes and verifies it first. A current valid output is reused. A stale, truncated, wrong-codec, or otherwise invalid output is preserved and the new conversion receives the next numbered filename.
+When a matching output already exists, PreRecs decodes and verifies it first. A current valid output is reused. A stale, truncated, wrong-codec, or otherwise invalid pre-existing output is preserved and the new conversion receives the next numbered filename — including sparse numbered slots, so `clip_preset_2.avi` can be reused even when the base name is free. An output produced by the *current* run that fails probe, decode, or verification checks is removed rather than left behind under a normal-looking filename.
 
 Output allocation atomically reserves the final target to prevent parallel same-stem collisions. An abrupt process termination can therefore leave a zero-byte placeholder; the next run preserves/rejects that invalid candidate and safely chooses a numbered replacement.
 
@@ -180,7 +183,7 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
   go build -trimpath -ldflags='-s -w' -o PreRecs.exe .
 ```
 
-Run the resulting executable on Windows and confirm it reports `PreRecs 1.0.1`.
+Run the resulting executable on Windows and confirm it reports `PreRecs 1.0.2`.
 
 On Windows, `build_windows.ps1` runs the unit tests and vet before producing `PreRecs.exe`. The GitHub Actions CI also checks formatting, tests, vet, race tests, and a Windows amd64 CGO-disabled build. Tags beginning with `v` use the release workflow to build a Windows ZIP and SHA-256 checksum file.
 
@@ -195,7 +198,11 @@ On Windows, `build_windows.ps1` runs the unit tests and vet before producing `Pr
 - Lagarith is supported as an input when FFmpeg can decode it, but the tested FFmpeg builds do not provide a Lagarith encoder.
 - Intermediates can be much larger than compressed downloads. Transcoding cannot restore detail already lost by a distribution codec.
 - Timing conforming strips audio by design. Normal-timing audio is stream-copied only when the destination container is known to accept the tested codec.
-- Vulkan ProRes is an experimental fast path. It is probed at startup and automatically falls back to CPU `prores_ks` when the driver or runtime encode fails.
+- Vulkan ProRes is an experimental fast path. It is probed at startup with a bounded (10-second) probe and automatically falls back to CPU `prores_ks` when the driver, probe, or runtime encode fails.
+- Only the first video stream of each input is processed (`-map 0:v:0`); additional video streams are not converted.
+- Folder inputs are scanned non-recursively: only files directly inside the folder are taken.
+- Directory scans skip filenames that exactly match PreRecs' own generated output naming (`stem_<preset>.avi|mov`, `stem_<preset>_<n>.ext`) so a later run does not re-ingest its own results when the output directory overlaps a scanned folder. A file that deliberately shares the exact generated name can still be passed explicitly.
+- Command-line options may appear before or after file paths; `--` terminates option parsing for paths that begin with a dash.
 
 ## Technical notes and QA evidence
 
