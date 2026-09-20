@@ -1,6 +1,6 @@
 # PreRecs
 
-PreRecs is a Windows console application for preparing high-frame-rate game captures and other prerequisite video for editing workflows. The next patch release is **v1.0.1**; v1.0.0 remains frozen.
+PreRecs is a Windows console application for preparing high-frame-rate game captures and other prerequisite video for editing workflows. The current source version is **v1.0.1**; v1.0.0 remains frozen.
 
 It has two complementary jobs:
 
