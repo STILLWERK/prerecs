@@ -1665,7 +1665,17 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 			item.Backend = fmt.Sprintf("native Xvid (Q%s, %d threads/%d slices)", xvidQuant(opts.Preset), threads, slices)
 		}
 		rep.line("Encoder: " + item.Backend)
-		expectedFPS, expectedDur, err = e.runNativeXvid(ctx, info, opts, out, func(p progressInfo) {
+		// Bound the encode by the claimed frame count only when that count was
+		// decode-verified this run. A container table that understates the
+		// stream would otherwise truncate the encode to the lie — and the
+		// post-verify would see claim == output, reporting VERIFIED on a
+		// partial conversion. Unbounded, the encoder stops at stream end and
+		// the VOP/verify checks stay authoritative.
+		frameBound := int64(0)
+		if inputScanned {
+			frameBound = info.FrameCount
+		}
+		expectedFPS, expectedDur, err = e.runNativeXvid(ctx, info, opts, out, frameBound, func(p progressInfo) {
 			rep.progress(p)
 		})
 		if err != nil && e.enc["libxvid"] && ctx.Err() == nil {
@@ -1844,6 +1854,12 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 			item.InputInfo = info
 			if _, fps, dur, terr := expectedTiming(info, opts); terr == nil {
 				expectedFPS, expectedDur = fps, dur
+			} else {
+				// Timing can't be recomputed from the reconciled metadata
+				// (e.g. conform mode without a usable rate): drop the
+				// pre-rescan expectations too instead of verifying against
+				// values derived from the stale table.
+				expectedFPS, expectedDur = nil, 0
 			}
 			problems = verifyOutput(info, outInfo, opts, expectedFPS, expectedDur)
 		}
@@ -3322,7 +3338,11 @@ func nativeXvidNeedsExactFrameScan(info MediaInfo) bool {
 	return expected <= 0 || expected != info.FrameCount
 }
 
-func nativeXvidArgs(info MediaInfo, req ConvertOptions, tmpVideo string, target *big.Rat) []string {
+// frameBound caps the encode at a decode-verified frame count; pass 0 to let
+// the encoder run to stream end — the only safe choice when the container's
+// claimed count was never verified, since an understated table would
+// otherwise truncate the output to match the lie.
+func nativeXvidArgs(info MediaInfo, req ConvertOptions, tmpVideo string, target *big.Rat, frameBound int64) []string {
 	threads, slices := nativeXvidThreads()
 	q := xvidQuant(req.Preset)
 	vhq := "1"
@@ -3351,8 +3371,8 @@ func nativeXvidArgs(info MediaInfo, req ConvertOptions, tmpVideo string, target 
 	} else if req.Preset == "xvid_efficient_q2" {
 		xargs = append(xargs, "-bvhq", "-bquant_ratio", "100", "-bquant_offset", "100", "-metric", "0")
 	}
-	if info.FrameCount > 0 {
-		xargs = append(xargs, "-frames", strconv.FormatInt(info.FrameCount, 10))
+	if frameBound > 0 {
+		xargs = append(xargs, "-frames", strconv.FormatInt(frameBound, 10))
 	}
 	return xargs
 }
@@ -3410,7 +3430,7 @@ func (c *mpeg4VOPCounter) poll(path string) (int64, error) {
 	return c.count, nil
 }
 
-func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertOptions, out string, progress func(progressInfo)) (*big.Rat, float64, error) {
+func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertOptions, out string, frameBound int64, progress func(progressInfo)) (*big.Rat, float64, error) {
 	if !e.caps.HasNativeXvid || e.caps.XvidEncRaw == "" {
 		return nil, 0, errors.New("native Xvid encoder not available")
 	}
@@ -3435,7 +3455,7 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 	defer os.Remove(tmpVideo)
 
 	progress(progressInfo{Percent: 0, TotalFrames: info.FrameCount, Stage: "ENCODE"})
-	xargs := nativeXvidArgs(info, req, tmpVideo, target)
+	xargs := nativeXvidArgs(info, req, tmpVideo, target, frameBound)
 	cmd := xvidEncrawCommand(ctx, e.caps.XvidEncRaw, xargs...)
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
@@ -3598,15 +3618,22 @@ func outputCandidates(src, custom, preset string) ([]string, string, error) {
 			continue
 		}
 		name := e.Name()
-		rest := strings.TrimPrefix(name, prefix)
-		if rest == name {
+		// NTFS is case-insensitive: on Windows match case-folded so a
+		// differently-cased existing output is found for reuse instead of
+		// being missed and duplicated under a numbered name.
+		matchName, matchPrefix, matchExt := name, prefix, ext
+		if runtime.GOOS == "windows" {
+			matchName, matchPrefix, matchExt = strings.ToLower(name), strings.ToLower(prefix), strings.ToLower(ext)
+		}
+		rest := strings.TrimPrefix(matchName, matchPrefix)
+		if rest == matchName {
 			continue
 		}
 		n := 0
-		if rest == ext {
+		if rest == matchExt {
 			n = 1
-		} else if strings.HasPrefix(rest, "_") && strings.HasSuffix(rest, ext) {
-			mid := rest[1 : len(rest)-len(ext)]
+		} else if strings.HasPrefix(rest, "_") && strings.HasSuffix(rest, matchExt) {
+			mid := rest[1 : len(rest)-len(matchExt)]
 			if !isDigits(mid) {
 				continue
 			}

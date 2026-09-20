@@ -183,7 +183,7 @@ func TestNativeXvidArgsAreFrameSafeAndFixedQuant(t *testing.T) {
 		"xvid_compact": "2",
 		"xvid_small":   "3",
 	} {
-		args := nativeXvidArgs(info, ConvertOptions{Preset: preset}, "out.avi", target)
+		args := nativeXvidArgs(info, ConvertOptions{Preset: preset}, "out.avi", target, info.FrameCount)
 		joined := " " + strings.Join(args, " ") + " "
 		if !strings.Contains(joined, " -i C:\\clips\\master.avi -type 2 ") {
 			t.Fatalf("native Xvid should use direct AVI/VFW input: %v", args)
@@ -208,7 +208,7 @@ func TestNativeXvidArgsAreFrameSafeAndFixedQuant(t *testing.T) {
 
 func TestNativeXvidShareQ2Args(t *testing.T) {
 	info := MediaInfo{Path: "C:/clips/master.avi", Codec: "lagarith", Width: 2560, Height: 1440, FrameCount: 645}
-	args := nativeXvidArgs(info, ConvertOptions{Preset: "xvid_max_q2"}, "out.m4v", big.NewRat(300, 1))
+	args := nativeXvidArgs(info, ConvertOptions{Preset: "xvid_max_q2"}, "out.m4v", big.NewRat(300, 1), info.FrameCount)
 	joined := " " + strings.Join(args, " ") + " "
 	for _, want := range []string{
 		" -cq 2 ", " -quality 6 ", " -vhqmode 4 ", " -max_bframes 2 ",
@@ -229,7 +229,7 @@ func TestNativeXvidShareQ2Args(t *testing.T) {
 
 func TestNativeXvidEfficientQ2Args(t *testing.T) {
 	info := MediaInfo{Path: "C:/clips/master.avi", Codec: "lagarith", Width: 2560, Height: 1440, FrameCount: 645}
-	args := nativeXvidArgs(info, ConvertOptions{Preset: "xvid_efficient_q2"}, "out.m4v", big.NewRat(300, 1))
+	args := nativeXvidArgs(info, ConvertOptions{Preset: "xvid_efficient_q2"}, "out.m4v", big.NewRat(300, 1), info.FrameCount)
 	joined := " " + strings.Join(args, " ") + " "
 	for _, want := range []string{
 		" -cq 2 ", " -quality 6 ", " -vhqmode 4 ", " -max_bframes 2 ",
@@ -980,7 +980,14 @@ func TestUtVideoBuildPreservesYUV444(t *testing.T) {
 
 func TestNativeXvidWritesRawStreamForLiveProgress(t *testing.T) {
 	info := MediaInfo{Path: `C:\clips\master.avi`, Codec: "lagarith", Width: 2560, Height: 1440, FrameCount: 645}
-	args := nativeXvidArgs(info, ConvertOptions{Preset: "xvid_compact"}, "out.m4v", big.NewRat(300, 1))
+	// A zero frameBound must emit no -frames argument: an unverified container
+	// count that understates the stream would truncate the encode to the lie
+	// and let verification see claim == output.
+	unbounded := nativeXvidArgs(info, ConvertOptions{Preset: "xvid_compact"}, "out.m4v", big.NewRat(300, 1), 0)
+	if strings.Contains(" "+strings.Join(unbounded, " ")+" ", " -frames ") {
+		t.Fatalf("unbounded encode must not pass -frames: %v", unbounded)
+	}
+	args := nativeXvidArgs(info, ConvertOptions{Preset: "xvid_compact"}, "out.m4v", big.NewRat(300, 1), info.FrameCount)
 	joined := " " + strings.Join(args, " ") + " "
 	if !strings.Contains(joined, " -o out.m4v ") {
 		t.Fatalf("native Xvid should write an elementary stream for live progress: %v", args)
@@ -1895,7 +1902,7 @@ func TestNativeXvidFakeSuccess(t *testing.T) {
 	src := filepath.Join(td, "src.avi")
 	info := MediaInfo{Path: src, Codec: "ffv1", FPS: "30/1", FPSFloat: 30, FrameCount: int64(frames), FrameCountExact: true, Duration: float64(frames) / 30}
 	out := filepath.Join(td, "out.avi")
-	target, dur, err := e.runNativeXvid(context.Background(), info, ConvertOptions{Preset: "xvid_compact", StripAudio: true}, out, func(progressInfo) {})
+	target, dur, err := e.runNativeXvid(context.Background(), info, ConvertOptions{Preset: "xvid_compact", StripAudio: true}, out, info.FrameCount, func(progressInfo) {})
 	if err != nil {
 		t.Fatalf("native path failed: %v", err)
 	}
@@ -1924,7 +1931,7 @@ func TestNativeXvidFakeWrongFrameCount(t *testing.T) {
 	installFakeXvid(t, es, map[string]string{"PRERECS_FAKE_XVID_VOPS": "15"})
 	info := MediaInfo{Path: filepath.Join(td, "src.avi"), Codec: "ffv1", FPS: "30/1", FPSFloat: 30, FrameCount: int64(frames), FrameCountExact: true, Duration: float64(frames) / 30}
 	out := filepath.Join(td, "out.avi")
-	_, _, err := e.runNativeXvid(context.Background(), info, ConvertOptions{Preset: "xvid_compact", StripAudio: true}, out, func(progressInfo) {})
+	_, _, err := e.runNativeXvid(context.Background(), info, ConvertOptions{Preset: "xvid_compact", StripAudio: true}, out, info.FrameCount, func(progressInfo) {})
 	if err == nil || !strings.Contains(err.Error(), "VOP") {
 		t.Fatalf("expected VOP count failure, got %v", err)
 	}
@@ -1943,7 +1950,7 @@ func TestNativeXvidFakeExitError(t *testing.T) {
 	installFakeXvid(t, es, map[string]string{"PRERECS_FAKE_XVID_EXIT": "3"})
 	info := MediaInfo{Path: filepath.Join(td, "src.avi"), Codec: "ffv1", FPS: "30/1", FPSFloat: 30, FrameCount: int64(frames), FrameCountExact: true, Duration: float64(frames) / 30}
 	out := filepath.Join(td, "out.avi")
-	_, _, err := e.runNativeXvid(context.Background(), info, ConvertOptions{Preset: "xvid_compact", StripAudio: true}, out, func(progressInfo) {})
+	_, _, err := e.runNativeXvid(context.Background(), info, ConvertOptions{Preset: "xvid_compact", StripAudio: true}, out, info.FrameCount, func(progressInfo) {})
 	if err == nil || !strings.Contains(err.Error(), "native Xvid failed") {
 		t.Fatalf("expected encoder failure, got %v", err)
 	}
@@ -1961,7 +1968,7 @@ func TestNativeXvidFakeCancellation(t *testing.T) {
 	out := filepath.Join(td, "out.avi")
 	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()
-	_, _, err := e.runNativeXvid(ctx, info, ConvertOptions{Preset: "xvid_compact", StripAudio: true}, out, func(progressInfo) {})
+	_, _, err := e.runNativeXvid(ctx, info, ConvertOptions{Preset: "xvid_compact", StripAudio: true}, out, info.FrameCount, func(progressInfo) {})
 	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected cancellation, got %v", err)
 	}
