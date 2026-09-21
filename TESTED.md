@@ -1,4 +1,10 @@
-# PreRecs v1.0.0 QA and historical evidence
+# PreRecs QA and historical evidence
+
+## v1.0.4 release gate
+
+The v1.0.4 source passed formatting, the complete test suite, vet, race-enabled tests, Windows-tagged vet, and a Windows amd64 CGO-disabled build. The built executable reports `PreRecs 1.0.4`.
+
+Focused regressions cover bounded native-Xvid diagnostics, FFprobe and capability-command cancellation (including inherited output pipes), existing-output reservation cleanup on cancellation, alpha-safe ProRes fallback selection, and rejection of missing expected timing metadata.
 
 ## Efficient preset implementation
 

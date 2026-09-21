@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.0.4 — Maintainability and process-hardening patch
+
+- Split the former monolithic `main.go` into responsibility-focused files for application wiring, CLI/input handling, presets, capability detection, media probing, FFmpeg execution, native Xvid, pixel formats, output reservations, verification, batch orchestration, and terminal reporting. The tests now follow the same structure; encoder tuning and normal conversion behavior are unchanged.
+- Native `xvid_encraw` stdout and stderr capture is bounded to 32 KiB per stream, preventing a verbose or malfunctioning encoder from growing memory without limit while retaining the diagnostic tail.
+- FFprobe metadata calls are bounded and honor batch cancellation. Capability probes use bounded contexts and `WaitDelay`, so canceled commands and inherited subprocess pipes cannot hold startup or verification open indefinitely. Existing-output probe cancellation now releases the reserved destination immediately.
+- The compressed-source prompt switches alpha-bearing batches to ProRes 4444 instead of offering ProRes 422 LT, which cannot preserve alpha.
+- Output verification now fails when expected frame-rate or duration metadata is absent instead of silently skipping those timing checks.
+- Added regression coverage for bounded native-Xvid diagnostics, inherited-pipe timeouts, FFprobe cancellation, alpha-safe fallback selection, missing timing metadata, and reservation cleanup.
+
 ## v1.0.3 — Robustness and polish patch
 
 - New `--no-native-xvid` option bypasses the `xvid_encraw` path entirely, so a machine whose native encoder fails verification can still convert through FFmpeg libxvid.
