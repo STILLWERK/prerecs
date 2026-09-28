@@ -1,0 +1,117 @@
+name: Quality
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-quality:
+    name: Linux quality checks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: go.mod
+
+      - name: Check gofmt
+        shell: bash
+        run: |
+          files="$(gofmt -l .)"
+          if [[ -n "$files" ]]; then
+            printf '%s\n' "$files"
+            exit 1
+          fi
+
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Race tests
+        run: go test -race -count=1 ./...
+
+  go-floor:
+    name: Go 1.23 floor (documented minimum)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.23'
+          cache-dependency-path: go.mod
+
+      # Language features stay gated by the go directive, but stdlib symbols
+      # added after 1.23 compile fine on newer toolchains — only the floor
+      # toolchain proves the documented minimum still works.
+      - name: Vet and build at floor
+        run: |
+          go vet ./...
+          go build ./...
+
+      - name: Test at floor
+        run: go test -count=1 ./...
+
+  windows-build:
+    name: Windows amd64 CGO-disabled build
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: go.mod
+
+      - name: Vet Windows-tagged sources
+        shell: pwsh
+        run: |
+          $env:CGO_ENABLED = '0'
+          $env:GOOS = 'windows'
+          $env:GOARCH = 'amd64'
+          go vet ./...
+
+      # The suite must also execute on the actual target OS: Windows-tagged
+      # sources (ansi_windows.go, vfw_windows.go) and the GOOS=="windows"
+      # branches never run on the Linux legs. FFmpeg-dependent tests skip
+      # cleanly when ffmpeg is absent.
+      - name: Test on Windows
+        shell: pwsh
+        run: |
+          $env:CGO_ENABLED = '0'
+          go test -count=1 ./...
+
+      - name: Build and check version
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $env:CGO_ENABLED = '0'
+          $env:GOOS = 'windows'
+          $env:GOARCH = 'amd64'
+          go build -trimpath -ldflags='-s -w' -o dist/PreRecs.exe .
+          $source = Get-Content main.go -Raw
+          $versionMatch = [regex]::Match($source, 'const version = "(?<version>[^"\r\n]+)"')
+          if (-not $versionMatch.Success) {
+            throw 'Could not find the source application version'
+          }
+          $version = $versionMatch.Groups['version'].Value
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Invalid source application version: $version"
+          }
+          $expected = "PreRecs $version"
+          $reported = (& dist/PreRecs.exe --version).Trim()
+          if ($reported -ne $expected) {
+            throw "Unexpected version: $reported"
+          }
