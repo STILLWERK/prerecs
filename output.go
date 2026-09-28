@@ -116,7 +116,10 @@ func outputCandidates(src, custom, preset string) ([]string, string, error) {
 			name = fmt.Sprintf("%s_%d%s", prefix, n, ext)
 		}
 		p := filepath.Join(base, name)
-		reservation, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
+		// The reservation inode becomes the final output file (ffmpeg -y
+		// truncates it in place), so keep it owner-only: converted media
+		// should not become world-readable just because it was produced.
+		reservation, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 		if err == nil {
 			if closeErr := reservation.Close(); closeErr != nil {
 				_ = os.Remove(p)

@@ -8,7 +8,7 @@
 - Per-item existing-output and post-encode metadata probes now share the documented 30-second bound, and a probe timeout is reported as a failure/rejection rather than masquerading as cancellation.
 - `--capture-fps` without `--timescale` fails fast under `--yes` instead of being silently ignored, and it seeds the interactive conform prompt as the default instead of being overwritten. An explicit `--strip-audio` now locks the choice instead of letting the audio menu's "keep" default undo it.
 - FFmpeg stderr diagnostics retain the trailing 32 KiB — where the decisive error in a long log lives — matching the native-Xvid convention, instead of keeping the first 32 KiB and dropping the ending.
-- Pre-existing outputs that win a reservation race now land in the sorted reuse list, reserved placeholders get normal file permissions, generated-output name matching respects each preset family's real extension (`.avi` vs `.mov`), and `clipName`/`shortFFmpeg` no longer cut multibyte runes in half.
+- Pre-existing outputs that win a reservation race now land in the sorted reuse list, generated-output name matching respects each preset family's real extension (`.avi` vs `.mov`), and `clipName`/`shortFFmpeg` no longer cut multibyte runes in half.
 - `--preset` help lists the canonical `xvid-q3`/`xvid-q1` names alongside the others, and the MagicYUV-missing error names Ut Video as the free alternative.
 
 ## v1.0.4 — Maintainability and process-hardening patch
