@@ -342,6 +342,12 @@ func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (Conv
 		}
 		opts.OutputDir = out
 	}
+	if opts.OutputDir != "" {
+		// Keep the directory absolute: a flag value like `-neg` would otherwise
+		// reach every ffmpeg/xvid invocation as a `-`-prefixed path and fail
+		// all of them as an unrecognized option.
+		opts.OutputDir = absOrSelf(opts.OutputDir)
+	}
 	return opts, nil
 }
 

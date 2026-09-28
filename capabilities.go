@@ -124,6 +124,12 @@ func capabilityCommandOutput(name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.WaitDelay = time.Second
 	out, err := cmd.CombinedOutput()
+	// Same forgiveness probeMediaContext/runFFmpeg apply: a wrapper or shim
+	// that exits 0 while a descendant holds the pipes open reports
+	// ErrWaitDelay, which must not fail startup.
+	if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 0 {
+		err = nil
+	}
 	if ctx.Err() != nil {
 		return out, ctx.Err()
 	}
@@ -159,19 +165,34 @@ func detectCapabilities() (Capabilities, map[string]bool, error) {
 	if err != nil {
 		return Capabilities{}, nil, err
 	}
-	enc := map[string]bool{}
-	scanner := bufio.NewScanner(strings.NewReader(string(encOut)))
-	for scanner.Scan() {
-		f := strings.Fields(scanner.Text())
-		if len(f) >= 2 && len(f[0]) == 6 && (strings.Contains(f[0], "V") || strings.Contains(f[0], "A")) {
-			enc[f[1]] = true
-		}
-	}
+	enc := parseEncoderNames(encOut)
 	magic := detectMagicYUV()
 	xvidRaw := findXvidEncRaw()
 	hasNative := xvidRaw != ""
 	hasVulkanProRes := enc["prores_ks_vulkan"] && probeProResVulkan(ffmpeg)
-	return Capabilities{FFmpeg: ffmpeg, FFprobe: ffprobe, Version: versionLine, HasXvid: enc["libxvid"] || hasNative, HasLibXvid: enc["libxvid"], HasNativeXvid: hasNative, XvidEncRaw: xvidRaw, HasProRes: enc["prores_ks"], HasProResVulkan: hasVulkanProRes, HasMagicYUV: enc["magicyuv"], HasUtVideo: enc["utvideo"], MagicInstalled: magic}, enc, nil
+	// vfrdet ships in FFmpeg ≥4.1 and is never optional in practice, but a
+	// stripped build without it must not hard-fail every compressed input at
+	// the integrity scan — gate timing observation on its presence.
+	filtersOut, _ := capabilityCommandOutput(ffmpeg, "-hide_banner", "-filters")
+	hasVfrdet := bytes.Contains(filtersOut, []byte(" vfrdet "))
+	return Capabilities{FFmpeg: ffmpeg, FFprobe: ffprobe, Version: versionLine, HasXvid: enc["libxvid"] || hasNative, HasLibXvid: enc["libxvid"], HasNativeXvid: hasNative, XvidEncRaw: xvidRaw, HasProRes: enc["prores_ks"], HasProResVulkan: hasVulkanProRes, HasMagicYUV: enc["magicyuv"], HasUtVideo: enc["utvideo"], MagicInstalled: magic, HasVfrdet: hasVfrdet}, enc, nil
+}
+
+// parseEncoderNames turns `ffmpeg -encoders` output into a name set. Encoder
+// rows are `<flags> <name> <desc>` where flags is a fixed-width capability
+// column — 6 chars today, but the width is not pinned so a wider flag field
+// in a future FFmpeg cannot silently empty the map. Legend rows spell `=` as
+// the name (`V..... = Video`), which would otherwise register a bogus encoder.
+func parseEncoderNames(out []byte) map[string]bool {
+	enc := map[string]bool{}
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	for scanner.Scan() {
+		f := strings.Fields(scanner.Text())
+		if len(f) >= 2 && f[1] != "=" && strings.ContainsAny(f[0], "VA") {
+			enc[f[1]] = true
+		}
+	}
+	return enc
 }
 
 // vulkanProbeTimeout bounds the startup capability probe. A wedged Vulkan

@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/big"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +32,11 @@ func (e *Engine) canUseVulkanProRes(info MediaInfo, req ConvertOptions) bool {
 	if isRGBPixelFormat(info.PixelFormat) || strings.EqualFold(info.ColorSpace, "gbr") || strings.EqualFold(info.ColorRange, "pc") {
 		return false
 	}
+	// >10-bit sources get the deeper CPU pin (yuv444p12le/gbrp16le chain) so
+	// their extra precision actually survives; the Vulkan path pins 10-bit.
+	if info.BitDepth > 10 {
+		return false
+	}
 	return true
 }
 
@@ -51,29 +57,31 @@ func (e *Engine) buildProResVulkanCommand(info MediaInfo, req ConvertOptions, ou
 	}
 	// -xerror + -err_detect explode: a source that reports decoder errors must
 	// fail the encode rather than produce a silently truncated output.
-	args := []string{"-hide_banner", "-nostdin", "-y", "-init_hw_device", "vulkan=prerecs_vk", "-filter_hw_device", "prerecs_vk", "-xerror", "-err_detect", "explode", "-i", info.Path, "-map", "0:v:0"}
+	args := []string{"-hide_banner", "-nostdin", "-y", "-init_hw_device", "vulkan=prerecs_vk", "-filter_hw_device", "prerecs_vk", "-xerror", "-err_detect", "explode", "-i", info.Path, "-map", "0:V:0"}
 	filters := []string{}
 	if cf := colorFilter(info); cf != "" {
 		filters = append(filters, cf)
 	}
 	if req.Conform {
 		filters = append(conformVideoFilters(target), filters...)
-	} else if compressedSourceNeedsTimelineRebuild(info, req, target) {
-		filters = append(conformVideoFilters(target), filters...)
-		if info.FrameCount > 0 {
-			expectedDur = float64(info.FrameCount) / ratFloat(target)
+	} else if compressedSourceNeedsTimelineRebuild(info, req) {
+		// Verify the output against the rate actually stamped: with the
+		// container rate impeached the rebuild falls back to derived intent,
+		// and a muxer that ignores it must not slip past verification.
+		if rt := rebuildTargetRate(info, target); rt != nil {
+			filters = append(conformVideoFilters(rt), filters...)
+			expectedDur = float64(info.FrameCount) / ratFloat(rt)
+			target = rt
 		}
 	}
 
 	profile := map[string]string{"prores_lt": "1", "prores_422": "2", "prores_hq": "3", "prores_4444": "4"}[req.Preset]
-	pix := "yuv422p10le"
+	// Share the CPU path's pixel-format selection so >8-bit sources keep the
+	// 12-bit targets here too instead of crushing through 10le.
+	pix := proresPixelFormat(info, req.Preset)
 	alphaBits := ""
-	if req.Preset == "prores_4444" {
-		pix = "yuv444p10le"
-		if info.HasAlpha {
-			pix = "yuva444p10le"
-			alphaBits = strconv.Itoa(proresAlphaBits(info))
-		}
+	if req.Preset == "prores_4444" && info.HasAlpha {
+		alphaBits = strconv.Itoa(proresAlphaBits(info))
 	}
 	filters = append(filters, "format="+pix, "hwupload")
 	args = append(args, "-vf", strings.Join(filters, ","))
@@ -88,6 +96,7 @@ func (e *Engine) buildProResVulkanCommand(info MediaInfo, req ConvertOptions, ou
 	args = append(args, e.audioArgs(req)...)
 	args = append(args, "-movflags", "+write_colr")
 	args = append(args, colorOutputArgs(info, req.Preset)...)
+	args = append(args, provenanceArgs(info, req)...)
 	args = append(args, "-progress", "pipe:1", "-stats_period", "0.25", "-nostats", out)
 	return args, target, expectedDur, nil
 }
@@ -98,29 +107,40 @@ func (e *Engine) buildCommand(info MediaInfo, req ConvertOptions, out string) ([
 	}
 	// -xerror + -err_detect explode: a source that reports decoder errors must
 	// fail the encode rather than produce a silently truncated output.
-	args := []string{"-hide_banner", "-nostdin", "-y", "-xerror", "-err_detect", "explode", "-i", info.Path, "-map", "0:v:0"}
+	args := []string{"-hide_banner", "-nostdin", "-y", "-xerror", "-err_detect", "explode", "-i", info.Path, "-map", "0:V:0"}
 	filters := []string{}
 	if cf := colorFilter(info); cf != "" {
 		filters = append(filters, cf)
 	}
 	filters = append(filters, proresRGBConversionFilters(info, req.Preset)...)
+	filters = append(filters, xvidRGBConversionFilters(info, req.Preset)...)
 	_, target, expectedDur, err := expectedTiming(info, req)
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	if req.Conform {
-		filters = append(conformVideoFilters(target), filters...)
-		args = append(args, "-vf", strings.Join(filters, ","), "-fps_mode", "passthrough")
-	} else if compressedSourceNeedsTimelineRebuild(info, req, target) {
+	var rebuildRate *big.Rat
+	if !req.Conform && compressedSourceNeedsTimelineRebuild(info, req) {
 		// Distribution files found in the wild can have stale AVI indexes and
 		// broken/gapped timestamps. Once SCAN has established the actual decoded
 		// picture count, build a clean constant-rate editing timeline from those
-		// pictures instead of carrying bad source timestamps into the intermediate.
+		// pictures instead of carrying bad source timestamps into the
+		// intermediate. When no rate survives impeachment the rebuild is
+		// skipped — the verify pass then checks the passthrough output's own
+		// timestamps rather than pretending it was repaired.
+		rebuildRate = rebuildTargetRate(info, target)
+	}
+	if req.Conform {
 		filters = append(conformVideoFilters(target), filters...)
 		args = append(args, "-vf", strings.Join(filters, ","), "-fps_mode", "passthrough")
+	} else if rebuildRate != nil {
+		filters = append(conformVideoFilters(rebuildRate), filters...)
+		args = append(args, "-vf", strings.Join(filters, ","), "-fps_mode", "passthrough")
 		if info.FrameCount > 0 {
-			expectedDur = float64(info.FrameCount) / ratFloat(target)
+			expectedDur = float64(info.FrameCount) / ratFloat(rebuildRate)
 		}
+		// The output is verified against the rate actually stamped — which may
+		// be a derived fallback when the container rate was impeached.
+		target = rebuildRate
 	} else {
 		if len(filters) > 0 {
 			args = append(args, "-vf", strings.Join(filters, ","))
@@ -185,6 +205,7 @@ func (e *Engine) buildCommand(info MediaInfo, req ConvertOptions, out string) ([
 		return nil, nil, 0, fmt.Errorf("unknown preset %q", req.Preset)
 	}
 	args = append(args, colorOutputArgs(info, req.Preset)...)
+	args = append(args, provenanceArgs(info, req)...)
 	args = append(args, "-progress", "pipe:1", "-stats_period", "0.25", "-nostats", out)
 	return args, target, expectedDur, nil
 }
@@ -195,9 +216,79 @@ func (e *Engine) buildCommand(info MediaInfo, req ConvertOptions, out string) ([
 // stream-copied audio keeps the source timeline and would drift out of sync
 // with rebuilt video. Audio-carrying inputs keep passthrough timing for both
 // streams instead.
-func compressedSourceNeedsTimelineRebuild(info MediaInfo, req ConvertOptions, target *big.Rat) bool {
-	return target != nil && sourceClass(info) == "compressed" && info.FrameCountExact && info.FrameCount > 0 &&
+//
+// The rebuild also requires proven-broken timestamps: the exact decode scan's
+// vfrdet delta stats flag duplicated/non-monotonic PTS, a collapsed spread, or
+// missing stats. Healthy cadence — constant OR variable frame rate — goes
+// through passthrough so genuine VFR captures are not silently flattened.
+func compressedSourceNeedsTimelineRebuild(info MediaInfo, req ConvertOptions) bool {
+	return sourceClass(info) == "compressed" && info.FrameCountExact && info.FrameCount > 0 &&
+		info.TimestampsBroken &&
 		(req.StripAudio || len(info.Audio) == 0)
+}
+
+// rebuildTargetRate resolves the frame rate a broken-timestamp rebuild should
+// stamp. The container's rate is used when it survived impeachment; when it
+// was cleared, derive one from intact container evidence — the declared
+// duration, then (only when packet PTS are proven destroyed) the impeached
+// rate claim itself, since destroyed timestamps cannot contradict it. The
+// decoded presentation spread is deliberately never a rate source: a broken
+// source's spread is the very thing that collapsed, so frames/spread invents
+// absurd rates. Returns nil when nothing trustworthy remains; callers then
+// verify the passthrough output's own timestamps rather than pretending it
+// was repaired.
+func rebuildTargetRate(info MediaInfo, target *big.Rat) *big.Rat {
+	if target != nil {
+		return target
+	}
+	if info.FrameCount <= 1 {
+		return nil
+	}
+	if info.Duration > 0 {
+		if rate := new(big.Rat).SetFloat64(float64(info.FrameCount) / info.Duration); rate != nil {
+			if f := ratFloat(rate); f >= 1 && f <= 2000 {
+				return rate
+			}
+		}
+	}
+	if info.TimestampsBroken && info.ImpeachedFPS != "" {
+		if rate, err := parseRat(info.ImpeachedFPS); err == nil && rate != nil {
+			if f := ratFloat(rate); f >= 1 && f <= 2000 {
+				return rate
+			}
+		}
+	}
+	return nil
+}
+
+// timingReference returns the duration a healthy stream is implied to span,
+// as the minimum over independently-claimed positive candidates: count/rate,
+// the container duration, and — for destroyed-PTS sources — count over the
+// impeached rate claim. Surviving fields are mutually consistent by the time
+// this runs (reconcileScannedInput has pruned contradictions), so min() only
+// narrows the reference against a stale-large claim: a header that lies 8×
+// above the real cadence can no longer fabricate a "collapsed spread" verdict
+// and retime a healthy stream, while a genuinely destroyed timeline still
+// collapses far below any claim it could produce.
+func timingReference(info MediaInfo, frames int64) float64 {
+	best := math.Inf(1)
+	if info.FPSFloat > 0 && frames > 0 {
+		best = math.Min(best, float64(frames)/info.FPSFloat)
+	}
+	if info.Duration > 0 {
+		best = math.Min(best, info.Duration)
+	}
+	if info.ImpeachedFPS != "" && frames > 0 {
+		if r, err := parseRat(info.ImpeachedFPS); err == nil && r != nil {
+			if f := ratFloat(r); f > 0 {
+				best = math.Min(best, float64(frames)/f)
+			}
+		}
+	}
+	if math.IsInf(best, 1) {
+		return 0
+	}
+	return best
 }
 
 func (e *Engine) audioArgs(req ConvertOptions) []string {
@@ -308,6 +399,14 @@ func (w *progressPipeWriter) line(s string) {
 var childPipeWaitDelay = 5 * time.Second
 
 func (e *Engine) runFFmpeg(ctx context.Context, args []string, expectedDur float64, progress func(progressInfo)) error {
+	_, err := e.runFFmpegTail(ctx, args, expectedDur, progress)
+	return err
+}
+
+// runFFmpegTail is runFFmpeg that also hands back the captured stderr tail so
+// callers that need diagnostics beyond the exit status (e.g. the timestamp
+// stats emitted by the integrity scan) do not have to re-run the process.
+func (e *Engine) runFFmpegTail(ctx context.Context, args []string, expectedDur float64, progress func(progressInfo)) (string, error) {
 	if progress == nil {
 		progress = func(progressInfo) {}
 	}
@@ -335,10 +434,10 @@ func (e *Engine) runFFmpeg(ctx context.Context, args []string, expectedDur float
 		// The process finished cleanly. Checking ctx first would let a
 		// cancellation that landed between Run() and here discard a complete,
 		// valid output — the caller deletes it as "cancelled".
-		return nil
+		return stderr.String(), nil
 	}
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return stderr.String(), ctx.Err()
 	}
 	if err != nil {
 		msg := strings.TrimSpace(stderr.String())
@@ -352,42 +451,136 @@ func (e *Engine) runFFmpeg(ctx context.Context, args []string, expectedDur float
 		case msg == "":
 			// No diagnostics to quote — a Start failure or a signal kill must
 			// still surface the underlying error, not an empty "ffmpeg:".
-			return fmt.Errorf("ffmpeg: %w", err)
+			return stderr.String(), fmt.Errorf("ffmpeg: %w", err)
 		}
-		return fmt.Errorf("ffmpeg: %s", msg)
+		return stderr.String(), fmt.Errorf("ffmpeg: %s", msg)
 	}
-	return nil
+	return stderr.String(), nil
 }
 
-func (e *Engine) countDecodedFrames(ctx context.Context, info MediaInfo, progress func(progressInfo)) (int64, error) {
+// timingStats carries the vfrdet delta summary from an integrity scan: min/max
+// frame deltas in presentation order (B-frames handled by the filter), or nil
+// when timing was not observed on that scan. vfrdet omits min/max entirely for
+// uniformly spaced streams — HasDeltas distinguishes "uniform" (healthy) from
+// "variable with a non-positive minimum" (broken).
+//
+// LastOutSec is the final decoded presentation timestamp reported by
+// -progress — the real end-to-end spread of the stream, which vfrdet's
+// delta classification cannot see: a stream where every frame shares one PTS
+// (or monotonically collapses) reports as "uniform" while its spread is a
+// single frame's duration. The spread check closes that blind spot.
+type timingStats struct {
+	Reported   bool
+	HasDeltas  bool
+	MinDelta   int64
+	MaxDelta   int64
+	Count      int64
+	LastOutSec float64
+}
+
+// The VFR: field can spell an undefined ratio as nan/-nan (0 deltas seen) —
+// accept it so "reported zero deltas" is distinguishable from "never
+// reported"; those two cases classify differently (empty/unmeasurable vs
+// proven-unreadable).
+var vfrSummaryRe = regexp.MustCompile(`VFR:(?:-?nan|[\d.]+) +\((\d+)/\d+\)(?: +min: +(-?\d+) +max: +(-?\d+))?`)
+
+// brokenTimestamps classifies a decode scan's timestamp stats. Only deltas
+// that cannot be played back — duplicated, non-monotonic, or never reported —
+// justify rebuilding the timeline. A uniformly spaced or genuinely variable
+// cadence is healthy timing and is preserved as-is.
+func brokenTimestamps(st *timingStats, frames int64, refDurSec float64) bool {
+	if st == nil || !st.Reported {
+		// No stats means the stream never produced measurable timestamps —
+		// the very case the rebuild exists for.
+		return true
+	}
+	if st.HasDeltas {
+		// Delta range only exists when cadence varied; a non-positive minimum
+		// is duplicated or non-monotonic PTS, which playback cannot express.
+		return st.MinDelta <= 0
+	}
+	// Uniform cadence reports no delta range at all, so a stream whose frames
+	// all share one PTS (or whose container header claims a duration the
+	// packet timestamps collapse far below) is invisible to the delta check —
+	// catch it by comparing the decoded presentation spread against the claimed
+	// duration. The reference is a minimum over surviving metadata claims, and
+	// the collapse must be extreme (8×): a merely-stale rate claim — the exact
+	// garbage this path exists to clean up — cannot fabricate a "collapsed"
+	// verdict and retime a healthy stream.
+	if frames > 1 && refDurSec > 0 && st.LastOutSec > 0 && st.LastOutSec*8 <= refDurSec {
+		return true
+	}
+	return false
+}
+
+func (e *Engine) countDecodedFrames(ctx context.Context, info MediaInfo, includeAudio bool, observeTiming bool, progress func(progressInfo)) (int64, *timingStats, error) {
 	// -xerror + -err_detect explode make decoder corruption fatal. Without them
 	// FFmpeg logs decode errors but can still exit 0 after silently dropping
 	// frames — which would let a truncated count pass verification as truth.
+	// Retained audio is decoded in the same pass so damaged tracks cannot hide
+	// behind a healthy video track.
+	logLevel := "error"
+	if observeTiming {
+		// vfrdet emits its delta summary at INFO level at end of stream.
+		logLevel = "info"
+	}
 	args := []string{
-		"-hide_banner", "-loglevel", "error", "-nostdin",
+		"-hide_banner", "-loglevel", logLevel, "-nostdin",
 		"-xerror", "-err_detect", "explode",
 		"-i", info.Path,
-		"-map", "0:v:0", "-an", "-sn", "-dn",
+		"-map", "0:V:0", "-sn", "-dn",
+	}
+	if includeAudio {
+		args = append(args, "-map", "0:a?")
+	}
+	if observeTiming {
+		args = append(args, "-vf", "vfrdet")
+	}
+	args = append(args,
 		"-fps_mode", "passthrough",
 		"-progress", "pipe:1", "-stats_period", "0.25", "-nostats",
 		"-f", "null", "-",
-	}
+	)
 	var last int64
+	var lastOut float64
 	started := time.Now()
-	err := e.runFFmpeg(ctx, args, info.Duration, func(p progressInfo) {
+	stderr, err := e.runFFmpegTail(ctx, args, info.Duration, func(p progressInfo) {
 		if n := parseInt64(strings.TrimSpace(p.Frame)); n > 0 {
 			last = n
 			if elapsed := time.Since(started).Seconds(); elapsed > 0 {
 				p.FPS = fmt.Sprintf("%.2f", float64(n)/elapsed)
 			}
 		}
+		if p.Time > lastOut {
+			lastOut = p.Time
+		}
 		progress(p)
 	})
+	stats := parseTimingStats(stderr)
+	if stats == nil {
+		stats = &timingStats{}
+	}
+	stats.LastOutSec = lastOut
 	if err != nil {
-		return 0, err
+		return 0, stats, err
 	}
 	if last <= 0 {
-		return 0, errors.New("decoder did not report a frame count")
+		return 0, stats, errors.New("decoder did not report a frame count")
 	}
-	return last, nil
+	return last, stats, nil
+}
+
+func parseTimingStats(stderr string) *timingStats {
+	matches := vfrSummaryRe.FindAllStringSubmatch(stderr, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	m := matches[len(matches)-1]
+	st := &timingStats{Reported: true, Count: parseInt64(m[1])}
+	if m[2] != "" && m[3] != "" {
+		st.HasDeltas = true
+		st.MinDelta = parseInt64(m[2])
+		st.MaxDelta = parseInt64(m[3])
+	}
+	return st
 }

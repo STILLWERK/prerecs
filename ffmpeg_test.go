@@ -213,6 +213,9 @@ func TestCompressedScannedSourceGetsCleanCFR(t *testing.T) {
 		PixelFormat:     "yuv420p",
 		BitDepth:        8,
 		Chroma:          "4:2:0",
+		// The rebuild now requires scan-proven broken timestamps — healthy
+		// (including variable-rate) cadence goes through passthrough instead.
+		TimestampsBroken: true,
 	}
 	args, fps, dur, err := e.buildCommand(info, ConvertOptions{Preset: "prores_lt"}, "out.mov")
 	if err != nil {
@@ -258,6 +261,8 @@ func TestCompressedSourceWithCopiedAudioKeepsPassthroughTiming(t *testing.T) {
 		BitDepth:        8,
 		Chroma:          "4:2:0",
 		Audio:           []string{"aac"},
+		// Scan-proven broken timestamps are what make the rebuild eligible.
+		TimestampsBroken: true,
 	}
 	args, _, dur, err := e.buildCommand(info, ConvertOptions{Preset: "prores_lt"}, "out.mov")
 	if err != nil {
@@ -454,7 +459,7 @@ func TestStrictVerifyRejectsCorruptOutput(t *testing.T) {
 		t.Fatalf("probe of damaged output: %v", err)
 	}
 	e := &Engine{caps: caps, enc: enc}
-	if _, err := e.countDecodedFrames(context.Background(), outInfo, func(progressInfo) {}); err == nil {
+	if _, _, err := e.countDecodedFrames(context.Background(), outInfo, len(outInfo.Audio) > 0, false, func(progressInfo) {}); err == nil {
 		t.Fatal("strict verification decode accepted a damaged output")
 	}
 }
@@ -669,5 +674,203 @@ func TestBuildCommandPresetArgs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Timestamp health: vfrdet stats drive the timeline-rebuild decision
+// ---------------------------------------------------------------------------
+
+func TestParseTimingStats(t *testing.T) {
+	cfr := parseTimingStats("[Parsed_vfrdet_0 @ 0x1] VFR:0.000000 (0/89)")
+	if cfr == nil || !cfr.Reported {
+		t.Fatalf("CFR stats not parsed: %+v", cfr)
+	}
+	cfr.LastOutSec = 2.966
+	if brokenTimestamps(cfr, 90, 3.0) {
+		t.Fatal("uniform cadence classified as broken")
+	}
+	vfr := parseTimingStats("[Parsed_vfrdet_0 @ 0x1] VFR:0.993711 (158/1) min: 256 max: 512")
+	if vfr == nil || vfr.MinDelta != 256 || vfr.MaxDelta != 512 || vfr.Count != 158 {
+		t.Fatalf("VFR stats not parsed: %+v", vfr)
+	}
+	vfr.LastOutSec = 3.98
+	if brokenTimestamps(vfr, 160, 4.0) {
+		t.Fatal("genuine VFR classified as broken — rebuild would flatten it")
+	}
+	dup := parseTimingStats("[Parsed_vfrdet_0 @ 0x1] VFR:0.500000 (4/2) min: 0 max: 512")
+	if !brokenTimestamps(dup, 6, 1.0) {
+		t.Fatal("zero-delta (duplicated PTS) stream must be rebuilt")
+	}
+	if !brokenTimestamps(nil, 60, 2.0) {
+		t.Fatal("missing stats must be treated as broken")
+	}
+	// Every frame sharing one PTS reports as uniform to vfrdet — no delta
+	// range is emitted — but the decoded presentation spread (one frame's
+	// worth) collapses far below the container's claimed duration.
+	collapsed := &timingStats{Reported: true, LastOutSec: 0.033}
+	if !brokenTimestamps(collapsed, 60, 2.0) {
+		t.Fatal("uniform-zero PTS stream escaped detection via the uniform-cadence branch")
+	}
+	// A uniform stream whose spread matches its duration must not be rebuilt.
+	healthy := &timingStats{Reported: true, LastOutSec: 1.97}
+	if brokenTimestamps(healthy, 60, 2.0) {
+		t.Fatal("healthy uniform stream classified as broken by the spread check")
+	}
+	// A stale-large reference must not fabricate a verdict: a stream that
+	// genuinely spans 10s but whose header claims 20s is mistimed metadata,
+	// not collapsed timing — rebuilding at the claimed rate would halve the
+	// playback speed and verify it.
+	staleRef := &timingStats{Reported: true, LastOutSec: 10}
+	if brokenTimestamps(staleRef, 500, 20) {
+		t.Fatal("2× spread/claim ratio treated as broken — a stale rate claim would retime a healthy stream")
+	}
+	// Moderate collapse stays out of the ambiguous zone; only extreme
+	// (>=8×) collapse is unambiguous corruption.
+	mid := &timingStats{Reported: true, LastOutSec: 0.5}
+	if brokenTimestamps(mid, 60, 2.0) {
+		t.Fatal("4× spread/claim ratio must not fire on a plausible stale-rate mismatch")
+	}
+	extreme := &timingStats{Reported: true, LastOutSec: 0.2}
+	if !brokenTimestamps(extreme, 60, 2.0) {
+		t.Fatal("10× collapsed spread should be detected as destroyed timing")
+	}
+}
+
+// timingReference picks the minimum-implied duration over surviving metadata
+// so a single stale-large claim cannot inflate the collapse reference.
+func TestTimingReferenceMinImplied(t *testing.T) {
+	// Consistent claims: rate and duration agree — min of equal values.
+	if r := timingReference(MediaInfo{FPSFloat: 30, Duration: 2.0}, 60); r != 2.0 {
+		t.Fatalf("consistent claims reference = %v, want 2.0", r)
+	}
+	// The impeached rate is the only surviving claim for a destroyed-PTS
+	// source whose rate/duration were both cleared.
+	if r := timingReference(MediaInfo{ImpeachedFPS: "30/1"}, 60); r != 2.0 {
+		t.Fatalf("impeached-rate reference = %v, want 2.0", r)
+	}
+	// Stale-large impeached claim must not inflate the reference past an
+	// honest surviving duration.
+	if r := timingReference(MediaInfo{Duration: 2.0, ImpeachedFPS: "1/10"}, 60); r != 2.0 {
+		t.Fatalf("stale impeached rate inflated reference to %v", r)
+	}
+	// Stale-small impeached claim shrinks the reference — collapse must then
+	// clear an even higher bar, biasing toward passthrough on ambiguity.
+	if r := timingReference(MediaInfo{ImpeachedFPS: "10/1"}, 500); r != 50.0 {
+		t.Fatalf("impeached reference = %v, want 50.0", r)
+	}
+	if r := timingReference(MediaInfo{}, 60); r != 0 {
+		t.Fatalf("claimless reference = %v, want 0", r)
+	}
+}
+
+// A compressed source whose timestamps are healthy-but-variable must pass
+// through untouched: the timeline rebuild exists only for broken cadence.
+func TestProcessItemPreservesVFRTiming(t *testing.T) {
+	caps, enc, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	if !enc["prores_ks"] || !enc["libx264"] {
+		t.Skip("prores_ks/libx264 unavailable")
+	}
+	td := t.TempDir()
+	src := filepath.Join(td, "vfr.mp4")
+	// 60fps stream, drop every third frame keeping original PTS → deltas
+	// alternate 16.7ms/33.3ms — a genuine VFR capture pattern.
+	if b, err := exec.Command(caps.FFmpeg, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=60",
+		"-filter:v", "select='lt(mod(n,3),2)'", "-fps_mode", "vfr",
+		"-frames:v", "120",
+		"-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", src).CombinedOutput(); err != nil {
+		t.Skipf("VFR fixture: %v %s", err, b)
+	}
+	info, err := probeMedia(caps.FFprobe, src, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{caps: caps, enc: enc}
+	rep, _ := captureReporter()
+	item := processItem(context.Background(), theme{}, e, info,
+		ConvertOptions{Preset: "prores_lt", OutputDir: filepath.Join(td, "out"), StripAudio: true}, rep)
+	if item.Status != "ok" {
+		t.Fatalf("VFR source failed: %q %q", item.Status, item.Message)
+	}
+	// Output PTS deltas must remain non-uniform — a flattened CFR output would
+	// have exactly one distinct delta.
+	deltas := packetDeltaCounts(t, caps.FFprobe, item.Output)
+	if len(deltas) < 2 {
+		t.Fatalf("output was flattened to a single %v delta — VFR timing destroyed", deltas)
+	}
+}
+
+// packetDeltaCounts returns the distinct inter-packet PTS deltas (in ms,
+// rounded to 0.1ms) for the video stream.
+func packetDeltaCounts(t *testing.T, ffprobe, path string) map[int64]int {
+	t.Helper()
+	out, err := exec.Command(ffprobe, "-v", "error", "-select_streams", "v",
+		"-show_entries", "packet=pts_time", "-of", "csv=p=0", path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("pts dump: %v %s", err, out)
+	}
+	prev, first := float64(0), true
+	counts := map[int64]int{}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		pts := parseFloat(strings.TrimSpace(line))
+		if !first {
+			counts[int64((pts-prev)*10000+0.5)]++
+		}
+		first = false
+		prev = pts
+	}
+	return counts
+}
+
+// A source whose packet timestamps collapse to a single value is genuinely
+// broken — the rebuild path exists for it. The output must carry a playable
+// constant-rate timeline (uniform deltas spanning the real duration), not a
+// passthrough copy of the damaged PTS.
+func TestProcessItemRepairsCollapsedTimestamps(t *testing.T) {
+	caps, enc, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	if !enc["prores_ks"] || !enc["libx264"] {
+		t.Skip("prores_ks/libx264 unavailable")
+	}
+	td := t.TempDir()
+	ok := filepath.Join(td, "ok.mp4")
+	if b, err := exec.Command(caps.FFmpeg, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30",
+		"-frames:v", "60", "-c:v", "libx264", "-an", ok).CombinedOutput(); err != nil {
+		t.Skipf("base fixture: %v %s", err, b)
+	}
+	// Flatten every packet timestamp to zero: vfrdet then reports uniform
+	// cadence with no delta range, so only the presentation-spread check can
+	// catch the collapse.
+	src := filepath.Join(td, "zeropts.mkv")
+	if b, err := exec.Command(caps.FFmpeg, "-hide_banner", "-loglevel", "error", "-y",
+		"-i", ok, "-c", "copy", "-bsf:v", "setts=ts=0", "-f", "matroska", src).CombinedOutput(); err != nil {
+		t.Skipf("collapsed-PTS fixture: %v %s", err, b)
+	}
+	info, err := probeMedia(caps.FFprobe, src, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{caps: caps, enc: enc}
+	rep, lines := captureReporter()
+	item := processItem(context.Background(), theme{}, e, info,
+		ConvertOptions{Preset: "prores_lt", OutputDir: filepath.Join(td, "out"), StripAudio: true}, rep)
+	if item.Status != "ok" {
+		t.Fatalf("broken-PTS source failed: %q %q\n%s", item.Status, item.Message, strings.Join(*lines, "\n"))
+	}
+	deltas := packetDeltaCounts(t, caps.FFprobe, item.Output)
+	if len(deltas) != 1 {
+		t.Fatalf("rebuilt output should be constant-rate, got deltas %v", deltas)
+	}
+	for d := range deltas {
+		if d < 200 || d > 500 {
+			t.Fatalf("rebuilt delta %v ms is not ~33ms", float64(d)/10)
+		}
 	}
 }

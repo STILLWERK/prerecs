@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 )
 
 func hasDuplicateOutputStems(customDir string, infos []MediaInfo) bool {
@@ -33,13 +34,22 @@ func hasDuplicateOutputStems(customDir string, infos []MediaInfo) bool {
 	return false
 }
 
+// createdOutDirs records output directories this run made so a fully-failed
+// batch can remove the empty folder it left behind — os.Remove on a non-empty
+// dir fails harmlessly, so the sweep is safe even when a sibling run filled it.
+var createdOutDirs sync.Map
+
 func outputCandidates(src, custom, preset string) ([]string, string, error) {
 	base := custom
 	if base == "" {
 		base = filepath.Join(filepath.Dir(src), "converted_prerecs")
 	}
+	_, statErr := os.Stat(base)
 	if err := os.MkdirAll(base, 0755); err != nil {
 		return nil, "", err
+	}
+	if errors.Is(statErr, os.ErrNotExist) {
+		createdOutDirs.Store(filepath.Clean(base), struct{}{})
 	}
 	ext := ".mov"
 	if strings.HasPrefix(preset, "xvid") || preset == "magicyuv_lossless" || preset == "utvideo_lossless" {
@@ -158,6 +168,17 @@ func reserveOutputSlot(base, prefix, ext string, taken map[int]bool) (string, er
 		return "", fmt.Errorf("reserve output %s: %w", p, err)
 	}
 	return "", errors.New("could not choose unused output filename")
+}
+
+// removeEmptyCreatedDirs sweeps output directories this run created that are
+// still empty — e.g. after a batch where every item failed. Errors (including
+// the dir being non-empty or already gone) are deliberately ignored.
+func removeEmptyCreatedDirs() {
+	createdOutDirs.Range(func(k, _ any) bool {
+		createdOutDirs.Delete(k)
+		_ = os.Remove(k.(string))
+		return true
+	})
 }
 
 func releaseOutputReservation(path string) error {

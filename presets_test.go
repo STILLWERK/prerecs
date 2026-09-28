@@ -273,3 +273,45 @@ func TestSourceClassDistribution(t *testing.T) {
 		t.Errorf("mpeg4/DX50 = %q", got)
 	}
 }
+
+// AVI/MOV muxer support was measured directly by encoding+muxing every codec
+// — the pcm_* prefix massively over-accepts (pcm_dvd, pcm_bluray, planar
+// variants all fail at mux time), while non-PCM codecs like ac3/wmav2/flac do
+// carry AVI tags.
+func TestAudioCopyCompatibilityPCMMatrix(t *testing.T) {
+	aviOK := []string{"pcm_alaw", "pcm_mulaw", "pcm_u8", "pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_s64le", "pcm_f32le", "pcm_f64le",
+		"mp3", "mp2", "ac3", "eac3", "wmav1", "wmav2", "flac", "adpcm_ima_wav", "adpcm_ms"}
+	aviBad := []string{"pcm_dvd", "pcm_bluray", "pcm_s8", "pcm_s16be", "pcm_s24be", "pcm_s32be", "pcm_f32be", "pcm_f64be", "pcm_s64be", "pcm_u16le", "pcm_s16le_planar", "dts", "opus", "gsm", "aac"}
+	for _, c := range aviOK {
+		if !audioCopyCompatible("xvid_compact", c) {
+			t.Fatalf("AVI: %s should be copy-compatible", c)
+		}
+	}
+	for _, c := range aviBad {
+		if audioCopyCompatible("xvid_compact", c) {
+			t.Fatalf("AVI: %s must not be copy-compatible (mux fails)", c)
+		}
+	}
+	movExtra := []string{"pcm_s8", "pcm_s16be", "pcm_s24be", "pcm_s32be", "pcm_f32be", "pcm_f64be",
+		"aac", "alac", "mp3", "mp2", "ac3", "eac3", "wmav1", "wmav2", "adpcm_ima_qt", "adpcm_ima_wav", "adpcm_ms"}
+	for _, c := range movExtra {
+		if !audioCopyCompatible("prores_lt", c) {
+			t.Fatalf("MOV: %s should be copy-compatible", c)
+		}
+	}
+	for _, c := range []string{"pcm_dvd", "pcm_bluray", "pcm_u16le", "pcm_s16le_planar", "pcm_s64be", "flac", "opus", "dts", "gsm"} {
+		if audioCopyCompatible("prores_lt", c) {
+			t.Fatalf("MOV: %s must not be copy-compatible (mux fails)", c)
+		}
+	}
+}
+
+// Xvid presets cannot carry alpha — matching the ProRes non-4444 gate.
+func TestXvidRejectsAlphaInputs(t *testing.T) {
+	alpha := []MediaInfo{{Path: "alpha.mkv", HasAlpha: true}}
+	for _, preset := range []string{"xvid_compact", "xvid_max_q2", "xvid_efficient_q2", "xvid_small", "xvid_max"} {
+		if err := validatePresetInputs(preset, alpha); err == nil || !strings.Contains(err.Error(), "alpha") {
+			t.Fatalf("%s accepted alpha input: %v", preset, err)
+		}
+	}
+}

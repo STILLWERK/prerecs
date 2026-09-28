@@ -44,7 +44,6 @@ func parsePathInput(line string) []string {
 	out := []string{}
 	var b strings.Builder
 	quoted := false
-	quote := rune(0)
 	flush := func() {
 		s := strings.TrimSpace(b.String())
 		b.Reset()
@@ -53,18 +52,15 @@ func parsePathInput(line string) []string {
 		}
 	}
 	for _, ch := range line {
-		if ch == '"' || ch == '\'' {
-			if !quoted {
-				quoted = true
-				quote = ch
-				continue
-			}
-			if quote == ch {
-				quoted = false
-				continue
-			}
+		// Only `"` acts as a quoting character: it is illegal inside filenames
+		// on both Windows and POSIX, while `'` and `;` are real, legal name
+		// characters (it's.avi, semi;colon.avi) — treating them as syntax
+		// silently converts the wrong file or splits a single name in two.
+		if ch == '"' {
+			quoted = !quoted
+			continue
 		}
-		if !quoted && (ch == ';' || ch == '\t') {
+		if !quoted && ch == '\t' {
 			flush()
 			continue
 		}
@@ -82,7 +78,7 @@ func parsePathInput(line string) []string {
 
 func trimOuterQuotes(s string) string {
 	s = strings.TrimSpace(s)
-	if len(s) >= 2 && ((s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'')) {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
 		return s[1 : len(s)-1]
 	}
 	return s

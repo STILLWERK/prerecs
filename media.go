@@ -32,10 +32,16 @@ type ffprobeDoc struct {
 		ColorSpace       string `json:"color_space"`
 		ColorTransfer    string `json:"color_transfer"`
 		ColorPrimaries   string `json:"color_primaries"`
+		Disposition      struct {
+			AttachedPic int `json:"attached_pic"`
+		} `json:"disposition"`
 	} `json:"streams"`
 	Format struct {
 		Duration string `json:"duration"`
 		Size     string `json:"size"`
+		Tags     struct {
+			Comment string `json:"comment"`
+		} `json:"tags"`
 	} `json:"format"`
 }
 
@@ -156,7 +162,10 @@ func probeMediaContext(ctx context.Context, ffprobe, path string, countFrames bo
 	}
 	vi := -1
 	for i := range doc.Streams {
-		if doc.Streams[i].CodecType == "video" {
+		// Attached pictures (cover art, thumbnails) report codec_type=video but
+		// are not playable video content — the same class FFmpeg's uppercase V
+		// stream selector excludes on the encode side.
+		if doc.Streams[i].CodecType == "video" && doc.Streams[i].Disposition.AttachedPic == 0 {
 			vi = i
 			break
 		}
@@ -214,7 +223,7 @@ func probeMediaContext(ctx context.Context, ffprobe, path string, countFrames bo
 	if bit == 0 {
 		bit = deriveBitDepth(sv.PixFmt)
 	}
-	info := MediaInfo{Path: path, Codec: sv.CodecName, CodecTag: sv.CodecTagString, Profile: sv.Profile, Width: sv.Width, Height: sv.Height, PixelFormat: sv.PixFmt, BitDepth: bit, FPS: fpsStr, FPSFloat: fpsFloat, Duration: dur, FrameCount: frames, FrameCountExact: frameCountExact, SizeBytes: parseInt64(doc.Format.Size), ColorRange: sv.ColorRange, ColorSpace: sv.ColorSpace, ColorTransfer: sv.ColorTransfer, ColorPrimaries: sv.ColorPrimaries, HasAlpha: hasAlpha(sv.PixFmt), Chroma: chroma(sv.PixFmt), Audio: []string{}}
+	info := MediaInfo{Path: path, Codec: sv.CodecName, CodecTag: sv.CodecTagString, Profile: sv.Profile, Width: sv.Width, Height: sv.Height, PixelFormat: sv.PixFmt, BitDepth: bit, FPS: fpsStr, FPSFloat: fpsFloat, Duration: dur, FrameCount: frames, FrameCountExact: frameCountExact, SizeBytes: parseInt64(doc.Format.Size), ColorRange: sv.ColorRange, ColorSpace: sv.ColorSpace, ColorTransfer: sv.ColorTransfer, ColorPrimaries: sv.ColorPrimaries, HasAlpha: hasAlpha(sv.PixFmt), Chroma: chroma(sv.PixFmt), Audio: []string{}, ProvenanceTag: doc.Format.Tags.Comment}
 	for _, sa := range doc.Streams {
 		if sa.CodecType != "audio" {
 			continue

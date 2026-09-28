@@ -258,7 +258,7 @@ func TestBuildCPUProResRGBAlphaPreservesAlphaGraph(t *testing.T) {
 	}
 	joined := " " + strings.Join(args, " ") + " "
 	for _, want := range []string{
-		"split=2[c][a];[c]format=gbrp,scale=out_color_matrix=bt709:out_range=tv,format=yuv444p10le[c10];[a]alphaextract,format=gray[a8];[c10][a8]alphamerge",
+		"split=2[c][a];[c]format=gbrp,scale=out_color_matrix=bt709:out_range=tv,format=yuv444p10le[cX];[a]alphaextract,format=gray[aX];[cX][aX]alphamerge",
 		" -pix_fmt yuva444p10le ", " -alpha_bits 8 ", " -color_range tv ", " -colorspace bt709 ",
 	} {
 		if !strings.Contains(joined, want) {
@@ -423,5 +423,85 @@ func TestProResAlphaBits(t *testing.T) {
 	}
 	if got := proresAlphaBits(MediaInfo{HasAlpha: true, BitDepth: 10}); got != 16 {
 		t.Fatalf("10-bit alpha bits=%d", got)
+	}
+}
+
+// Semi-planar/packed layouts carry no "4xx" digits — chroma() must classify
+// them or the lossless presets refuse pixel-exact repacks.
+func TestChromaSemiPlanarAndPacked(t *testing.T) {
+	cases := map[string]string{
+		"nv12": "4:2:0", "nv21": "4:2:0", "p010le": "4:2:0",
+		"nv16": "4:2:2", "nv20": "4:2:2", "yuyv422": "4:2:2", "uyvy422": "4:2:2", "v210": "4:2:2", "y210le": "4:2:2",
+		"nv24": "4:4:4", "p410le": "4:4:4", "vuyx": "4:4:4", "ayuv": "4:4:4", "v410": "4:4:4", "y412le": "4:4:4",
+	}
+	for fmtName, want := range cases {
+		if got := chroma(fmtName); got != want {
+			t.Fatalf("chroma(%s)=%q want %q", fmtName, got, want)
+		}
+	}
+}
+
+func TestHasAlphaV410(t *testing.T) {
+	if !hasAlpha("v410") {
+		t.Fatal("v410 carries alpha on FFmpeg ≤7.x builds")
+	}
+	if hasAlpha("vuyx") {
+		t.Fatal("vuyx has padding, not alpha")
+	}
+}
+
+// >8-bit RGB/RGBA sources must not be pinned through 8-bit planar formats —
+// format=gbrp/gray quantized 16-bit planes to 256 levels before encoding.
+func TestProResRGBConversionHighBitDepthPins(t *testing.T) {
+	info := MediaInfo{PixelFormat: "rgba64le", BitDepth: 16, HasAlpha: true}
+	filters := proresRGBConversionFilters(info, "prores_4444")
+	joined := strings.Join(filters, " ")
+	if !strings.Contains(joined, "gbrp16le") || !strings.Contains(joined, "gray16le") {
+		t.Fatalf("16-bit source pinned through 8-bit formats: %v", filters)
+	}
+	if !strings.Contains(joined, "yuv444p12le") {
+		t.Fatalf("16-bit colour branch must target yuv444p12le: %v", filters)
+	}
+	if got := proresPixelFormat(info, "prores_4444"); got != "yuva444p12le" {
+		t.Fatalf("proresPixelFormat=%s, want yuva444p12le", got)
+	}
+	if got := proresAlphaBits(info); got != 16 {
+		t.Fatalf("alpha_bits=%d, want 16", got)
+	}
+
+	// 8-bit sources keep the classic 10-bit pins.
+	info8 := MediaInfo{PixelFormat: "rgba", BitDepth: 8, HasAlpha: true}
+	filters8 := strings.Join(proresRGBConversionFilters(info8, "prores_4444"), " ")
+	if !strings.Contains(filters8, "gbrp") || strings.Contains(filters8, "gbrp16") {
+		t.Fatalf("8-bit source should keep 8-bit planar pins: %v", filters8)
+	}
+	if got := proresPixelFormat(info8, "prores_4444"); got != "yuva444p10le" {
+		t.Fatalf("proresPixelFormat=%s, want yuva444p10le", got)
+	}
+
+	// Non-alpha >8-bit RGB into non-4444 presets still gains the 16-bit pin.
+	infoNoAlpha := MediaInfo{PixelFormat: "rgb48le", BitDepth: 16}
+	filtersLT := strings.Join(proresRGBConversionFilters(infoNoAlpha, "prores_lt"), " ")
+	if !strings.Contains(filtersLT, "gbrp16le") {
+		t.Fatalf("16-bit rgb48le into prores_lt pinned to 8-bit: %v", filtersLT)
+	}
+}
+
+// A bare -pix_fmt on an RGB→Xvid conversion lets swscale pick a default
+// BT.601-range matrix; the ProRes presets already emit an explicit BT.709
+// conversion, so Xvid must do the same.
+func TestXvidRGBConversionExplicitMatrix(t *testing.T) {
+	info := MediaInfo{PixelFormat: "rgb24", ColorSpace: "gbr"}
+	filters := xvidRGBConversionFilters(info, "xvid_compact")
+	joined := strings.Join(filters, " ")
+	if !strings.Contains(joined, "out_color_matrix=bt709") || !strings.Contains(joined, "yuv420p") {
+		t.Fatalf("xvid RGB conversion missing explicit bt709→yuv420p: %v", filters)
+	}
+	if got := xvidRGBConversionFilters(info, "prores_lt"); got != nil {
+		t.Fatalf("xvid conversion leaked into a ProRes preset: %v", got)
+	}
+	yuv := MediaInfo{PixelFormat: "yuv420p"}
+	if got := xvidRGBConversionFilters(yuv, "xvid_compact"); got != nil {
+		t.Fatalf("yuv source should get no RGB conversion filters: %v", got)
 	}
 }

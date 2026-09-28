@@ -53,7 +53,7 @@ func deriveBitDepth(p string) int {
 			return 8
 		}
 	}
-	for _, pixFmt := range []string{"nv12", "nv21", "uyvy422", "yuyv422", "yuv422p"} {
+	for _, pixFmt := range []string{"nv12", "nv21", "uyvy422", "yuyv422", "vyuy422", "yuv422p"} {
 		if low == pixFmt {
 			return 8
 		}
@@ -71,6 +71,20 @@ func deriveBitDepth(p string) int {
 	for _, pixFmt := range []string{"v210", "v410", "r210"} {
 		if low == pixFmt {
 			return 10
+		}
+	}
+	// 16-bit packed formats whose names carry no depth digits.
+	for _, pixFmt := range []string{"v216", "v216le", "v216be"} {
+		if low == pixFmt {
+			return 16
+		}
+	}
+	// Float planar formats (EXR/HDR decodes) report no numeric depth in the
+	// name; without this they collapse to BitDepth 0 and the conversion pins
+	// silently crush them through the 8-bit path.
+	for _, pixFmt := range []string{"gbrpf32le", "gbrpf32be", "gbrapf32le", "gbrapf32be", "grayf32le", "grayf32be", "rgbf32le", "rgbf32be", "rgbaf32le", "rgbaf32be", "yaf32le", "yaf32be"} {
+		if low == pixFmt {
+			return 32
 		}
 	}
 	// These descriptors always carry an endian suffix in ffprobe output
@@ -101,8 +115,9 @@ func hasAlpha(p string) bool {
 	low := strings.ToLower(p)
 	// Packed/palette formats whose pixdesc sets AV_PIX_FMT_FLAG_ALPHA. The
 	// padded siblings (vuyx, v30x, xv30, xv36) carry X bits, not alpha.
+	// v410 is FFmpeg ≤7.x's packed 10-bit YUVA (the enum was dropped in 8).
 	switch low {
-	case "v408", "vuya", "uyva", "pal8":
+	case "v408", "vuya", "uyva", "pal8", "v410":
 		return true
 	}
 	for _, prefix := range []string{"rgba", "bgra", "argb", "abgr", "yuva", "ayuv", "gbraf", "y410", "y412", "y416"} {
@@ -138,6 +153,18 @@ func chroma(p string) string {
 	}
 	if strings.Contains(low, "420") {
 		return "4:2:0"
+	}
+	// Semi-planar and packed layouts carry no "4xx" digits in their names, so
+	// the substring scan above misses them; without these entries the lossless
+	// presets refuse common captures (nv12/nv16/nv24, packed 4:2:2/4:4:4) that
+	// repack losslessly into planar.
+	switch low {
+	case "nv12", "nv21", "p010", "p012", "p016", "p010le", "p010be", "p012le", "p012be", "p016le", "p016be":
+		return "4:2:0"
+	case "nv16", "p210", "p212", "p216", "p210le", "p210be", "p212le", "p212be", "p216le", "p216be", "nv20", "nv20le", "nv20be", "y210", "y210le", "y210be", "y212", "y212le", "y212be", "y216", "y216le", "y216be", "yuyv422", "uyvy422", "vyuy422", "v210", "v216", "v216le", "v216be":
+		return "4:2:2"
+	case "nv24", "nv42", "p410", "p412", "p416", "p410le", "p410be", "p412le", "p412be", "p416le", "p416be", "v308", "v408", "vuyx", "vuya", "uyva", "ayuv", "v410", "y410", "y410le", "y410be", "y412", "y412le", "y412be", "y416", "y416le", "y416be", "v30x", "v30xle", "v30xbe", "xv30", "xv30le", "xv30be", "xv36", "xv36le", "xv36be":
+		return "4:4:4"
 	}
 	return ""
 }
@@ -196,8 +223,44 @@ func proresPixelFormat(info MediaInfo, preset string) string {
 	if preset != "prores_4444" {
 		return "yuv422p10le"
 	}
+	// >8-bit sources keep their extra precision through the 12-bit encoder
+	// target (the 4444 bitstream ceiling); pinning 10le would quantize them
+	// to the 8-bit-converted chain's precision instead.
+	if info.BitDepth > 8 {
+		if info.HasAlpha {
+			return "yuva444p12le"
+		}
+		return "yuv444p12le"
+	}
 	if info.HasAlpha {
 		return "yuva444p10le"
+	}
+	return "yuv444p10le"
+}
+
+// proresPlanarPin returns the planar GBR/gray format that keeps source
+// precision for the conversion chain: 16-bit for >8-bit sources, the classic
+// 8-bit pins otherwise. Pinning the 8-bit variants unconditionally crushed
+// high-bit RGB/alpha planes to 256 levels before the encoder saw them.
+func proresPlanarPin(info MediaInfo, alpha bool) string {
+	if alpha {
+		if info.BitDepth > 8 {
+			return "gray16le"
+		}
+		return "gray"
+	}
+	if info.BitDepth > 8 {
+		return "gbrp16le"
+	}
+	return "gbrp"
+}
+
+// proresColorPixFmt is the colour-planes target inside the alpha-split chains —
+// alphamerge reattaches the separately carried alpha, so the colour branch
+// itself must not carry an alpha channel.
+func proresColorPixFmt(info MediaInfo) string {
+	if info.BitDepth > 8 {
+		return "yuv444p12le"
 	}
 	return "yuv444p10le"
 }
@@ -210,7 +273,7 @@ func proresRGBConversionFilters(info MediaInfo, preset string) []string {
 		// Gray+alpha has no colour planes for the RGB conversion branch, but its
 		// alpha plane still must bypass the gray-to-YUV conversion unchanged.
 		return []string{
-			"split=2[c][a];[c]format=gray,format=yuv444p10le[c10];[a]alphaextract,format=gray[a8];[c10][a8]alphamerge",
+			"split=2[c][a];[c]format=" + proresPlanarPin(info, false) + ",format=" + proresColorPixFmt(info) + "[cX];[a]alphaextract,format=" + proresPlanarPin(info, true) + "[aX];[cX][aX]alphamerge",
 		}
 	}
 	if !(isRGBPixelFormat(info.PixelFormat) || strings.EqualFold(info.ColorSpace, "gbr")) {
@@ -225,10 +288,24 @@ func proresRGBConversionFilters(info MediaInfo, preset string) []string {
 		// before the encoder. With -alpha_bits 8 an 8-bit alpha source round-trips
 		// byte-for-byte through both prores_ks and prores_ks_vulkan.
 		return []string{
-			"split=2[c][a];[c]format=gbrp,scale=out_color_matrix=bt709:out_range=tv,format=yuv444p10le[c10];[a]alphaextract,format=gray[a8];[c10][a8]alphamerge",
+			"split=2[c][a];[c]format=" + proresPlanarPin(info, false) + ",scale=out_color_matrix=bt709:out_range=tv,format=" + proresColorPixFmt(info) + "[cX];[a]alphaextract,format=" + proresPlanarPin(info, true) + "[aX];[cX][aX]alphamerge",
 		}
 	}
-	return []string{"format=gbrp", "scale=out_color_matrix=bt709:out_range=tv", "format=" + pix}
+	return []string{"format=" + proresPlanarPin(info, false), "scale=out_color_matrix=bt709:out_range=tv", "format=" + pix}
+}
+
+// xvidRGBConversionFilters mirrors the ProRes RGB path for Xvid presets: Xvid
+// encodes 4:2:0 YUV and a bare -pix_fmt leaves swscale to pick a default
+// matrix (BT.601-range), visibly shifting colour versus the BT.709 conversion
+// the ProRes presets emit for the same source.
+func xvidRGBConversionFilters(info MediaInfo, preset string) []string {
+	if !isXvidPreset(preset) {
+		return nil
+	}
+	if !(isRGBPixelFormat(info.PixelFormat) || strings.EqualFold(info.ColorSpace, "gbr")) {
+		return nil
+	}
+	return []string{"format=" + proresPlanarPin(info, false), "scale=out_color_matrix=bt709:out_range=tv", "format=yuv420p"}
 }
 
 // Known FFmpeg color metadata enum names, in the spellings ffprobe actually
@@ -288,11 +365,13 @@ func colorFilter(i MediaInfo) string {
 
 func colorOutputArgs(i MediaInfo, preset string) []string {
 	a := []string{}
-	rgbToProRes := strings.HasPrefix(preset, "prores") && (isRGBPixelFormat(i.PixelFormat) || strings.EqualFold(i.ColorSpace, "gbr"))
-	if rgbToProRes {
-		// ProRes is encoded as YUV in this build. RGB/GBR inputs are explicitly
-		// converted to limited-range BT.709 before encoding, so write metadata
-		// describing those encoded YUV planes rather than the source RGB matrix.
+	// ProRes and Xvid both encode YUV in this build; RGB/GBR inputs get the
+	// explicit limited-range BT.709 conversion before encoding (see
+	// proresRGBConversionFilters/xvidRGBConversionFilters), so write metadata
+	// describing those encoded YUV planes rather than the source RGB matrix.
+	rgbToYUV := (strings.HasPrefix(preset, "prores") || strings.HasPrefix(preset, "xvid")) &&
+		(isRGBPixelFormat(i.PixelFormat) || strings.EqualFold(i.ColorSpace, "gbr"))
+	if rgbToYUV {
 		a = append(a, "-color_range", "tv", "-colorspace", "bt709")
 	} else if i.ColorRange == "tv" || i.ColorRange == "pc" {
 		a = append(a, "-color_range", i.ColorRange)
@@ -303,7 +382,7 @@ func colorOutputArgs(i MediaInfo, preset string) []string {
 	// prores_ks rejects it outright). Keep GBR as input metadata via setparams,
 	// but do not claim an RGB matrix on a YUV encoded stream.
 	yuvOutput := strings.HasPrefix(preset, "xvid") || strings.HasPrefix(preset, "prores")
-	if !rgbToProRes && i.ColorSpace != "" && i.ColorSpace != "unknown" && validColorSpaces[strings.ToLower(i.ColorSpace)] && !(yuvOutput && strings.EqualFold(i.ColorSpace, "gbr")) {
+	if !rgbToYUV && i.ColorSpace != "" && i.ColorSpace != "unknown" && validColorSpaces[strings.ToLower(i.ColorSpace)] && !(yuvOutput && strings.EqualFold(i.ColorSpace, "gbr")) {
 		a = append(a, "-colorspace", i.ColorSpace)
 	}
 	if i.ColorTransfer != "" && i.ColorTransfer != "unknown" && validColorTransfers[strings.ToLower(i.ColorTransfer)] {

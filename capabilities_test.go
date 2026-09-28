@@ -127,3 +127,57 @@ func TestFFmpegVersionLineSkipsLeadingNoise(t *testing.T) {
 		t.Fatalf("fallback = %q", got)
 	}
 }
+
+// `ffmpeg -encoders` rows are `<flags> <name> <desc>`; legend lines spell
+// `=` as the name and must not register as encoders, and flag-column width
+// must not be position-parsed (a wider field in a future FFmpeg would
+// silently empty the map if it were).
+func TestParseEncoderNames(t *testing.T) {
+	out := []byte(`Encoders:
+ V..... = Video
+ A..... = Audio
+ V..... libx264              libx264 H.264 / AVC / MPEG-4 AVC
+ VF.... prores_ks            Apple ProRes (iCodec Pro)
+ A..... aac                  AAC (Advanced Audio Coding)
+ S..... mov_text             MOV text
+`)
+	enc := parseEncoderNames(out)
+	for _, name := range []string{"libx264", "prores_ks", "aac"} {
+		if !enc[name] {
+			t.Fatalf("missing encoder %q in %v", name, enc)
+		}
+	}
+	if enc["="] || enc["mov_text"] {
+		t.Fatalf("bogus entries registered: %v", enc)
+	}
+}
+
+// A shim that exits 0 while a descendant still holds its pipes reports
+// ErrWaitDelay; that is success, matching probeMediaContext/runFFmpeg.
+func TestCapabilityCommandOutputOrphanedPipe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fake executable is not portable to Windows")
+	}
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "faketool")
+	pidFile := filepath.Join(dir, "sleep.pid")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nsleep 30 <&1 1>&2 2>/dev/null &\necho $! > '"+pidFile+"'\necho ok\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if b, err := os.ReadFile(pidFile); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
+				if p, err := os.FindProcess(pid); err == nil {
+					p.Kill()
+				}
+			}
+		}
+	})
+	out, err := capabilityCommandOutput(fake)
+	if err != nil {
+		t.Fatalf("exit-0 shim with a pipe-holding descendant must not fail: %v", err)
+	}
+	if !strings.Contains(string(out), "ok") {
+		t.Fatalf("lost output: %q", out)
+	}
+}

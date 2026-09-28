@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -51,6 +52,10 @@ func reconcileScannedInput(info *MediaInfo, count int64, ui theme, rep itemRepor
 		// real timestamps by construction and the exact frame count remains
 		// the integrity gate. (A source with no rate at all skips this branch
 		// — its duration was never contradicted and still gates verification.)
+		// The impeached rate is kept aside: when packet timestamps are later
+		// proven destroyed, the container's claim is the only surviving
+		// statement of intended rate the timeline rebuild can trust.
+		info.ImpeachedFPS = info.FPS
 		info.FPS, info.FPSFloat = "", 0
 		info.Duration = 0
 	}
@@ -91,7 +96,14 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		} else {
 			rep.line("Source frame count is estimated; doing one exact decode scan before conversion.")
 		}
-		count, scanErr := e.countDecodedFrames(ctx, info, func(p progressInfo) {
+		// The scan doubles as the audio integrity check for sources whose
+		// audio will ride along, and as the timestamp-health measurement that
+		// decides whether the compressed-source timeline rebuild may run —
+		// only proven-broken PTS (duplicate/non-monotonic/missing stats)
+		// justifies flattening to constant rate; healthy VFR is preserved.
+		includeAudio := len(info.Audio) > 0 && !opts.StripAudio && !opts.Conform
+		observeTiming := e.caps.HasVfrdet && !opts.Conform && sourceClass(info) == "compressed" && (opts.StripAudio || len(info.Audio) == 0)
+		count, stats, scanErr := e.countDecodedFrames(ctx, info, includeAudio, observeTiming, func(p progressInfo) {
 			p.Stage = "SCAN"
 			p.TotalFrames = info.FrameCount
 			rep.progress(p)
@@ -110,6 +122,15 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 			return item
 		}
 		reconcileScannedInput(&info, count, ui, rep)
+		if observeTiming {
+			// The spread check compares the decoded presentation span against
+			// the minimum-implied duration over surviving metadata claims —
+			// rate, duration, and (for destroyed-PTS sources) the impeached
+			// rate claim. Minimum-implied keeps one stale-large claim from
+			// inflating the reference into a false "collapsed" verdict on a
+			// healthy stream; impeachment has already pruned contradictions.
+			info.TimestampsBroken = brokenTimestamps(stats, count, timingReference(info, count))
+		}
 		item.InputInfo = info
 		rep.line(fmt.Sprintf("Exact source frames: %d", count))
 	}
@@ -125,6 +146,10 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		_, expectedFPS0, expectedDur0, timingErr := expectedTiming(info, opts)
 		if timingErr == nil {
 			srcStat, _ := os.Stat(info.Path)
+			// Compute the signature at decision time: the probe ran before
+			// interactive prompts, so a source replaced while the user sat in
+			// the wizard must not be judged by the old content's hash.
+			srcSig := sourceSignature(info.Path)
 			for _, cand := range existing {
 				candStat, statErr := os.Stat(cand)
 				if statErr != nil || (srcStat != nil && candStat.ModTime().Before(srcStat.ModTime())) {
@@ -157,8 +182,15 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 					rep.line(ui.dim(fmt.Sprintf("Rejected: codec is %s/%s, expected %s", strictConsoleText(outInfo.Codec), strictConsoleText(outInfo.CodecTag), presetLabel(opts.Preset))))
 					continue
 				}
+				// Identical dims/rate/count prove nothing about content — the
+				// embedded provenance tag is what ties this output to THIS
+				// source. Untagged or foreign-tagged files are never adopted.
+				if !provenanceMatches(srcSig, jobSignature(opts), outInfo) {
+					rep.line(ui.dim("Rejected: output was not produced from this source (provenance tag missing or different)."))
+					continue
+				}
 				checkStarted := time.Now()
-				decoded, decodeErr := e.countDecodedFrames(ctx, outInfo, func(p progressInfo) {
+				decoded, candTiming, decodeErr := e.countDecodedFrames(ctx, outInfo, len(outInfo.Audio) > 0, info.TimestampsBroken, func(p progressInfo) {
 					p.Stage = "CHECK"
 					p = exactFrameProgress(p, info.FrameCount, checkStarted)
 					rep.progress(p)
@@ -180,6 +212,29 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 				outInfo.FrameCount = decoded
 				outInfo.FrameCountExact = true
 				problems := verifyOutput(info, outInfo, opts, expectedFPS0, expectedDur0)
+				// The spread reference is the candidate's own declared cadence —
+				// when source metadata was impeached, expectedDur0 is 0 and a
+				// claimless reference would skip the check entirely, adopting a
+				// file that still carries the destroyed timeline.
+				candRef := expectedDur0
+				if outInfo.FPSFloat > 0 && decoded > 0 {
+					candRef = float64(decoded) / outInfo.FPSFloat
+				}
+				if info.TimestampsBroken && candTiming != nil && brokenTimestamps(candTiming, decoded, candRef) {
+					problems = append(problems, "candidate timestamps are still broken (non-monotonic or collapsed PTS)")
+				}
+				// A broken source's rebuild rate is deterministic: a candidate
+				// stamped at any other rate cannot be this job's output even if
+				// it otherwise verifies (e.g. an artifact from a build that
+				// derived timing differently). Skip the check when nothing can
+				// be derived — the passthrough output's own health then rules.
+				if info.TimestampsBroken && expectedFPS0 == nil && outInfo.FPSFloat > 0 {
+					if rt := rebuildTargetRate(info, nil); rt != nil {
+						if f := ratFloat(rt); math.Abs(outInfo.FPSFloat-f) > math.Max(.01, f*.002) {
+							problems = append(problems, fmt.Sprintf("candidate rate %.6g does not match the rebuild rate %.6g for this broken source", outInfo.FPSFloat, f))
+						}
+					}
+				}
 				if len(problems) == 0 {
 					item.Output = cand
 					item.OutputInfo = outInfo
@@ -219,6 +274,20 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	// the delete, and silently leaving the file would let a bad output keep
 	// masquerading under a canonical name.
 	removeOut := func() {
+		// Unlink only what still looks like the file this run created: if the
+		// path was swapped for a link or non-file since the reservation check,
+		// unlinking by name could destroy something else.
+		st, lerr := os.Lstat(out)
+		switch {
+		case errors.Is(lerr, os.ErrNotExist):
+			return
+		case lerr != nil:
+			rep.line(ui.yellow("WARNING: could not stat output before cleanup: " + strictConsoleText(lerr.Error())))
+			return
+		case !st.Mode().IsRegular():
+			rep.line(ui.yellow("WARNING: output path no longer looks like the produced file; leaving it in place"))
+			return
+		}
 		if rmErr := os.Remove(out); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
 			msg := "cleanup failed: " + strictConsoleText(rmErr.Error())
 			rep.line(ui.yellow("WARNING: " + msg))
@@ -234,63 +303,114 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	var expectedFPS *big.Rat
 	var expectedDur float64
 
-	usedNative := isXvidPreset(opts.Preset) && e.caps.HasNativeXvid && !opts.NoNativeXvid && nativeXvidEligible(info) && info.FPS != ""
-	if usedNative && info.FrameCountExact && info.FrameCount > 0 {
-		ok, preflightErr := vfwCanDecodeFrame(info.Path, info.FrameCount-1)
-		if preflightErr != nil {
-			usedNative = false
-			rep.line(ui.yellow("Native Xvid preflight could not validate the AVI; using FFmpeg libxvid."))
-			rep.line(ui.dim(strictConsoleText(preflightErr.Error())))
-		} else if !ok {
-			usedNative = false
-			rep.line(ui.yellow("Native Xvid preflight: Windows VfW cannot decode the final source frame; using FFmpeg libxvid."))
-			rep.line(ui.dim("The AVI is readable by FFmpeg, but the legacy VfW path used by xvid_encraw cannot reach the complete stream."))
-		}
-	}
-	if usedNative {
-		threads, slices := nativeXvidThreads()
-		if opts.Preset == "xvid_max_q2" {
-			slices = 1
-			item.Backend = fmt.Sprintf("native Xvid Share Q2 (VHQ4/B2 strict Q2, %d threads/%d slice)", threads, slices)
-		} else if opts.Preset == "xvid_efficient_q2" {
-			slices = 1
-			item.Backend = fmt.Sprintf("native Xvid Efficient Q2 (VHQ4/B2, I/P Q2 + B Q3, %d threads/%d slice)", threads, slices)
-		} else if opts.Preset == "xvid_compact" {
-			item.Backend = fmt.Sprintf("native Xvid Fast Q2 (VHQ1/B0, %d threads/%d slices)", threads, slices)
-		} else {
-			item.Backend = fmt.Sprintf("native Xvid (Q%s, %d threads/%d slices)", xvidQuant(opts.Preset), threads, slices)
-		}
-		rep.line("Encoder: " + item.Backend)
-		// Bound the encode by the claimed frame count only when that count was
-		// decode-verified this run. A container table that understates the
-		// stream would otherwise truncate the encode to the lie — and the
-		// post-verify would see claim == output, reporting VERIFIED on a
-		// partial conversion. Unbounded, the encoder stops at stream end and
-		// the VOP/verify checks stay authoritative.
-		frameBound := int64(0)
-		if inputScanned {
-			frameBound = info.FrameCount
-		}
-		expectedFPS, expectedDur, err = e.runNativeXvid(ctx, info, opts, out, frameBound, func(p progressInfo) {
-			rep.progress(p)
-		})
-		if err != nil && e.enc["libxvid"] && ctx.Err() == nil {
-			rep.finish()
-			rep.line(ui.yellow("Native Xvid failed its frame-integrity check; retrying with FFmpeg libxvid."))
-			rep.line(ui.dim(strictConsoleText(err.Error())))
-			// Keep `out` occupied: it is the O_EXCL reservation guarding this
-			// destination against concurrent same-stem runs. Removing it here
-			// would briefly release the reservation before the fallback encode;
-			// ffmpeg -y overwrites the placeholder/partial output itself.
-			if opts.Preset == "xvid_max_q2" {
-				item.Backend = "FFmpeg libxvid Share fallback (strict Q2 full RD/B0)"
-			} else if opts.Preset == "xvid_efficient_q2" {
-				item.Backend = "FFmpeg libxvid Efficient fallback (strict Q2 full RD/B0; native B-Q3 unavailable)"
-			} else if opts.Preset == "xvid_compact" {
-				item.Backend = "FFmpeg libxvid Fast fallback (B0)"
-			} else {
-				item.Backend = "FFmpeg libxvid fallback"
+	// Encode, then verify. When the native Xvid path produced the file and
+	// verification rejects it, retry once through FFmpeg libxvid: xvid_encraw
+	// treats a mid-stream AVIStreamGetFrame failure as clean end-of-stream and
+	// exits 0, so a stalled VfW decode only becomes visible here.
+	nativeVerifyRejected := false
+	var outInfo MediaInfo
+	var problems []string
+	for {
+		usedNative := isXvidPreset(opts.Preset) && !nativeVerifyRejected && e.caps.HasNativeXvid && !opts.NoNativeXvid && nativeXvidEligible(info) && info.FPS != ""
+		if usedNative && info.FrameCountExact && info.FrameCount > 0 {
+			ok, preflightErr := vfwCanDecodeFrame(info.Path, info.FrameCount-1)
+			if preflightErr != nil {
+				usedNative = false
+				rep.line(ui.yellow("Native Xvid preflight could not validate the AVI; using FFmpeg libxvid."))
+				rep.line(ui.dim(strictConsoleText(preflightErr.Error())))
+			} else if !ok {
+				usedNative = false
+				rep.line(ui.yellow("Native Xvid preflight: Windows VfW cannot decode the final source frame; using FFmpeg libxvid."))
+				rep.line(ui.dim("The AVI is readable by FFmpeg, but the legacy VfW path used by xvid_encraw cannot reach the complete stream."))
 			}
+		}
+		if usedNative {
+			threads, slices := nativeXvidThreads()
+			if opts.Preset == "xvid_max_q2" {
+				slices = 1
+				item.Backend = fmt.Sprintf("native Xvid Share Q2 (VHQ4/B2 strict Q2, %d threads/%d slice)", threads, slices)
+			} else if opts.Preset == "xvid_efficient_q2" {
+				slices = 1
+				item.Backend = fmt.Sprintf("native Xvid Efficient Q2 (VHQ4/B2, I/P Q2 + B Q3, %d threads/%d slice)", threads, slices)
+			} else if opts.Preset == "xvid_compact" {
+				item.Backend = fmt.Sprintf("native Xvid Fast Q2 (VHQ1/B0, %d threads/%d slices)", threads, slices)
+			} else {
+				item.Backend = fmt.Sprintf("native Xvid (Q%s, %d threads/%d slices)", xvidQuant(opts.Preset), threads, slices)
+			}
+			rep.line("Encoder: " + item.Backend)
+			// Bound the encode by the claimed frame count only when that count was
+			// decode-verified this run. A container table that understates the
+			// stream would otherwise truncate the encode to the lie — and the
+			// post-verify would see claim == output, reporting VERIFIED on a
+			// partial conversion. Unbounded, the encoder stops at stream end and
+			// the VOP/verify checks stay authoritative.
+			frameBound := int64(0)
+			if inputScanned {
+				frameBound = info.FrameCount
+			}
+			expectedFPS, expectedDur, err = e.runNativeXvid(ctx, info, opts, out, frameBound, func(p progressInfo) {
+				rep.progress(p)
+			})
+			if err != nil && e.enc["libxvid"] && ctx.Err() == nil {
+				rep.finish()
+				rep.line(ui.yellow("Native Xvid failed its frame-integrity check; retrying with FFmpeg libxvid."))
+				rep.line(ui.dim(strictConsoleText(err.Error())))
+				// Keep `out` occupied: it is the O_EXCL reservation guarding this
+				// destination against concurrent same-stem runs. Removing it here
+				// would briefly release the reservation before the fallback encode;
+				// ffmpeg -y overwrites the placeholder/partial output itself.
+				// The file at `out` is now libxvid-produced — mark native as
+				// rejected so a later verify failure doesn't waste a redundant
+				// identical libxvid encode.
+				nativeVerifyRejected = true
+				setLibxvidBackend(&item, opts.Preset)
+				var args []string
+				args, expectedFPS, expectedDur, err = e.buildCommand(info, opts, out)
+				if err == nil {
+					err = e.runFFmpeg(ctx, args, expectedDur, func(p progressInfo) {
+						p.Stage = "ENCODE"
+						p = exactFrameProgress(p, info.FrameCount, started)
+						rep.progress(p)
+					})
+				}
+			}
+		} else if e.canUseVulkanProRes(info, opts) {
+			item.Backend = "Vulkan ProRes GPU (experimental, async 4)"
+			rep.line("Encoder: " + item.Backend)
+			var args []string
+			args, expectedFPS, expectedDur, err = e.buildProResVulkanCommand(info, opts, out)
+			if err == nil {
+				err = e.runFFmpeg(ctx, args, expectedDur, func(p progressInfo) {
+					p.Stage = "GPU ENCODE"
+					p = exactFrameProgress(p, info.FrameCount, started)
+					rep.progress(p)
+				})
+			}
+			if err != nil && e.caps.HasProRes && ctx.Err() == nil {
+				rep.finish()
+				rep.line(ui.yellow("Vulkan ProRes failed; retrying with CPU prores_ks."))
+				rep.line(ui.dim(strictConsoleText(err.Error())))
+				// Same reservation rule: `out` must stay occupied through the
+				// backend switch; ffmpeg -y truncates whatever the GPU attempt left.
+				item.Backend = "CPU prores_ks fallback"
+				args, expectedFPS, expectedDur, err = e.buildCommand(info, opts, out)
+				if err == nil {
+					err = e.runFFmpeg(ctx, args, expectedDur, func(p progressInfo) {
+						p.Stage = "CPU ENCODE"
+						p = exactFrameProgress(p, info.FrameCount, started)
+						rep.progress(p)
+					})
+				}
+			}
+		} else {
+			if isXvidPreset(opts.Preset) {
+				setLibxvidBackend(&item, opts.Preset)
+			} else if isProResPreset(opts.Preset) {
+				item.Backend = "CPU prores_ks"
+			} else {
+				item.Backend = "FFmpeg"
+			}
+			rep.line("Encoder: " + item.Backend)
 			var args []string
 			args, expectedFPS, expectedDur, err = e.buildCommand(info, opts, out)
 			if err == nil {
@@ -301,175 +421,154 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 				})
 			}
 		}
-	} else if e.canUseVulkanProRes(info, opts) {
-		item.Backend = "Vulkan ProRes GPU (experimental, async 4)"
-		rep.line("Encoder: " + item.Backend)
-		var args []string
-		args, expectedFPS, expectedDur, err = e.buildProResVulkanCommand(info, opts, out)
-		if err == nil {
-			err = e.runFFmpeg(ctx, args, expectedDur, func(p progressInfo) {
-				p.Stage = "GPU ENCODE"
-				p = exactFrameProgress(p, info.FrameCount, started)
-				rep.progress(p)
-			})
-		}
-		if err != nil && e.caps.HasProRes && ctx.Err() == nil {
-			rep.finish()
-			rep.line(ui.yellow("Vulkan ProRes failed; retrying with CPU prores_ks."))
-			rep.line(ui.dim(strictConsoleText(err.Error())))
-			// Same reservation rule: `out` must stay occupied through the
-			// backend switch; ffmpeg -y truncates whatever the GPU attempt left.
-			item.Backend = "CPU prores_ks fallback"
-			args, expectedFPS, expectedDur, err = e.buildCommand(info, opts, out)
-			if err == nil {
-				err = e.runFFmpeg(ctx, args, expectedDur, func(p progressInfo) {
-					p.Stage = "CPU ENCODE"
-					p = exactFrameProgress(p, info.FrameCount, started)
-					rep.progress(p)
-				})
-			}
-		}
-	} else {
-		if isXvidPreset(opts.Preset) {
-			if opts.Preset == "xvid_max_q2" {
-				item.Backend = "FFmpeg libxvid Share fallback (strict Q2 full RD/B0)"
-			} else if opts.Preset == "xvid_efficient_q2" {
-				item.Backend = "FFmpeg libxvid Efficient fallback (strict Q2 full RD/B0; native B-Q3 unavailable)"
-			} else if opts.Preset == "xvid_compact" {
-				item.Backend = "FFmpeg libxvid Fast fallback (B0)"
-			} else {
-				item.Backend = "FFmpeg libxvid fallback"
-			}
-		} else if isProResPreset(opts.Preset) {
-			item.Backend = "CPU prores_ks"
-		} else {
-			item.Backend = "FFmpeg"
-		}
-		rep.line("Encoder: " + item.Backend)
-		var args []string
-		args, expectedFPS, expectedDur, err = e.buildCommand(info, opts, out)
-		if err == nil {
-			err = e.runFFmpeg(ctx, args, expectedDur, func(p progressInfo) {
-				p.Stage = "ENCODE"
-				p = exactFrameProgress(p, info.FrameCount, started)
-				rep.progress(p)
-			})
-		}
-	}
-	rep.finish()
+		rep.finish()
 
-	if err != nil {
-		item.Elapsed = time.Since(started)
-		if isCtxErr(err) {
-			item.Status = "cancelled"
-			rep.line(ui.yellow("ENCODE CANCELLED"))
-			rep.line(indentError(err.Error(), 2))
+		if err != nil {
+			item.Elapsed = time.Since(started)
+			item.Message = err.Error()
+			if isCtxErr(err) {
+				item.Status = "cancelled"
+				rep.line(ui.yellow("ENCODE CANCELLED"))
+				rep.line(indentError(err.Error(), 2))
+				removeOut()
+				return item
+			}
+			item.Status = "failed"
 			removeOut()
+			rep.line(ui.red("ENCODE FAILED"))
+			rep.line(indentError(err.Error(), 2))
 			return item
 		}
-		item.Status = "failed"
-		item.Message = err.Error()
-		removeOut()
-		rep.line(ui.red("ENCODE FAILED"))
-		rep.line(indentError(err.Error(), 2))
-		return item
-	}
 
-	// From here on `out` is a file this run produced. If it cannot pass
-	// verification it must not stay behind under the canonical output name
-	// masquerading as a valid result — remove it. (Pre-existing candidates are
-	// still preserved deliberately in the reuse check above.)
-	outInfo, err := probeMediaBound(ctx, e.caps.FFprobe, out, false)
-	if err != nil {
-		item.Elapsed = time.Since(started)
-		item.Message = err.Error()
-		// A probe that only hit the per-probe deadline is a failure of this
-		// item, not a job cancellation — and the unverified output must not
-		// stay behind under the canonical name.
-		if ctx.Err() != nil {
-			item.Status = "cancelled"
-			rep.line(ui.yellow("VERIFY PROBE CANCELLED"))
-		} else {
-			item.Status = "failed"
-			if errors.Is(err, context.DeadlineExceeded) {
-				item.Message = fmt.Sprintf("output metadata probe exceeded %s", mediaProbeTimeout)
+		// From here on `out` is a file this run produced. If it cannot pass
+		// verification it must not stay behind under the canonical output name
+		// masquerading as a valid result — remove it. (Pre-existing candidates are
+		// still preserved deliberately in the reuse check above.)
+		var probeErr error
+		outInfo, probeErr = probeMediaBound(ctx, e.caps.FFprobe, out, false)
+		if probeErr != nil {
+			item.Elapsed = time.Since(started)
+			item.Message = probeErr.Error()
+			// A probe that only hit the per-probe deadline is a failure of this
+			// item, not a job cancellation — and the unverified output must not
+			// stay behind under the canonical name.
+			if ctx.Err() != nil {
+				item.Status = "cancelled"
+				rep.line(ui.yellow("VERIFY PROBE CANCELLED"))
+			} else {
+				item.Status = "failed"
+				if errors.Is(probeErr, context.DeadlineExceeded) {
+					item.Message = fmt.Sprintf("output metadata probe exceeded %s", mediaProbeTimeout)
+				}
+				removeOut()
+				rep.line(ui.red("VERIFY PROBE FAILED"))
 			}
-			removeOut()
-			rep.line(ui.red("VERIFY PROBE FAILED"))
+			rep.line(indentError(item.Message, 2))
+			return item
 		}
-		rep.line(indentError(item.Message, 2))
-		return item
-	}
-	rep.line("Decoding output for frame/timing verification...")
-	verifyStarted := time.Now()
-	decodedFrames, err := e.countDecodedFrames(ctx, outInfo, func(p progressInfo) {
-		p.Stage = "VERIFY"
-		p = exactFrameProgress(p, info.FrameCount, verifyStarted)
-		rep.progress(p)
-	})
-	rep.finish()
-	if err != nil {
-		item.Status = processErrorStatus(err)
-		item.Elapsed = time.Since(started)
-		item.Message = err.Error()
-		if item.Status == "cancelled" {
-			// The encoded output is complete but unverified; keep it so a later
-			// run can re-check and reuse it instead of discarding the work.
-			rep.line(ui.yellow("VERIFY DECODE CANCELLED"))
-		} else {
-			removeOut()
-			rep.line(ui.red("VERIFY DECODE FAILED"))
-		}
-		rep.line(indentError(err.Error(), 2))
-		return item
-	}
-	outInfo.FrameCount = decodedFrames
-	outInfo.FrameCountExact = true
-	item.OutputInfo = outInfo
-	problems := verifyOutput(info, outInfo, opts, expectedFPS, expectedDur)
-	if len(problems) > 0 && !inputScanned {
-		// The input's frame count came from container tables trusted without
-		// a decode scan — but for trusted-codec containers like AVI that count
-		// is itself a header field that can lie exactly like the compressed
-		// tables do. If the output's real decoded count disagrees, the claim
-		// may be the stale field: rescan the source once and re-verify against
-		// the decoded truth instead of failing an honest conversion.
-		rep.line("Source frame count was container-claimed; doing one exact decode scan to check whether the table was stale...")
-		rescanStarted := time.Now()
-		count, scanErr := e.countDecodedFrames(ctx, info, func(p progressInfo) {
-			p.Stage = "RESCAN"
-			p = exactFrameProgress(p, info.FrameCount, rescanStarted)
+		rep.line("Decoding output for frame/timing verification...")
+		verifyStarted := time.Now()
+		// When the source scan proved broken timestamps, the output's own
+		// cadence is checked too: a passthrough output that carried the damage
+		// across fails verification rather than shipping VERIFIED-broken media.
+		outStats := info.TimestampsBroken
+		decodedFrames, outTiming, decodeErr := e.countDecodedFrames(ctx, outInfo, len(outInfo.Audio) > 0, outStats, func(p progressInfo) {
+			p.Stage = "VERIFY"
+			p = exactFrameProgress(p, info.FrameCount, verifyStarted)
 			rep.progress(p)
 		})
 		rep.finish()
-		switch {
-		case scanErr != nil && isCtxErr(scanErr):
-			// The encoded output is complete but unverified; keep it so a
-			// later run can re-check and reuse it, matching the verify-decode
-			// cancellation path.
-			item.Status = "cancelled"
+		if decodeErr != nil {
+			item.Status = processErrorStatus(decodeErr)
 			item.Elapsed = time.Since(started)
-			item.Message = scanErr.Error()
-			rep.line(ui.yellow("SOURCE RESCAN CANCELLED"))
-			rep.line(indentError(scanErr.Error(), 2))
-			return item
-		case scanErr != nil:
-			rep.line(ui.dim("Source rescan failed: " + strictConsoleText(scanErr.Error())))
-		case count != info.FrameCount:
-			rep.line(ui.yellow(fmt.Sprintf("Container frame count %d was stale; the source actually decodes %d frames — re-verifying against the decoded count.", info.FrameCount, count)))
-			reconcileScannedInput(&info, count, ui, rep)
-			item.InputInfo = info
-			if _, fps, dur, terr := expectedTiming(info, opts); terr == nil {
-				expectedFPS, expectedDur = fps, dur
-				problems = verifyOutput(info, outInfo, opts, expectedFPS, expectedDur)
+			item.Message = decodeErr.Error()
+			if item.Status == "cancelled" {
+				// The encoded output is complete but unverified; keep it so a later
+				// run can re-check and reuse it instead of discarding the work.
+				rep.line(ui.yellow("VERIFY DECODE CANCELLED"))
 			} else {
-				// The output was encoded with now-impeached timing (e.g. a
-				// conform built on the stale rate) and the expectations can
-				// no longer be recomputed — the timeline cannot be verified,
-				// so the rescue must fail rather than weaken the checks.
-				problems = append(problems, "timing cannot be verified after correcting stale metadata: "+strictConsoleText(terr.Error()))
+				removeOut()
+				rep.line(ui.red("VERIFY DECODE FAILED"))
+			}
+			rep.line(indentError(decodeErr.Error(), 2))
+			return item
+		}
+		outInfo.FrameCount = decodedFrames
+		outInfo.FrameCountExact = true
+		item.OutputInfo = outInfo
+		problems = verifyOutput(info, outInfo, opts, expectedFPS, expectedDur)
+		// Reference the output's own declared cadence, not the (possibly
+		// impeached) source expectation — a passthrough output on a source
+		// whose claims were cleared still carries the destroyed timeline and
+		// must not verify on the strength of a missing reference.
+		outRef := expectedDur
+		if outInfo.FPSFloat > 0 && decodedFrames > 0 {
+			outRef = float64(decodedFrames) / outInfo.FPSFloat
+		}
+		if outStats && outTiming != nil && brokenTimestamps(outTiming, decodedFrames, outRef) {
+			problems = append(problems, "output timestamps are still broken (non-monotonic or collapsed PTS)")
+		}
+		if len(problems) > 0 && !inputScanned {
+			// The input's frame count came from container tables trusted without
+			// a decode scan — but for trusted-codec containers like AVI that count
+			// is itself a header field that can lie exactly like the compressed
+			// tables do. If the output's real decoded count disagrees, the claim
+			// may be the stale field: rescan the source once and re-verify against
+			// the decoded truth instead of failing an honest conversion.
+			rep.line("Source frame count was container-claimed; doing one exact decode scan to check whether the table was stale...")
+			rescanStarted := time.Now()
+			count, _, scanErr := e.countDecodedFrames(ctx, info, false, false, func(p progressInfo) {
+				p.Stage = "RESCAN"
+				p = exactFrameProgress(p, info.FrameCount, rescanStarted)
+				rep.progress(p)
+			})
+			rep.finish()
+			// One decode is enough: the retry loop must not rescan the same
+			// source again.
+			inputScanned = true
+			switch {
+			case scanErr != nil && isCtxErr(scanErr):
+				// The encoded output is complete but unverified; keep it so a
+				// later run can re-check and reuse it, matching the verify-decode
+				// cancellation path.
+				item.Status = "cancelled"
+				item.Elapsed = time.Since(started)
+				item.Message = scanErr.Error()
+				rep.line(ui.yellow("SOURCE RESCAN CANCELLED"))
+				rep.line(indentError(scanErr.Error(), 2))
+				return item
+			case scanErr != nil:
+				rep.line(ui.dim("Source rescan failed: " + strictConsoleText(scanErr.Error())))
+			case count != info.FrameCount:
+				rep.line(ui.yellow(fmt.Sprintf("Container frame count %d was stale; the source actually decodes %d frames — re-verifying against the decoded count.", info.FrameCount, count)))
+				reconcileScannedInput(&info, count, ui, rep)
+				item.InputInfo = info
+				if _, fps, dur, terr := expectedTiming(info, opts); terr == nil {
+					expectedFPS, expectedDur = fps, dur
+					problems = verifyOutput(info, outInfo, opts, expectedFPS, expectedDur)
+				} else {
+					// The output was encoded with now-impeached timing (e.g. a
+					// conform built on the stale rate) and the expectations can
+					// no longer be recomputed — the timeline cannot be verified,
+					// so the rescue must fail rather than weaken the checks.
+					problems = append(problems, "timing cannot be verified after correcting stale metadata: "+strictConsoleText(terr.Error()))
+				}
+				// A native-produced output was stamped with `-r <claimed rate>`:
+				// when the rescan just impeached that rate the file carries the
+				// lie, so it must be re-encoded through libxvid (passthrough
+				// timing) rather than adopted on frame count alone.
+				if usedNative && info.FPS == "" {
+					problems = append(problems, "native output was stamped at the impeached container rate")
+				}
 			}
 		}
+		if len(problems) > 0 && usedNative && !nativeVerifyRejected && e.enc["libxvid"] && ctx.Err() == nil {
+			rep.line(ui.yellow("Native Xvid output failed verification; re-encoding through FFmpeg libxvid."))
+			rep.line(ui.dim(strictConsoleText(strings.Join(problems, "; "))))
+			nativeVerifyRejected = true
+			continue
+		}
+		break
 	}
 	if len(problems) > 0 {
 		item.Elapsed = time.Since(started)
@@ -481,6 +580,30 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 			rep.line("- " + strictConsoleText(problem))
 		}
 		return item
+	}
+
+	// The output should carry the embedded provenance tag. A tag for a
+	// *different* signature means the source bytes changed mid-encode — the
+	// file on disk is tagged for content it does not contain, so it must not
+	// survive as a VERIFIED result (a later run could adopt it for the wrong
+	// source). A simply-absent tag is the muxer/drop case: keep the file, but
+	// warn once since future runs can never reuse it.
+	want := provenanceComment(sourceSignature(info.Path), jobSignature(opts))
+	got := strings.TrimSpace(outInfo.ProvenanceTag)
+	// Only our own tag proves a content mismatch: ffmpeg copies input global
+	// metadata by default, so an output may legitimately carry the source's
+	// ordinary comment — that is tag-absent, not tag-foreign.
+	if want != "" && strings.HasPrefix(got, provenancePrefix) && !strings.EqualFold(got, want) {
+		item.Status = "failed"
+		item.Elapsed = time.Since(started)
+		item.Message = "output provenance tag does not match the current source (source changed during encode)"
+		removeOut()
+		rep.line(ui.red("VERIFY FAILED"))
+		rep.line("- " + item.Message)
+		return item
+	}
+	if !provenanceMatches(sourceSignature(info.Path), jobSignature(opts), outInfo) {
+		rep.line(ui.yellow("WARNING: output did not retain the provenance tag; future runs cannot reuse it."))
 	}
 
 	item.Status = "ok"
@@ -536,6 +659,7 @@ var (
 )
 
 func runBatch(ctx context.Context, ui theme, e *Engine, infos []MediaInfo, opts ConvertOptions) BatchResult {
+	defer removeEmptyCreatedDirs()
 	workers := batchWorkerCountFunc(opts, infos)
 	if workers <= 1 {
 		result := BatchResult{Items: make([]ItemResult, 0, len(infos))}

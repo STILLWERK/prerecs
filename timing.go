@@ -139,6 +139,9 @@ func expectedTiming(info MediaInfo, req ConvertOptions) (*big.Rat, *big.Rat, flo
 		if ratFloat(target) > 2000 {
 			return nil, nil, 0, fmt.Errorf("target FPS %.3f is unreasonably high", ratFloat(target))
 		}
+		if ratFloat(target) < 1 {
+			return nil, nil, 0, fmt.Errorf("target FPS %.6g is unreasonably low", ratFloat(target))
+		}
 		if info.FrameCount > 0 {
 			expectedDur = float64(info.FrameCount) / ratFloat(target)
 		} else if info.Duration > 0 {
