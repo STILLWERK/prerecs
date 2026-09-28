@@ -68,7 +68,7 @@ func verifyOutput(in, out MediaInfo, opts ConvertOptions, expected *big.Rat, exp
 	} else {
 		if len(out.Audio) != len(in.Audio) {
 			p = append(p, fmt.Sprintf("audio track mismatch: expected %d got %d", len(in.Audio), len(out.Audio)))
-		} else if !opts.Conform {
+		} else {
 			// Normal-timing audio is stream-copied. Verify that "keep audio" really
 			// means the same codec came through, not a silent transcode or omission.
 			for i := range in.Audio {

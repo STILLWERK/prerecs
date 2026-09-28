@@ -581,3 +581,176 @@ func TestProcessItemStaleFrameCountConformFails(t *testing.T) {
 		t.Fatalf("expected unverifiable-timing failure message, got %q", item.Message)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Per-item probe deadline
+// ---------------------------------------------------------------------------
+
+// The existing-candidate probe and the post-encode probe run under the shared
+// per-probe deadline: a wedged ffprobe rejects the candidate / fails the item
+// after mediaProbeTimeout rather than stalling until user cancellation. A
+// child-deadline failure is a per-item failure, not a job cancellation.
+func TestProcessItemCandidateProbeTimeoutRejects(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fake executable is not portable to Windows")
+	}
+	caps, enc, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	if !enc["libxvid"] || !enc["ffv1"] {
+		t.Skip("libxvid/ffv1 unavailable")
+	}
+	caps.HasNativeXvid = false
+	old := mediaProbeTimeout
+	mediaProbeTimeout = 300 * time.Millisecond
+	defer func() { mediaProbeTimeout = old }()
+
+	td := t.TempDir()
+	src := filepath.Join(td, "clip.avi")
+	if b, err := exec.Command(caps.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30",
+		"-frames:v", "15", "-c:v", "ffv1", src,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("fixture: %v %s", err, b)
+	}
+	outDir := filepath.Join(td, "out")
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// A candidate that exists but cannot be probed within the deadline.
+	cand := filepath.Join(outDir, "clip_xvid_compact.avi")
+	if err := os.WriteFile(cand, []byte("stale"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	fakeProbe := filepath.Join(td, "ffprobe")
+	if err := os.WriteFile(fakeProbe, []byte("#!/bin/sh\nexec sleep 60\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	caps.FFprobe = fakeProbe
+
+	info := MediaInfo{
+		Path: src, Codec: "ffv1", FPS: "30/1", FPSFloat: 30,
+		Duration: 0.5, FrameCount: 15, FrameCountExact: true,
+		PixelFormat: "yuv420p", BitDepth: 8, Chroma: "4:2:0",
+	}
+	e := &Engine{caps: caps, enc: enc}
+	rep, _ := captureReporter()
+	start := time.Now()
+	item := processItem(context.Background(), theme{}, e, info, ConvertOptions{Preset: "xvid_compact", OutputDir: outDir, StripAudio: true}, rep)
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Fatalf("wedged probes were not bounded: %s", elapsed)
+	}
+	if item.Status == "cancelled" {
+		t.Fatal("per-probe timeout must not masquerade as cancellation")
+	}
+	// The wedged probe also hits the post-encode metadata read, so the item
+	// fails there — but bounded and reported as failure, never VERIFIED.
+	if item.Status != "failed" || !strings.Contains(item.Message, "probe") {
+		t.Fatalf("status=%q message=%q — want failed probe", item.Status, item.Message)
+	}
+	if !fileExists(cand) {
+		t.Fatal("timed-out candidate was removed — only fresh output is disposable")
+	}
+}
+
+// The headline reuse path: a candidate that probes, decodes and verifies must
+// be reported as skipped-with-existing instead of re-encoded, and the fresh
+// reservation for a numbered name must be released.
+func TestProcessItemReusesVerifiedExistingOutput(t *testing.T) {
+	caps, enc, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	if !enc["libxvid"] || !enc["ffv1"] {
+		t.Skip("libxvid/ffv1 unavailable")
+	}
+	caps.HasNativeXvid = false
+	td := t.TempDir()
+	src := filepath.Join(td, "clip.avi")
+	if b, err := exec.Command(caps.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=30",
+		"-frames:v", "30", "-c:v", "ffv1", src,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("fixture: %v %s", err, b)
+	}
+	info, err := probeMedia(caps.FFprobe, src, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outDir := filepath.Join(td, "out")
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Produce the canonical output with the same build path a conversion
+	// would use, so verification has no reason to reject it.
+	cand := filepath.Join(outDir, "clip_xvid_compact.avi")
+	e := &Engine{caps: caps, enc: enc}
+	args, _, _, err := e.buildCommand(info, ConvertOptions{Preset: "xvid_compact", StripAudio: true}, cand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.runFFmpeg(context.Background(), args, 0, func(progressInfo) {}); err != nil {
+		t.Fatalf("candidate encode: %v", err)
+	}
+	candStat, err := os.Stat(cand)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rep, lines := captureReporter()
+	item := processItem(context.Background(), theme{}, e, info, ConvertOptions{Preset: "xvid_compact", OutputDir: outDir, StripAudio: true}, rep)
+	if item.Status != "skipped" || item.Output != cand {
+		t.Fatalf("existing verified output was not reused: status=%q output=%q msg=%q", item.Status, item.Output, item.Message)
+	}
+	if item.Backend != "existing verified output" {
+		t.Fatalf("backend=%q", item.Backend)
+	}
+	st2, err := os.Stat(cand)
+	if err != nil || !st2.ModTime().Equal(candStat.ModTime()) {
+		t.Fatal("existing candidate was modified during reuse")
+	}
+	if fileExists(filepath.Join(outDir, "clip_xvid_compact_2.avi")) {
+		t.Fatal("numbered reservation was left behind after reuse")
+	}
+	joined := strings.Join(*lines, "\n")
+	if !strings.Contains(joined, "VERIFIED") {
+		t.Fatalf("reuse path did not verify: %v", *lines)
+	}
+}
+
+// Cancelling mid-encode must classify as cancelled and release the reserved
+// output name — a leftover 0-byte reservation would block the next run.
+func TestProcessItemEncodeCancelRemovesReservedOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fake executable is not portable to Windows")
+	}
+	td := t.TempDir()
+	fake := filepath.Join(td, "ffmpeg")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexec sleep 60\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	outDir := filepath.Join(td, "out")
+	info := MediaInfo{
+		Path: filepath.Join(td, "clip.avi"), Codec: "ffv1", FPS: "30/1", FPSFloat: 30,
+		Duration: 1, FrameCount: 30, FrameCountExact: true,
+		PixelFormat: "yuv420p", BitDepth: 8, Chroma: "4:2:0",
+	}
+	e := &Engine{caps: Capabilities{FFmpeg: fake}, enc: map[string]bool{"prores_ks": true}}
+	rep, _ := captureReporter()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	item := processItem(ctx, theme{}, e, info, ConvertOptions{Preset: "prores_lt", OutputDir: outDir, StripAudio: true}, rep)
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Fatalf("cancelled encode did not return promptly: %s", elapsed)
+	}
+	if item.Status != "cancelled" {
+		t.Fatalf("status=%q, want cancelled", item.Status)
+	}
+	if item.Output != "" && fileExists(item.Output) {
+		t.Fatalf("cancelled item left reserved output behind: %s", item.Output)
+	}
+}

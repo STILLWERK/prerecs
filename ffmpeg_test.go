@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"math"
 	"os"
 	"os/exec"
@@ -152,20 +153,24 @@ func TestBuildCommandUsesFrameSafeConformChain(t *testing.T) {
 	for _, want := range []string{
 		" -vf settb=expr=1/300,setpts=N,fps=300/1 ",
 		" -fps_mode passthrough ",
-		" -enc_time_base filter ",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("missing %q in %v", want, args)
 		}
+	}
+	// -enc_time_base filter requires FFmpeg 6.1; the fps filter already emits
+	// CFR timestamps so the keyword is omitted to keep FFmpeg 5.1 working.
+	if strings.Contains(joined, " -enc_time_base ") {
+		t.Fatalf("enc_time_base flag returned: %v", args)
 	}
 	if strings.Contains(joined, " -fps_mode cfr ") || strings.Contains(joined, " -r 300/1 ") {
 		t.Fatalf("unsafe CFR/output-r conform path returned: %v", args)
 	}
 }
 
-// A stderr line longer than the bufio buffer must not end the drain:
-// ReadSlice reports ErrBufferFull per fragment, and bailing out leaves FFmpeg
-// blocked on a full pipe forever.
+// A stderr flood beyond the diagnostic cap must not stall the run: the copier
+// goroutine keeps draining the pipe even though only the tail is retained, and
+// the reported error stays bounded.
 func TestRunFFmpegDrainsOverlongStderrLine(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake ffmpeg is a shell script")
@@ -224,11 +229,66 @@ func TestCompressedScannedSourceGetsCleanCFR(t *testing.T) {
 	for _, want := range []string{
 		" -vf settb=expr=1/600,setpts=N,fps=600/1 ",
 		" -fps_mode passthrough ",
-		" -enc_time_base filter ",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("missing %q in %v", want, args)
 		}
+	}
+	if strings.Contains(joined, " -enc_time_base ") {
+		t.Fatalf("enc_time_base flag returned: %v", args)
+	}
+}
+
+// The timeline rebuild rewrites video timestamps from scratch, so it must not
+// run while audio is being stream-copied — the copied track would keep the
+// source timeline and drift against rebuilt video. Stripped or audio-less
+// compressed sources still get the clean CFR chain; audio-carrying inputs
+// keep passthrough timing for both streams.
+func TestCompressedSourceWithCopiedAudioKeepsPassthroughTiming(t *testing.T) {
+	e := &Engine{caps: Capabilities{}, enc: map[string]bool{"prores_ks": true}}
+	info := MediaInfo{
+		Path:            "download.mp4",
+		Codec:           "h264",
+		FPS:             "600/1",
+		FPSFloat:        600,
+		Duration:        3.328333333,
+		FrameCount:      1997,
+		FrameCountExact: true,
+		PixelFormat:     "yuv420p",
+		BitDepth:        8,
+		Chroma:          "4:2:0",
+		Audio:           []string{"aac"},
+	}
+	args, _, dur, err := e.buildCommand(info, ConvertOptions{Preset: "prores_lt"}, "out.mov")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := " " + strings.Join(args, " ") + " "
+	if strings.Contains(joined, " settb=expr=") || strings.Contains(joined, " setpts=N") {
+		t.Fatalf("timeline rebuild ran while audio is stream-copied: %v", args)
+	}
+	if !strings.Contains(joined, " -map 0:a? -c:a copy ") {
+		t.Fatalf("audio copy args missing: %v", args)
+	}
+	if !strings.Contains(joined, " -fps_mode passthrough ") {
+		t.Fatalf("passthrough timing missing: %v", args)
+	}
+	// Passthrough duration is the probed one, not count/target.
+	if math.Abs(dur-3.328333333) > 1e-6 {
+		t.Fatalf("duration=%f, want probed duration", dur)
+	}
+
+	// The same source with audio stripped rebuilds the timeline again.
+	args, _, dur, err = e.buildCommand(info, ConvertOptions{Preset: "prores_lt", StripAudio: true}, "out.mov")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined = " " + strings.Join(args, " ") + " "
+	if !strings.Contains(joined, " -vf settb=expr=1/600,setpts=N,fps=600/1 ") {
+		t.Fatalf("stripped-audio source did not get the rebuild: %v", args)
+	}
+	if math.Abs(dur-1997.0/600.0) > 1e-9 {
+		t.Fatalf("stripped rebuild duration=%f, want %f", dur, 1997.0/600.0)
 	}
 }
 
@@ -396,5 +456,218 @@ func TestStrictVerifyRejectsCorruptOutput(t *testing.T) {
 	e := &Engine{caps: caps, enc: enc}
 	if _, err := e.countDecodedFrames(context.Background(), outInfo, func(progressInfo) {}); err == nil {
 		t.Fatal("strict verification decode accepted a damaged output")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Process lifecycle: inherited pipes, cancellation, diagnostics
+// ---------------------------------------------------------------------------
+
+// A wrapper script can exit while a spawned child still holds its stdout and
+// stderr pipes open. The run must still return once the encoder itself is
+// gone — bounded by childPipeWaitDelay — rather than waiting for pipe EOF
+// forever. An exit-0 process that stalls its pipes is judged by the output it
+// produced, not the wedged plumbing; a nonzero exit still fails.
+func TestRunFFmpegSurvivesDescendantHeldPipes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake ffmpeg is a shell script")
+	}
+	old := childPipeWaitDelay
+	childPipeWaitDelay = 300 * time.Millisecond
+	defer func() { childPipeWaitDelay = old }()
+
+	for _, tc := range []struct {
+		name    string
+		script  string
+		wantErr bool
+	}{
+		{
+			name:    "clean exit with stuck pipes",
+			script:  "#!/bin/sh\nprintf 'frame=5\\nprogress=end\\n'\nsleep 5 >&1 2>&2 &\nexit 0\n",
+			wantErr: false,
+		},
+		{
+			name:    "failure exit with stuck pipes",
+			script:  "#!/bin/sh\necho 'encoder exploded' 1>&2\nsleep 5 >&1 2>&2 &\nexit 1\n",
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			td := t.TempDir()
+			fake := filepath.Join(td, "ffmpeg")
+			if err := os.WriteFile(fake, []byte(tc.script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			e := &Engine{caps: Capabilities{FFmpeg: fake}}
+			start := time.Now()
+			err := e.runFFmpeg(context.Background(), []string{"-i", "in"}, 0, func(progressInfo) {})
+			// Without the WaitDelay bound this call would wait out the full
+			// 5s grandchild sleep instead of returning at ~300ms.
+			if elapsed := time.Since(start); elapsed > 4*time.Second {
+				t.Fatalf("runFFmpeg did not return promptly: %s", elapsed)
+			}
+			if tc.wantErr && err == nil {
+				t.Fatal("nonzero exit with stuck pipes was not reported")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("clean exit with stuck pipes failed: %v", err)
+			}
+		})
+	}
+}
+
+// Cancellation must surface as the context error, not as a generic ffmpeg
+// failure — headless exit codes distinguish the two.
+func TestRunFFmpegCancellationSurfacesCtxErr(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake ffmpeg is a shell script")
+	}
+	td := t.TempDir()
+	fake := filepath.Join(td, "ffmpeg")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{caps: Capabilities{FFmpeg: fake}}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := e.runFFmpeg(ctx, []string{"-i", "in"}, 0, func(progressInfo) {})
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context deadline, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("cancelled run did not return promptly: %s", elapsed)
+	}
+}
+
+// The scan relies on the LAST progress block for the frame count; a trailing
+// line without a newline at EOF must still be delivered.
+func TestRunFFmpegDeliversUnterminatedFinalProgressLine(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake ffmpeg is a shell script")
+	}
+	td := t.TempDir()
+	fake := filepath.Join(td, "ffmpeg")
+	script := "#!/bin/sh\nprintf 'frame=7\\nout_time_us=1000000\\nprogress=continue\\n'\nprintf 'frame=42'" // no trailing newline
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{caps: Capabilities{FFmpeg: fake}}
+	var last progressInfo
+	if err := e.runFFmpeg(context.Background(), []string{"-i", "in"}, 0, func(p progressInfo) { last = p }); err != nil {
+		t.Fatal(err)
+	}
+	if last.Frame != "42" {
+		t.Fatalf("final unterminated frame= line lost: %+v", last)
+	}
+}
+
+// The diagnostic buffer keeps the tail — the decisive error in a long FFmpeg
+// log is always at the end, while the head was historically kept instead.
+func TestBoundedTailWriterKeepsTail(t *testing.T) {
+	var w boundedTailWriter
+	head := strings.Repeat("H", maxDiagnosticBytes)
+	tail := "the actual failure line"
+	if _, err := w.Write([]byte(head)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte(tail)); err != nil {
+		t.Fatal(err)
+	}
+	got := w.String()
+	if len(got) != maxDiagnosticBytes {
+		t.Fatalf("buffer len=%d, want capped at %d", len(got), maxDiagnosticBytes)
+	}
+	if !strings.HasSuffix(got, tail) {
+		t.Fatalf("tail not retained: ...%q", got[len(got)-40:])
+	}
+	if !strings.HasPrefix(got, "HH") {
+		t.Fatal("head-of-buffer content unexpectedly dropped")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Per-preset argument construction
+// ---------------------------------------------------------------------------
+
+func TestBuildCommandPresetArgs(t *testing.T) {
+	info := MediaInfo{Path: "in.avi", Codec: "ffv1", FPS: "30/1", FPSFloat: 30, Duration: 1, FrameCount: 30, FrameCountExact: true, PixelFormat: "yuv420p", BitDepth: 8, Chroma: "4:2:0"}
+	join := func(args []string) string { return " " + strings.Join(args, " ") + " " }
+
+	for _, tc := range []struct {
+		name   string
+		preset string
+		enc    map[string]bool
+		caps   Capabilities
+		want   []string
+		absent []string
+	}{
+		{
+			name:   "xvid small is Q3",
+			preset: "xvid_small",
+			enc:    map[string]bool{"libxvid": true},
+			want:   []string{" -c:v libxvid ", " -qscale:v 3 ", " -mbd bits ", " -bf 0 ", " -vtag XVID "},
+		},
+		{
+			name:   "xvid max is Q1",
+			preset: "xvid_max",
+			enc:    map[string]bool{"libxvid": true},
+			want:   []string{" -c:v libxvid ", " -qscale:v 1 ", " -mbd bits ", " -vtag XVID "},
+		},
+		{
+			name:   "xvid compact is Q2 VHQ-style bits",
+			preset: "xvid_compact",
+			enc:    map[string]bool{"libxvid": true},
+			want:   []string{" -qscale:v 2 ", " -mbd bits "},
+			absent: []string{" -mbd rd "},
+		},
+		{
+			name:   "magicyuv args",
+			preset: "magicyuv_lossless",
+			enc:    map[string]bool{"magicyuv": true},
+			caps:   Capabilities{MagicInstalled: true},
+			want:   []string{" -c:v magicyuv ", " -pred gradient ", " -pix_fmt yuv420p "},
+		},
+		{
+			name:   "utvideo args",
+			preset: "utvideo_lossless",
+			enc:    map[string]bool{"utvideo": true},
+			want:   []string{" -c:v utvideo ", " -pred left ", " -pix_fmt yuv420p "},
+		},
+		{
+			name:   "prores 422 maps profile 2",
+			preset: "prores_422",
+			enc:    map[string]bool{"prores_ks": true},
+			want:   []string{" -c:v prores_ks ", " -profile:v 2 ", " -pix_fmt yuv422p10le ", " -movflags +write_colr "},
+		},
+		{
+			name:   "prores 4444 carries alpha args",
+			preset: "prores_4444",
+			enc:    map[string]bool{"prores_ks": true},
+			want:   []string{" -profile:v 4 ", " -pix_fmt yuva444p10le ", " -alpha_bits 8 "},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := info
+			if tc.preset == "prores_4444" {
+				in.HasAlpha = true
+			}
+			e := &Engine{caps: tc.caps, enc: tc.enc}
+			args, _, _, err := e.buildCommand(in, ConvertOptions{Preset: tc.preset, StripAudio: true}, "out")
+			if err != nil {
+				t.Fatal(err)
+			}
+			joined := join(args)
+			for _, w := range tc.want {
+				if !strings.Contains(joined, w) {
+					t.Fatalf("missing %q in %v", w, args)
+				}
+			}
+			for _, a := range tc.absent {
+				if strings.Contains(joined, a) {
+					t.Fatalf("unexpected %q in %v", a, args)
+				}
+			}
+		})
 	}
 }

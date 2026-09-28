@@ -142,34 +142,42 @@ func expandInputs(items []string) ([]string, error) {
 }
 
 // generatedOutputSuffixes are the canonical preset tokens PreRecs appends to
-// output filenames: `stem_<preset>.ext` and `stem_<preset>_N.ext`.
-var generatedOutputSuffixes = []string{
-	"xvid_compact", "xvid_max_q2", "xvid_efficient_q2", "xvid_small", "xvid_max",
-	"prores_lt", "prores_422", "prores_hq", "prores_4444",
-	"magicyuv_lossless", "utvideo_lossless",
+// output filenames: `stem_<preset>.ext` and `stem_<preset>_N.ext`. Each token
+// pairs with the only extension its preset actually emits — .avi for
+// Xvid/lossless presets, .mov for ProRes — so a user file whose name merely
+// ends in the token under the other extension stays eligible.
+var generatedOutputSuffixes = []struct {
+	token string
+	ext   string
+}{
+	{"xvid_compact", ".avi"}, {"xvid_max_q2", ".avi"}, {"xvid_efficient_q2", ".avi"},
+	{"xvid_small", ".avi"}, {"xvid_max", ".avi"},
+	{"prores_lt", ".mov"}, {"prores_422", ".mov"}, {"prores_hq", ".mov"}, {"prores_4444", ".mov"},
+	{"magicyuv_lossless", ".avi"}, {"utvideo_lossless", ".avi"},
 }
 
 // isGeneratedOutputName reports whether a filename matches the exact naming
 // convention of a PreRecs output. It only triggers on a trailing
-// `_<preset>` or `_<preset>_<digits>` before an .avi/.mov extension — the
-// precise names this program itself produces — so arbitrary user media with a
-// vaguely similar substring stays eligible. A user file that happens to share
-// the exact generated pattern is indistinguishable from real output and is
-// skipped only inside directory scans; it can still be passed explicitly.
+// `_<preset>` or `_<preset>_<digits>` before the extension that preset emits —
+// the precise names this program itself produces — so arbitrary user media
+// with a vaguely similar substring stays eligible. A user file that happens
+// to share the exact generated pattern is indistinguishable from real output
+// and is skipped only inside directory scans; it can still be passed
+// explicitly.
 func isGeneratedOutputName(name string) bool {
 	// Case-fold the whole name: Windows filesystems are case-insensitive, and
 	// generated names always carry lowercase preset tokens.
 	low := strings.ToLower(name)
 	ext := filepath.Ext(low)
-	if ext != ".avi" && ext != ".mov" {
-		return false
-	}
 	stem := low[:len(low)-len(ext)]
 	for _, p := range generatedOutputSuffixes {
-		if strings.HasSuffix(stem, "_"+p) {
+		if ext != p.ext {
+			continue
+		}
+		if strings.HasSuffix(stem, "_"+p.token) {
 			return true
 		}
-		marker := "_" + p + "_"
+		marker := "_" + p.token + "_"
 		idx := strings.LastIndex(stem, marker)
 		if idx >= 0 && isDigits(stem[idx+len(marker):]) {
 			return true

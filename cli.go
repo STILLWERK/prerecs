@@ -103,7 +103,7 @@ var errShowHelp = errors.New("help requested")
 func newFlagSet(c *cliConfig) *flag.FlagSet {
 	fs := flag.NewFlagSet("prerecs", flag.ContinueOnError)
 	fs.SetOutput(io.Discard) // help/errors are reported by the caller, not flag
-	fs.StringVar(&c.preset, "preset", "", "share|compact|xvid|xvid-q2|xvid-efficient|xvid-fast|edit|lossless|prores|hq|xvid-max-q2|xvid-small|xvid-max|4444|magicyuv|utvideo")
+	fs.StringVar(&c.preset, "preset", "", "share|compact|xvid|xvid-q2|xvid-efficient|xvid-fast|edit|lossless|prores|hq|xvid-max-q2|xvid-small|xvid-q3|xvid-max|xvid-q1|4444|magicyuv|utvideo")
 	fs.StringVar(&c.timescale, "timescale", "", "game timescale, e.g. 0.1")
 	fs.StringVar(&c.captureFPS, "capture-fps", "", "capture FPS override, e.g. 30 or 60000/1001")
 	fs.BoolVar(&c.stripAudio, "strip-audio", false, "remove audio instead of keeping it")
@@ -143,7 +143,7 @@ Usage:
   PreRecs.exe
 
 Options:
-  --preset share|compact|xvid|xvid-q2|xvid-efficient|xvid-fast|edit|lossless|prores|hq|xvid-max-q2|xvid-small|xvid-max|4444|magicyuv|utvideo
+  --preset share|compact|xvid|xvid-q2|xvid-efficient|xvid-fast|edit|lossless|prores|hq|xvid-max-q2|xvid-small|xvid-q3|xvid-max|xvid-q1|4444|magicyuv|utvideo
   --timescale 0.1          conform slowed capture to effective FPS
   --capture-fps 30         override detected capture FPS
   --strip-audio            remove audio instead of keeping it
@@ -174,6 +174,11 @@ func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (Conv
 	if cfg.captureFPS != "" {
 		if _, err := parseRat(cfg.captureFPS); err != nil {
 			return opts, fmt.Errorf("invalid --capture-fps value: %w", err)
+		}
+		// Under --yes there is no TIMING prompt to give the flag a job, so a
+		// lone --capture-fps would be silently ignored — fail fast instead.
+		if cfg.timescale == "" && cfg.yes {
+			return opts, errors.New("--capture-fps only applies to a conform job; it has no effect without --timescale")
 		}
 	}
 	if cfg.preset != "" {
@@ -255,7 +260,14 @@ func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (Conv
 		}
 		if conform {
 			opts.Conform = true
-			if opts.CaptureFPS, err = askLine("Capture FPS override (Enter = detected FPS)", ""); err != nil {
+			// A flag-provided --capture-fps seeds the prompt default so
+			// pressing Enter keeps it instead of discarding the flag — and the
+			// label must not promise "detected FPS" for a seeded default.
+			fpsLabel := "Capture FPS override (Enter = detected FPS)"
+			if cfg.captureFPS != "" {
+				fpsLabel = "Capture FPS override"
+			}
+			if opts.CaptureFPS, err = askLine(fpsLabel, cfg.captureFPS); err != nil {
 				return opts, err
 			}
 			if opts.Timescale, err = askLine("Game timescale", "0.1"); err != nil {
@@ -271,6 +283,8 @@ func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (Conv
 			}
 			printEffectiveRates(ui, infos, opts)
 			fmt.Println(ui.dim("  Audio will be stripped when conforming timing; copying it unchanged would desynchronize it."))
+		} else if cfg.captureFPS != "" {
+			fmt.Println(ui.dim("  Note: --capture-fps has no effect without a timing conform."))
 		}
 	}
 
@@ -282,7 +296,9 @@ func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (Conv
 				break
 			}
 		}
-		if hasAudio && !cfg.yes {
+		// An explicit --strip-audio flag wins over the menu: asking again and
+		// defaulting to "keep" would silently undo what the user already said.
+		if hasAudio && !cfg.yes && !cfg.stripAudio {
 			fmt.Println()
 			fmt.Println(ui.bold("AUDIO"))
 			fmt.Println("  1. Keep audio unchanged " + ui.green("recommended"))

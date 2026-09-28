@@ -2,6 +2,7 @@
 PreRecs.exe
 *.exe
 *.dll
+/prerecs
 dist/
 release/
 *.zip

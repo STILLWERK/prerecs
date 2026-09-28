@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -64,8 +65,7 @@ func nativeXvidEligible(info MediaInfo) bool {
 	if strings.ToLower(filepath.Ext(info.Path)) != ".avi" {
 		return false
 	}
-	class := sourceClass(info)
-	return class == "lossless" || strings.EqualFold(info.Codec, "rawvideo")
+	return sourceClass(info) == "lossless"
 }
 
 func nativeXvidNeedsExactFrameScan(info MediaInfo) bool {
@@ -171,11 +171,17 @@ func (c *mpeg4VOPCounter) poll(path string) (int64, error) {
 	return c.count, nil
 }
 
+// boundedTailWriter keeps only the trailing maxDiagnosticBytes of a stream.
+// The mutex matters once WaitDelay can fire: the runtime abandons the copier
+// goroutines then, and a Write already in flight must not race String().
 type boundedTailWriter struct {
+	mu  sync.Mutex
 	buf []byte
 }
 
 func (w *boundedTailWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	n := len(p)
 	if n >= maxDiagnosticBytes {
 		w.buf = append(w.buf[:0], p[n-maxDiagnosticBytes:]...)
@@ -190,6 +196,8 @@ func (w *boundedTailWriter) Write(p []byte) (int, error) {
 }
 
 func (w *boundedTailWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	return string(w.buf)
 }
 
@@ -223,6 +231,10 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 	var stdout, stderr boundedTailWriter
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	// Same stuck-pipe bound as runFFmpeg: if the encoder exits while a
+	// descendant holds its pipes open, Wait returns ErrWaitDelay instead of
+	// leaving the poll loop spinning forever.
+	cmd.WaitDelay = childPipeWaitDelay
 	if err := cmd.Start(); err != nil {
 		return nil, 0, err
 	}
@@ -290,6 +302,13 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 			return nil, 0, fmt.Errorf("%w (encoder did not exit within 5s of cancellation; %s may remain locked)", ctx.Err(), tmpVideo)
 		}
 		return nil, 0, ctx.Err()
+	}
+	if errors.Is(waitErr, exec.ErrWaitDelay) {
+		// The encoder exited while a descendant held its pipes open. A clean
+		// exit is judged by the .m4v below; a nonzero one still fails.
+		if st := cmd.ProcessState; st != nil && st.ExitCode() == 0 {
+			waitErr = nil
+		}
 	}
 	if waitErr != nil {
 		msg := strings.TrimSpace(stderr.String())

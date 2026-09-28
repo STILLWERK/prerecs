@@ -107,6 +107,38 @@ func TestEfficientOutputSuffix(t *testing.T) {
 // Sparse numbered outputs (#5)
 // ---------------------------------------------------------------------------
 
+func TestRacedReservationIsNotReusable(t *testing.T) {
+	d := t.TempDir()
+	// Scan runs first, exactly as outputCandidates does — the racer does not
+	// exist yet.
+	existing, taken, err := scanOutputSlots(d, "clip_xvid_compact", ".avi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A concurrent run claims slot 1 between our scan and our reservation;
+	// its file is an in-flight reservation, not a reusable output.
+	raced := filepath.Join(d, "clip_xvid_compact.avi")
+	if err := os.WriteFile(raced, []byte("in-flight"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	reserved, err := reserveOutputSlot(d, "clip_xvid_compact", ".avi", taken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(reserved)
+	if filepath.Base(reserved) != "clip_xvid_compact_2.avi" {
+		t.Fatalf("raced slot should have been skipped, reserved=%q", reserved)
+	}
+	if !taken[1] {
+		t.Fatal("raced slot not marked taken")
+	}
+	for _, p := range existing {
+		if p == raced {
+			t.Fatalf("raced reservation %q must not be offered for reuse", raced)
+		}
+	}
+}
+
 func TestOutputCandidatesSparse(t *testing.T) {
 	td := t.TempDir()
 	src := filepath.Join(td, "clip.avi")

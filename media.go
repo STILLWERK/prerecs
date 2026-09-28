@@ -52,9 +52,16 @@ var mediaProbeTimeout = 30 * time.Second
 // Conversion integrity uses Engine.countDecodedFrames instead because it makes
 // decoder errors fatal; an ffprobe frame count is not an integrity check.
 func probeMedia(ffprobe, path string, countFrames bool) (MediaInfo, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), mediaProbeTimeout)
+	return probeMediaBound(context.Background(), ffprobe, path, countFrames)
+}
+
+// probeMediaBound runs a metadata probe under the shared per-probe deadline
+// while still honoring cancellation of the surrounding job — a wedged ffprobe
+// stalls for at most mediaProbeTimeout rather than until the user gives up.
+func probeMediaBound(ctx context.Context, ffprobe, path string, countFrames bool) (MediaInfo, error) {
+	pctx, cancel := context.WithTimeout(ctx, mediaProbeTimeout)
 	defer cancel()
-	return probeMediaContext(ctx, ffprobe, path, countFrames)
+	return probeMediaContext(pctx, ffprobe, path, countFrames)
 }
 
 func probeMediaContext(ctx context.Context, ffprobe, path string, countFrames bool) (MediaInfo, error) {

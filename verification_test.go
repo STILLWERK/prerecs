@@ -136,3 +136,57 @@ func TestVerifyOutputAudioAndFormat(t *testing.T) {
 		t.Fatal("wrong Xvid pixel format should fail verification")
 	}
 }
+
+func TestVerifyOutputMismatches(t *testing.T) {
+	in := MediaInfo{
+		Width: 320, Height: 180, PixelFormat: "yuv420p", FrameCount: 30, FPSFloat: 30, Duration: 1,
+		Audio: []string{"aac"},
+	}
+	base := MediaInfo{
+		Codec: "mpeg4", CodecTag: "XVID", Width: 320, Height: 180, PixelFormat: "yuv420p",
+		FrameCount: 30, FPSFloat: 30, Duration: 1, Audio: []string{"aac"},
+	}
+	opts := ConvertOptions{Preset: "xvid_compact"}
+
+	dims := base
+	dims.Width = 640
+	if p := verifyOutput(in, dims, opts, big.NewRat(30, 1), 1); !contains(p, "dimension mismatch") {
+		t.Fatalf("dimension mismatch not reported: %v", p)
+	}
+	fps := base
+	fps.FPSFloat = 24
+	if p := verifyOutput(in, fps, opts, big.NewRat(30, 1), 1); !contains(p, "frame rate mismatch") {
+		t.Fatalf("frame rate mismatch not reported: %v", p)
+	}
+	dur := base
+	dur.Duration = 5
+	if p := verifyOutput(in, dur, opts, big.NewRat(30, 1), 1); !contains(p, "duration mismatch") {
+		t.Fatalf("duration mismatch not reported: %v", p)
+	}
+	codec := base
+	codec.Audio = []string{"mp3"}
+	if p := verifyOutput(in, codec, opts, big.NewRat(30, 1), 1); !contains(p, "audio codec mismatch") {
+		t.Fatalf("audio codec mismatch not reported: %v", p)
+	}
+	extra := base
+	extra.Audio = []string{"aac", "ac3"}
+	if p := verifyOutput(in, extra, opts, big.NewRat(30, 1), 1); !contains(p, "audio track mismatch") {
+		t.Fatalf("extra audio track not reported: %v", p)
+	}
+	unexpected := base
+	unexpected.Audio = []string{"aac"}
+	noAudioIn := in
+	noAudioIn.Audio = nil
+	if p := verifyOutput(noAudioIn, unexpected, opts, big.NewRat(30, 1), 1); !contains(p, "audio mismatch") {
+		t.Fatalf("unexpected audio track not reported: %v", p)
+	}
+}
+
+func contains(problems []string, sub string) bool {
+	for _, p := range problems {
+		if strings.Contains(p, sub) {
+			return true
+		}
+	}
+	return false
+}

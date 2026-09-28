@@ -137,7 +137,7 @@ Main release choices after the real Nade Raid bakeoff:
 
 `prores_ks` supports frame/slice threading. On the real 1440p Lagarith sample, leaving threading automatic was faster than forcing 4, 8, or 16 threads. The implementation therefore leaves thread selection to FFmpeg and uses the profile-selected quantization matrix (`quant_mat=auto`).
 
-The Vulkan ProRes encoder worked on the test machine and was only modestly faster on the sample (~69.6 fps versus ~66 fps CPU for a short test), so it is not a default release path.
+The Vulkan ProRes encoder worked on the test machine and was only modestly faster on this short sample (~69.6 fps versus ~66 fps CPU). The larger RTX 3060 result below (~144 fps versus ~35 fps CPU on a longer encode) is why it ships enabled whenever the startup encode probe passes — as an experimental fast path with automatic CPU fallback, not an unconditional default.
 
 ## Timescale conform
 

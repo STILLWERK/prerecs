@@ -126,9 +126,12 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 				}
 				rep.line(fmt.Sprintf("Existing output detected: %s", strictConsoleText(filepath.Base(cand))))
 				rep.line("Checking it before deciding whether to re-encode...")
-				outInfo, probeErr := probeMediaContext(ctx, e.caps.FFprobe, cand, false)
+				outInfo, probeErr := probeMediaBound(ctx, e.caps.FFprobe, cand, false)
 				if probeErr != nil {
-					if isCtxErr(probeErr) {
+					// ctx.Err() distinguishes the batch's own cancellation
+					// from the per-probe deadline: a timed-out candidate is
+					// just rejected, not treated as a cancelled job.
+					if ctx.Err() != nil {
 						rep.line(ui.yellow("OUTPUT PROBE CANCELLED"))
 						rep.line(indentError(probeErr.Error(), 2))
 						if relErr := releaseOutputReservation(out); relErr != nil {
@@ -137,6 +140,9 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 						item.Status = "cancelled"
 						item.Message = probeErr.Error()
 						return item
+					}
+					if errors.Is(probeErr, context.DeadlineExceeded) {
+						probeErr = fmt.Errorf("metadata probe exceeded %s", mediaProbeTimeout)
 					}
 					rep.line(ui.dim("Rejected: metadata probe failed: " + strictConsoleText(probeErr.Error())))
 					continue
@@ -185,7 +191,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 				}
 				rep.line(ui.dim("Rejected: " + strictConsoleText(strings.Join(problems, "; "))))
 			}
-			rep.line(ui.yellow("Existing output was stale or did not validate; preserving it and writing a numbered copy."))
+			rep.line(ui.yellow("Existing output was stale or failed validation; preserving it and writing a numbered copy."))
 		}
 	}
 	item.Output = out
@@ -355,18 +361,25 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	// verification it must not stay behind under the canonical output name
 	// masquerading as a valid result — remove it. (Pre-existing candidates are
 	// still preserved deliberately in the reuse check above.)
-	outInfo, err := probeMediaContext(ctx, e.caps.FFprobe, out, false)
+	outInfo, err := probeMediaBound(ctx, e.caps.FFprobe, out, false)
 	if err != nil {
 		item.Elapsed = time.Since(started)
-		item.Status = processErrorStatus(err)
 		item.Message = err.Error()
-		if item.Status == "cancelled" {
+		// A probe that only hit the per-probe deadline is a failure of this
+		// item, not a job cancellation — and the unverified output must not
+		// stay behind under the canonical name.
+		if ctx.Err() != nil {
+			item.Status = "cancelled"
 			rep.line(ui.yellow("VERIFY PROBE CANCELLED"))
 		} else {
+			item.Status = "failed"
+			if errors.Is(err, context.DeadlineExceeded) {
+				item.Message = fmt.Sprintf("output metadata probe exceeded %s", mediaProbeTimeout)
+			}
 			removeOut()
 			rep.line(ui.red("VERIFY PROBE FAILED"))
 		}
-		rep.line(indentError(err.Error(), 2))
+		rep.line(indentError(item.Message, 2))
 		return item
 	}
 	rep.line("Decoding output for frame/timing verification...")

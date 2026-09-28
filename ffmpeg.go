@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -55,13 +56,10 @@ func (e *Engine) buildProResVulkanCommand(info MediaInfo, req ConvertOptions, ou
 	if cf := colorFilter(info); cf != "" {
 		filters = append(filters, cf)
 	}
-	cleanTimeline := false
 	if req.Conform {
 		filters = append(conformVideoFilters(target), filters...)
-		cleanTimeline = true
-	} else if sourceClass(info) == "compressed" && info.FrameCountExact && target != nil {
+	} else if compressedSourceNeedsTimelineRebuild(info, req, target) {
 		filters = append(conformVideoFilters(target), filters...)
-		cleanTimeline = true
 		if info.FrameCount > 0 {
 			expectedDur = float64(info.FrameCount) / ratFloat(target)
 		}
@@ -79,11 +77,7 @@ func (e *Engine) buildProResVulkanCommand(info MediaInfo, req ConvertOptions, ou
 	}
 	filters = append(filters, "format="+pix, "hwupload")
 	args = append(args, "-vf", strings.Join(filters, ","))
-	if cleanTimeline {
-		args = append(args, "-fps_mode", "passthrough", "-enc_time_base", "filter")
-	} else {
-		args = append(args, "-fps_mode", "passthrough")
-	}
+	args = append(args, "-fps_mode", "passthrough")
 	// -alpha_bits is only meaningful when alpha exists; omit it otherwise
 	// rather than forcing an explicit 0 on a young encoder.
 	args = append(args, "-c:v", "prores_ks_vulkan", "-profile:v", profile, "-quant_mat", "auto")
@@ -116,14 +110,14 @@ func (e *Engine) buildCommand(info MediaInfo, req ConvertOptions, out string) ([
 	}
 	if req.Conform {
 		filters = append(conformVideoFilters(target), filters...)
-		args = append(args, "-vf", strings.Join(filters, ","), "-fps_mode", "passthrough", "-enc_time_base", "filter")
-	} else if sourceClass(info) == "compressed" && info.FrameCountExact && target != nil {
+		args = append(args, "-vf", strings.Join(filters, ","), "-fps_mode", "passthrough")
+	} else if compressedSourceNeedsTimelineRebuild(info, req, target) {
 		// Distribution files found in the wild can have stale AVI indexes and
 		// broken/gapped timestamps. Once SCAN has established the actual decoded
 		// picture count, build a clean constant-rate editing timeline from those
 		// pictures instead of carrying bad source timestamps into the intermediate.
 		filters = append(conformVideoFilters(target), filters...)
-		args = append(args, "-vf", strings.Join(filters, ","), "-fps_mode", "passthrough", "-enc_time_base", "filter")
+		args = append(args, "-vf", strings.Join(filters, ","), "-fps_mode", "passthrough")
 		if info.FrameCount > 0 {
 			expectedDur = float64(info.FrameCount) / ratFloat(target)
 		}
@@ -185,9 +179,6 @@ func (e *Engine) buildCommand(info MediaInfo, req ConvertOptions, out string) ([
 		if err != nil {
 			return nil, nil, 0, err
 		}
-		if pix == "yuva444p" || pix == "gray" {
-			return nil, nil, 0, fmt.Errorf("ut video cannot preserve source pixel format %s with this FFmpeg build", info.PixelFormat)
-		}
 		args = append(args, "-c:v", "utvideo", "-pred", "left", "-pix_fmt", pix)
 		args = append(args, e.audioArgs(req)...)
 	default:
@@ -196,6 +187,17 @@ func (e *Engine) buildCommand(info MediaInfo, req ConvertOptions, out string) ([
 	args = append(args, colorOutputArgs(info, req.Preset)...)
 	args = append(args, "-progress", "pipe:1", "-stats_period", "0.25", "-nostats", out)
 	return args, target, expectedDur, nil
+}
+
+// compressedSourceNeedsTimelineRebuild reports whether a scanned compressed
+// source gets the clean constant-rate timeline rebuild. Rebuilding rewrites
+// video timestamps from scratch, so it only runs when no audio is carried —
+// stream-copied audio keeps the source timeline and would drift out of sync
+// with rebuilt video. Audio-carrying inputs keep passthrough timing for both
+// streams instead.
+func compressedSourceNeedsTimelineRebuild(info MediaInfo, req ConvertOptions, target *big.Rat) bool {
+	return target != nil && sourceClass(info) == "compressed" && info.FrameCountExact && info.FrameCount > 0 &&
+		(req.StripAudio || len(info.Audio) == 0)
 }
 
 func (e *Engine) audioArgs(req ConvertOptions) []string {
@@ -210,90 +212,143 @@ func (e *Engine) audioArgs(req ConvertOptions) []string {
 
 const maxDiagnosticBytes = 32 * 1024
 
-func (e *Engine) runFFmpeg(ctx context.Context, args []string, expectedDur float64, progress func(progressInfo)) error {
-	cmd := exec.CommandContext(ctx, e.caps.FFmpeg, args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return err
-	}
-	if err := cmd.Start(); err != nil {
-		return err
-	}
+// progressPipeWriter parses FFmpeg's `-progress pipe:1` stream. It is
+// installed as cmd.Stdout, so exec's internal copier goroutine delivers every
+// byte and Wait waits for the drain — the final block (which carries the
+// encode's frame count) cannot be dropped the way a post-Wait reader could.
+type progressPipeWriter struct {
+	expectedDur float64
+	started     time.Time
+	emit        func(progressInfo)
+	mu          sync.Mutex
+	pi          progressInfo
+	buf         []byte
+	closed      bool
+}
 
-	var errBuf strings.Builder
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		// ReadSlice drains in bounded fragments: a pathological overlong line
-		// can neither stall the pipe nor land in memory whole, and the error
-		// buffer keeps only the first 32 KiB. ErrBufferFull is a full fragment,
-		// not a failure — keep draining or a long line would block FFmpeg on
-		// the pipe exactly like the old capped scanner did.
-		r := bufio.NewReader(stderr)
-		for {
-			frag, rerr := r.ReadSlice('\n')
-			if remain := maxDiagnosticBytes - errBuf.Len(); remain > 0 {
-				if len(frag) > remain {
-					frag = frag[:remain]
-				}
-				errBuf.Write(frag)
-			}
-			if rerr != nil && !errors.Is(rerr, bufio.ErrBufferFull) {
-				return
-			}
-		}
-	}()
-
-	started := time.Now()
-	pi := progressInfo{}
-	r := bufio.NewReader(stdout)
+func (w *progressPipeWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		// WaitDelay can return while a copier goroutine is still mid-write on
+		// an abandoned pipe; drop those bytes rather than emit past flush.
+		return len(p), nil
+	}
+	w.buf = append(w.buf, p...)
+	consumed := 0
 	for {
-		raw, rerr := r.ReadString('\n')
-		if k, v, ok := strings.Cut(strings.TrimRight(raw, "\r\n"), "="); ok {
-			switch k {
-			case "frame":
-				pi.Frame = v
-			case "fps":
-				pi.FPS = strings.TrimSpace(v)
-			case "speed":
-				pi.Speed = strings.TrimSpace(v)
-			case "total_size":
-				pi.Bytes = parseInt64(strings.TrimSpace(v))
-			case "out_time_us", "out_time_ms":
-				// FFmpeg <5.x emitted the same microsecond value under the
-				// misleading name out_time_ms; accept both keys.
-				us, _ := strconv.ParseFloat(v, 64)
-				pi.Time = us / 1e6
-				if expectedDur > 0 {
-					pi.Percent = math.Max(0, math.Min(1, pi.Time/expectedDur))
-				}
-				pi.ETA = etaFromProgress(started, pi.Percent)
-				progress(pi)
-			case "progress":
-				if v == "end" {
-					pi.Percent = 1
-					pi.ETA = 0
-					progress(pi)
-				}
-			}
-		}
-		if rerr != nil {
+		i := bytes.IndexByte(w.buf[consumed:], '\n')
+		if i < 0 {
 			break
 		}
+		w.line(string(w.buf[consumed : consumed+i]))
+		consumed += i + 1
 	}
-	// Drain stderr fully before reaping: Wait closes the pipes after process
-	// exit, which could otherwise truncate the tail of the error buffer.
-	<-done
-	err = cmd.Wait()
+	w.buf = append(w.buf[:0], w.buf[consumed:]...)
+	// -progress output is small key=value lines; a pathological unterminated
+	// flood must not grow this buffer without bound.
+	if len(w.buf) > maxDiagnosticBytes {
+		w.buf = w.buf[:0]
+	}
+	return len(p), nil
+}
+
+// flush handles a trailing fragment that ended without a newline at EOF. The
+// fragment's keys only mutate pi — a final frame= with no following
+// out_time/progress key would never be emitted — so emit the accumulated state
+// once the fragment is parsed.
+func (w *progressPipeWriter) flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = true
+	if len(w.buf) > 0 {
+		w.line(string(w.buf))
+		w.buf = nil
+		w.emit(w.pi)
+	}
+}
+
+func (w *progressPipeWriter) line(s string) {
+	k, v, ok := strings.Cut(strings.TrimRight(s, "\r"), "=")
+	if !ok {
+		return
+	}
+	switch k {
+	case "frame":
+		w.pi.Frame = v
+	case "fps":
+		w.pi.FPS = strings.TrimSpace(v)
+	case "speed":
+		w.pi.Speed = strings.TrimSpace(v)
+	case "total_size":
+		w.pi.Bytes = parseInt64(strings.TrimSpace(v))
+	case "out_time_us", "out_time_ms":
+		// FFmpeg <5.x emitted the same microsecond value under the
+		// misleading name out_time_ms; accept both keys.
+		us, _ := strconv.ParseFloat(v, 64)
+		w.pi.Time = us / 1e6
+		if w.expectedDur > 0 {
+			w.pi.Percent = math.Max(0, math.Min(1, w.pi.Time/w.expectedDur))
+		}
+		w.pi.ETA = etaFromProgress(w.started, w.pi.Percent)
+		w.emit(w.pi)
+	case "progress":
+		if v == "end" {
+			w.pi.Percent = 1
+			w.pi.ETA = 0
+			w.emit(w.pi)
+		}
+	}
+}
+
+// childPipeWaitDelay bounds how long Run waits for the stdout/stderr copier
+// goroutines after the process exits. A wrapper script or crashed decoder can
+// leave a descendant holding the pipes open; without a bound those reads block
+// forever even though the encoder itself is already gone.
+var childPipeWaitDelay = 5 * time.Second
+
+func (e *Engine) runFFmpeg(ctx context.Context, args []string, expectedDur float64, progress func(progressInfo)) error {
+	if progress == nil {
+		progress = func(progressInfo) {}
+	}
+	cmd := exec.CommandContext(ctx, e.caps.FFmpeg, args...)
+	var stderr boundedTailWriter
+	pw := &progressPipeWriter{expectedDur: expectedDur, started: time.Now(), emit: progress}
+	cmd.Stdout = pw
+	cmd.Stderr = &stderr
+	// With io.Writer sinks, WaitDelay forcibly closes the copier pipes when the
+	// process has exited but descendants keep them open: Run returns
+	// ErrWaitDelay instead of hanging the worker. In the normal case Wait still
+	// waits for the copiers to finish, so no output is lost.
+	cmd.WaitDelay = childPipeWaitDelay
+	err := cmd.Run()
+	pw.flush()
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	if errors.Is(err, exec.ErrWaitDelay) {
+		if st := cmd.ProcessState; st != nil && st.ExitCode() == 0 {
+			// FFmpeg exited cleanly but a descendant kept its pipes open and
+			// WaitDelay force-closed the copiers. A completed mux is judged by
+			// output verification, not by the wedged plumbing.
+			err = nil
+		}
+	}
 	if err != nil {
-		return fmt.Errorf("ffmpeg: %s", strings.TrimSpace(errBuf.String()))
+		msg := strings.TrimSpace(stderr.String())
+		switch {
+		case errors.Is(err, exec.ErrWaitDelay):
+			if msg == "" {
+				msg = "process exited but its output pipes stayed open"
+			} else {
+				msg += " (output pipes did not close after exit)"
+			}
+		case msg == "":
+			// No diagnostics to quote — a Start failure or a signal kill must
+			// still surface the underlying error, not an empty "ffmpeg:".
+			return fmt.Errorf("ffmpeg: %w", err)
+		}
+		return fmt.Errorf("ffmpeg: %s", msg)
 	}
 	return nil
 }
