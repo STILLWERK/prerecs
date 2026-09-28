@@ -177,7 +177,7 @@ Required gate:
 - `go test -race -count=1 ./...`
 - Windows amd64 console build
 
-Regression tests lock Xvid Q2 Maximum to strict Q2 I/P/B quantizers, quality 6, VHQ4, B2, B-frame RD, B quantizer ratio 100 / offset 0, GOP 240, unpacked bitstream, one slice, and no QPel/GMC/masking/custom matrix. The FFmpeg fallback is separately locked to Q2 / full RD / B0.
+Regression tests lock SHARE / Xvid Q2 to strict Q2 I/P/B quantizers, quality 6, VHQ4, B2, B-frame RD, B quantizer ratio 100 / offset 0, GOP 240, unpacked bitstream, one slice, and no QPel/GMC/masking/custom matrix. The FFmpeg fallback is separately locked to Q2 / full RD / B0.
 
 ## Four-file native Maximum batch
 
@@ -454,7 +454,7 @@ One real 2560x1440 Lagarith master (`nade_cine_green.avi`, 641 frames) was run t
 - MagicYUV Lossless;
 - Ut Video Lossless;
 - Xvid Q3 Small;
-- Xvid Q1 Maximum.
+- Xvid Q1 Extreme.
 
 ProRes 4444 was tested separately with a 30-frame FFV1 RGB/alpha source. Final result: profile 4444, alpha-capable decode, 30/30 frames, 30 fps, and identical source/output alpha-plane MD5. The same RGB source also passed the FFmpeg Xvid fallback after the GBR/YUV metadata fix.
 

@@ -39,6 +39,30 @@ jobs:
       - name: Race tests
         run: go test -race -count=1 ./...
 
+  go-floor:
+    name: Go 1.23 floor (documented minimum)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.23'
+          cache-dependency-path: go.mod
+
+      # Language features stay gated by the go directive, but stdlib symbols
+      # added after 1.23 compile fine on newer toolchains — only the floor
+      # toolchain proves the documented minimum still works.
+      - name: Vet and build at floor
+        run: |
+          go vet ./...
+          go build ./...
+
+      - name: Test at floor
+        run: go test -count=1 ./...
+
   windows-build:
     name: Windows amd64 CGO-disabled build
     runs-on: windows-latest
@@ -59,6 +83,16 @@ jobs:
           $env:GOOS = 'windows'
           $env:GOARCH = 'amd64'
           go vet ./...
+
+      # The suite must also execute on the actual target OS: Windows-tagged
+      # sources (ansi_windows.go, vfw_windows.go) and the GOOS=="windows"
+      # branches never run on the Linux legs. FFmpeg-dependent tests skip
+      # cleanly when ffmpeg is absent.
+      - name: Test on Windows
+        shell: pwsh
+        run: |
+          $env:CGO_ENABLED = '0'
+          go test -count=1 ./...
 
       - name: Build and check version
         shell: pwsh

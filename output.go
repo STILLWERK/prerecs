@@ -58,6 +58,10 @@ func outputCandidates(src, custom, preset string) ([]string, string, error) {
 	return existing, reserved, nil
 }
 
+// maxOutputSlot bounds both reuse discovery and new reservations so a run can
+// never inherit or create absurdly numbered outputs.
+const maxOutputSlot = 999999
+
 // scanOutputSlots lists base once and returns the pre-existing output paths
 // matching prefix/ext, sorted by slot number, plus the set of claimed slots.
 // Sparse numbered outputs are discovered for reuse even when earlier slots
@@ -98,7 +102,7 @@ func scanOutputSlots(base, prefix, ext string) ([]string, map[int]bool, error) {
 				continue
 			}
 			n = parseInt(mid)
-			if n < 2 || n > 999999 {
+			if n < 2 || n > maxOutputSlot {
 				continue
 			}
 		} else {
@@ -125,7 +129,7 @@ func scanOutputSlots(base, prefix, ext string) ([]string, map[int]bool, error) {
 // reuse list — the reuse check could otherwise verify a file the owner later
 // deletes on its own verification failure.
 func reserveOutputSlot(base, prefix, ext string, taken map[int]bool) (string, error) {
-	for n := 1; n <= len(taken)+1 && n < 100000; n++ {
+	for n := 1; n <= len(taken)+1 && n <= maxOutputSlot; n++ {
 		if taken[n] {
 			continue
 		}
@@ -159,6 +163,25 @@ func reserveOutputSlot(base, prefix, ext string, taken map[int]bool) (string, er
 func releaseOutputReservation(path string) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
+	}
+	return nil
+}
+
+// checkReservedOutput re-validates the O_EXCL reservation immediately before a
+// backend opens the path for writing. The reservation holds the *name*, but
+// ffmpeg/xvid later reopen the path itself: in a shared output directory an
+// attacker could swap the placeholder for a link and redirect the encode
+// elsewhere, so a non-regular inode here fails the item instead of encoding.
+// This is best-effort narrowing, not a closed window: the child still reopens
+// the path after the check, and a hardlink swap survives Lstat entirely (a
+// hardlink *is* a regular file) — OS hardlink protections cover that case.
+func checkReservedOutput(path string) error {
+	st, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("reserved output: %w", err)
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("reserved output %s is no longer a regular file", filepath.Base(path))
 	}
 	return nil
 }

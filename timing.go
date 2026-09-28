@@ -41,6 +41,12 @@ func parseRat(v string) (*big.Rat, error) {
 	if _, ok := r.SetString(s); !ok || r.Sign() <= 0 {
 		return nil, fmt.Errorf("invalid positive number/fraction %q", v)
 	}
+	// The exact rational can exceed float64 range at both ends: 1e309 becomes
+	// +Inf and 1e-999 underflows to +0. A rate that cannot be represented as a
+	// positive finite float is unusable downstream and must be rejected.
+	if f := ratFloat(r); !(f > 0) || math.IsInf(f, 0) {
+		return nil, fmt.Errorf("invalid positive number/fraction %q", v)
+	}
 	return r, nil
 }
 
@@ -60,6 +66,9 @@ func parseRatAllowZero(v string) (*big.Rat, error) {
 	r := new(big.Rat)
 	if _, ok := r.SetString(v); !ok || r.Sign() <= 0 {
 		return nil, errors.New("bad rational")
+	}
+	if f := ratFloat(r); !(f > 0) || math.IsInf(f, 0) {
+		return nil, errors.New("unrepresentable rational")
 	}
 	return r, nil
 }

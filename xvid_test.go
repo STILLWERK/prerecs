@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -264,6 +265,13 @@ func TestFakeXvidEncrawHelper(t *testing.T) {
 	}
 	writeNoise(os.Stdout, "PRERECS_FAKE_XVID_STDOUT_BYTES")
 	writeNoise(os.Stderr, "PRERECS_FAKE_XVID_STDERR_BYTES")
+	if os.Getenv("PRERECS_FAKE_XVID_ORPHAN_PIPES") != "" && runtime.GOOS != "windows" {
+		// A surviving descendant holding stdout/stderr open is the wedge the
+		// post-exit WaitDelay bound exists for: without it Wait would hang.
+		orphan := exec.Command("sh", "-c", "sleep 5")
+		orphan.Stdout, orphan.Stderr = os.Stdout, os.Stderr
+		_ = orphan.Start()
+	}
 	if code := os.Getenv("PRERECS_FAKE_XVID_EXIT"); code != "" {
 		n, _ := strconv.Atoi(code)
 		fmt.Fprintln(os.Stderr, "fake xvid: forced failure")
@@ -426,5 +434,55 @@ func TestNativeXvidFakeCancellation(t *testing.T) {
 	}
 	if fileExists(out + ".video.tmp.m4v") {
 		t.Fatal("temporary stream leaked after cancellation")
+	}
+}
+
+// A clean encoder exit with a descendant still holding the pipes must be
+// normalized through ErrWaitDelay, not hang the poll loop or fail the item.
+func TestNativeXvidSurvivesDescendantHeldPipes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh orphan helper is not portable to Windows")
+	}
+	e := nativeTestEngine(t)
+	td := t.TempDir()
+	es, frames := makeRealM4V(t, e.caps.FFmpeg, td, 10)
+	installFakeXvid(t, es, map[string]string{"PRERECS_FAKE_XVID_ORPHAN_PIPES": "1"})
+	old := childPipeWaitDelay
+	childPipeWaitDelay = 300 * time.Millisecond
+	t.Cleanup(func() { childPipeWaitDelay = old })
+	info := MediaInfo{Path: filepath.Join(td, "src.avi"), Codec: "ffv1", FPS: "30/1", FPSFloat: 30, FrameCount: int64(frames), FrameCountExact: true, Duration: float64(frames) / 30}
+	out := filepath.Join(td, "out.avi")
+	start := time.Now()
+	_, _, err := e.runNativeXvid(context.Background(), info, ConvertOptions{Preset: "xvid_compact", StripAudio: true}, out, info.FrameCount, func(progressInfo) {})
+	if err != nil {
+		t.Fatalf("clean exit behind wedged pipes must succeed: %v", err)
+	}
+	// The bound must sit below the orphan's 5 s pipe hold: without WaitDelay,
+	// Wait would block until the descendant exits — 20 s of slack could not
+	// tell that regression from a pass.
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Fatalf("wedged descendant pipes were not bounded: %s", elapsed)
+	}
+	if !fileExists(out) {
+		t.Fatal("remuxed AVI missing after wedged-pipe recovery")
+	}
+}
+
+// A failing FFmpeg wrap must surface as a remux failure, not be hidden behind
+// the encoder's success.
+func TestNativeXvidRemuxFailureFails(t *testing.T) {
+	e := nativeTestEngine(t)
+	td := t.TempDir()
+	garbage := filepath.Join(td, "garbage.m4v")
+	if err := os.WriteFile(garbage, []byte("definitely not an mpeg4 elementary stream"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	installFakeXvid(t, garbage, nil)
+	info := MediaInfo{Path: filepath.Join(td, "src.avi"), Codec: "ffv1", FPS: "30/1", FPSFloat: 30, FrameCount: 10, Duration: 1.0 / 3}
+	out := filepath.Join(td, "out.avi")
+	// frameBound 0 skips the VOP gate so the remux failure itself is reached.
+	_, _, err := e.runNativeXvid(context.Background(), info, ConvertOptions{Preset: "xvid_compact", StripAudio: true}, out, 0, func(progressInfo) {})
+	if err == nil || !strings.Contains(err.Error(), "remux") {
+		t.Fatalf("expected remux failure, got %v", err)
 	}
 }

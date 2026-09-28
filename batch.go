@@ -54,7 +54,13 @@ func reconcileScannedInput(info *MediaInfo, count int64, ui theme, rep itemRepor
 		info.FPS, info.FPSFloat = "", 0
 		info.Duration = 0
 	}
-	if info.FPSFloat > 0 {
+	if info.FPSFloat > 0 && info.Duration > 0 {
+		// Refresh duration against the exact count only when the rate was
+		// corroborated by a real duration above. With Duration == 0 the rate
+		// passed unchallenged; fabricating an expected duration from it would
+		// let a stale rate manufacture the verification it is judged against
+		// (and falsely fail honest passthrough outputs that carry real
+		// timestamps).
 		info.Duration = float64(count) / info.FPSFloat
 	}
 }
@@ -124,7 +130,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 				if statErr != nil || (srcStat != nil && candStat.ModTime().Before(srcStat.ModTime())) {
 					continue
 				}
-				rep.line(fmt.Sprintf("Existing output detected: %s", strictConsoleText(filepath.Base(cand))))
+				rep.line(fmt.Sprintf("Existing output detected: %s", oneLine(filepath.Base(cand))))
 				rep.line("Checking it before deciding whether to re-encode...")
 				outInfo, probeErr := probeMediaBound(ctx, e.caps.FFprobe, cand, false)
 				if probeErr != nil {
@@ -195,6 +201,18 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		}
 	}
 	item.Output = out
+
+	// The reservation claimed the name, not the inode: re-check the path is
+	// still the regular file we created before handing it to a subprocess
+	// that reopens and truncates it (a swapped-in link would write elsewhere).
+	if err := checkReservedOutput(out); err != nil {
+		item.Status = "failed"
+		item.Message = err.Error()
+		rep.line(ui.red("FAILED") + " " + strictConsoleText(err.Error()))
+		// Deliberately no releaseOutputReservation: the inode here may not be
+		// the placeholder we created, so nothing is removed by name.
+		return item
+	}
 
 	// removeOut deletes the file this run produced. A failed removal is
 	// surfaced rather than swallowed: on Windows a transient lock can refuse
@@ -475,7 +493,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		}
 		rep.line(msg)
 	}
-	rep.line("Output: " + strictConsoleText(out))
+	rep.line("Output: " + oneLine(out))
 	return item
 }
 
@@ -509,8 +527,16 @@ func batchWorkerCount(opts ConvertOptions, infos []MediaInfo) int {
 	return workers
 }
 
+// Test seams: the parallel orchestration below only triggers when
+// batchWorkerCount returns >= 2, which needs more CPUs than typical CI has.
+// Substituting these in tests exercises the fan-out deterministically.
+var (
+	processItemFunc      = processItem
+	batchWorkerCountFunc = batchWorkerCount
+)
+
 func runBatch(ctx context.Context, ui theme, e *Engine, infos []MediaInfo, opts ConvertOptions) BatchResult {
-	workers := batchWorkerCount(opts, infos)
+	workers := batchWorkerCountFunc(opts, infos)
 	if workers <= 1 {
 		result := BatchResult{Items: make([]ItemResult, 0, len(infos))}
 		fmt.Println(ui.bold("CONVERTING"))
@@ -518,8 +544,8 @@ func runBatch(ctx context.Context, ui theme, e *Engine, infos []MediaInfo, opts 
 			if ctx.Err() != nil {
 				break
 			}
-			fmt.Printf("\n  [%d/%d] %s\n", i+1, len(infos), strictConsoleText(filepath.Base(info.Path)))
-			item := processItem(ctx, ui, e, info, opts, sequentialReporter(ui))
+			fmt.Printf("\n  [%d/%d] %s\n", i+1, len(infos), oneLine(filepath.Base(info.Path)))
+			item := processItemFunc(ctx, ui, e, info, opts, sequentialReporter(ui))
 			addBatchItem(&result, item)
 		}
 		return result
@@ -551,7 +577,7 @@ func runBatch(ctx context.Context, ui theme, e *Engine, infos []MediaInfo, opts 
 					finish:   func() {},
 				}
 				printer.line(j.index, name, "START")
-				item := processItem(ctx, ui, e, j.info, opts, rep)
+				item := processItemFunc(ctx, ui, e, j.info, opts, rep)
 				done <- doneItem{index: j.index, item: item}
 				if ctx.Err() != nil {
 					return

@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -64,6 +66,47 @@ func probeMediaBound(ctx context.Context, ffprobe, path string, countFrames bool
 	return probeMediaContext(pctx, ffprobe, path, countFrames)
 }
 
+// maxProbeJSONBytes bounds the JSON document buffered from ffprobe stdout. A
+// hostile or pathological container can inflate metadata arbitrarily; the
+// probe timeout bounds duration but cannot bound bytes on its own.
+const maxProbeJSONBytes = 16 << 20
+
+// maxPlausibleDuration is a generosity bound on container-reported duration
+// in seconds (~100 years): past it, the metadata is impeached as corrupt and
+// the duration treated as absent rather than trusted for verification math.
+const maxPlausibleDuration = 100 * 365.25 * 24 * 3600
+
+// plausibleDuration returns the reported duration, or 0 when it is unusable:
+// NaN, negative, infinite, or absurdly large values (a claimed 1e300 s would
+// guarantee a spurious verification mismatch on an honest encode) are all
+// impeached as corrupt metadata.
+func plausibleDuration(v float64) float64 {
+	if !(v > 0 && v <= maxPlausibleDuration) {
+		return 0
+	}
+	return v
+}
+
+// cappedBuffer accumulates a stream up to a byte ceiling, then discards the
+// rest while flagging truncation. stdout of a probe is consumed as a whole
+// document, so unlike boundedTailWriter it cannot just keep the tail — a
+// cut-off JSON body must be reported rather than mis-parsed.
+type cappedBuffer struct {
+	buf       bytes.Buffer
+	truncated bool
+}
+
+func (w *cappedBuffer) Write(p []byte) (int, error) {
+	if rem := maxProbeJSONBytes - w.buf.Len(); len(p) > rem {
+		if rem > 0 {
+			w.buf.Write(p[:rem])
+		}
+		w.truncated = true
+		return len(p), nil
+	}
+	return w.buf.Write(p)
+}
+
 func probeMediaContext(ctx context.Context, ffprobe, path string, countFrames bool) (MediaInfo, error) {
 	args := []string{"-v", "error"}
 	if countFrames {
@@ -72,16 +115,44 @@ func probeMediaContext(ctx context.Context, ffprobe, path string, countFrames bo
 	args = append(args, "-show_streams", "-show_format", "-of", "json", path)
 	cmd := exec.CommandContext(ctx, ffprobe, args...)
 	cmd.WaitDelay = time.Second
-	out, err := cmd.CombinedOutput()
-	if ctx.Err() != nil {
+	// stdout and stderr stay in separate sinks: CombinedOutput would interleave
+	// non-fatal error lines into the JSON document and fail the parse.
+	var stdout cappedBuffer
+	var stderr boundedTailWriter
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		if st := cmd.ProcessState; st != nil && st.ExitCode() == 0 {
+			// ffprobe exited cleanly but a descendant kept its pipes open and
+			// WaitDelay expired — the buffered JSON document is complete.
+			err = nil
+		}
+	}
+	if err != nil && ctx.Err() != nil {
+		// A killed probe under an active cancellation reports the
+		// cancellation, not the signal — same ordering as runFFmpeg. A clean
+		// exit (err == nil) instead falls through: the buffered document is
+		// complete and wins over a cancellation that raced it.
 		return MediaInfo{}, ctx.Err()
 	}
 	if err != nil {
-		return MediaInfo{}, fmt.Errorf("ffprobe: %s", strings.TrimSpace(string(out)))
+		// oneLine: the basename is untrusted text embedded in single-line
+		// error rendering; newlines in it must not forge output lines.
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			// A Start failure or signal kill carries no diagnostics; surface
+			// the underlying error instead of an empty "ffprobe:".
+			return MediaInfo{}, fmt.Errorf("ffprobe %s: %w", oneLine(filepath.Base(path)), err)
+		}
+		return MediaInfo{}, fmt.Errorf("ffprobe %s: %s", oneLine(filepath.Base(path)), msg)
+	}
+	if stdout.truncated {
+		return MediaInfo{}, fmt.Errorf("ffprobe %s: metadata output exceeded %d bytes", oneLine(filepath.Base(path)), maxProbeJSONBytes)
 	}
 	var doc ffprobeDoc
-	if err := json.Unmarshal(out, &doc); err != nil {
-		return MediaInfo{}, err
+	if err := json.Unmarshal(stdout.buf.Bytes(), &doc); err != nil {
+		return MediaInfo{}, fmt.Errorf("ffprobe %s: unparsable metadata output: %w", oneLine(filepath.Base(path)), err)
 	}
 	vi := -1
 	for i := range doc.Streams {
@@ -94,9 +165,12 @@ func probeMediaContext(ctx context.Context, ffprobe, path string, countFrames bo
 		return MediaInfo{}, errors.New("no video stream found")
 	}
 	sv := doc.Streams[vi]
-	dur := parseFloat(sv.Duration)
+	// A corrupt stream-level duration must not shadow a valid format-level
+	// one: both levels pass through the same impeachment before the duration
+	// is trusted for the frame estimate or the verification math below.
+	dur := plausibleDuration(parseFloat(sv.Duration))
 	if dur == 0 {
-		dur = parseFloat(doc.Format.Duration)
+		dur = plausibleDuration(parseFloat(doc.Format.Duration))
 	}
 	frames := parseInt64(sv.NBFrames)
 	// Compressed community files frequently carry stale AVI/container frame
@@ -129,7 +203,11 @@ func probeMediaContext(ctx context.Context, ffprobe, path string, countFrames bo
 		fpsFloat = ratFloat(fpsRat)
 	}
 	if frames <= 0 && dur > 0 && fpsFloat > 0 {
-		frames = int64(math.Round(dur * fpsFloat))
+		// Bound well inside int64's exact-integer range: values approaching
+		// 2^63 can Round to an unrepresentable boundary.
+		if est := dur * fpsFloat; est > 0 && est < 1<<62 {
+			frames = int64(math.Round(est))
+		}
 		frameCountExact = false
 	}
 	bit := parseInt(sv.BitsPerRawSample)

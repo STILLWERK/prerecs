@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased — Security and correctness hardening patch
+
+- `avifil32.dll` is now loaded with `LOAD_LIBRARY_SEARCH_SYSTEM32` only: it is not a KnownDLL, so the default Windows DLL search order could pick up a payload library planted beside the executable or in the working directory on the first VfW call.
+- FFprobe's stdout and stderr are captured separately — a non-fatal diagnostic line can no longer corrupt the JSON document and reject a valid file — and the JSON capture is bounded to 16 MiB. Probe failures now name the tool and file instead of returning a bare `invalid character`/`ffprobe:` error, and a clean ffprobe exit with a descendant-held pipe (WaitDelay) is treated as the success it is.
+- A clean FFmpeg or native-Xvid exit can no longer be reclassified as cancelled (and the completed output deleted) when Ctrl+C lands between process exit and the cancellation check; the produced output is judged on its own merits. The native-Xvid classification is deterministic on both select arms.
+- Container-reported durations that are NaN, infinite, or absurdly large are impeached as corrupt instead of driving frame estimates and verification math, and a corrupt stream-level duration can no longer shadow a valid format-level one. Frame-rate rationals that over/underflow float64 (e.g. `1e309`, `1e-999`) are rejected at parse.
+- Reserved output slots are re-checked to be regular files immediately before encode (a swapped-in link fails the item), and the predictable native-Xvid temporary `.m4v` path refuses non-regular inodes. Reuse discovery and new reservations now share one slot bound.
+- ffprobe-reported color metadata is whitelisted to the spellings FFmpeg emits before it can be interpolated into filtergraphs or output arguments; unrecognized values are dropped rather than trusted.
+- A scanned frame rate no longer fabricates an expected duration it was never corroborated by, `filepath.Abs` failures no longer collapse inputs onto an empty path, and Windows inputs dedupe case-insensitively. Folder openers (`open`/`xdg-open`/`explorer`) are reaped instead of leaking child processes, and single-line console fields fold embedded newlines so a crafted filename cannot forge status lines.
+- New test coverage: parallel batch orchestration and cancellation, native-Xvid descendant-pipe (WaitDelay) survival, ffprobe error paths, Windows-style input dedupe, reservation integrity, console sanitizers, and fuzz seeds for the path/rational/console parsers.
+- CI now exercises the documented Go 1.23 floor (vet, build, test) and runs the suite on Windows; release tags are narrowed to `vX.Y.Z`, and Dependabot watches workflow actions.
+
 ## v1.0.5 — Compatibility and lifecycle patch
 
 - The documented FFmpeg floor is now enforced at startup: PreRecs requires FFmpeg 5.1 or newer (`-fps_mode` does not exist in 5.0) and rejects older builds once, instead of failing mid-batch. Snapshot/git builds without a dotted release number are checked for `-fps_mode` support directly. `-enc_time_base filter`, which silently required FFmpeg 6.1, is no longer emitted — the `settb`/`setpts`/`fps` chain already produces the constant-rate timestamps it pinned, so FFmpeg 5.1–6.0 now work everywhere.

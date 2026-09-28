@@ -231,6 +231,39 @@ func proresRGBConversionFilters(info MediaInfo, preset string) []string {
 	return []string{"format=gbrp", "scale=out_color_matrix=bt709:out_range=tv", "format=" + pix}
 }
 
+// Known FFmpeg color metadata enum names, in the spellings ffprobe actually
+// emits (av_color_space_name/av_color_transfer_name/av_color_primaries_name —
+// not the AVOption aliases, which differ: ffprobe says "iec61966-2-1" and
+// "bt2020-10", never "iec61966_2_1"/"bt2020_10"). ffprobe reports these
+// verbatim and they are interpolated into filtergraph strings, so
+// unrecognized spellings are dropped rather than trusted — a surprising value
+// must never become filter syntax.
+var (
+	validColorSpaces = map[string]bool{
+		// gbr is ffprobe's reported colorspace for RGB-matrix sources; the
+		// output side deliberately drops it for YUV encoders (colorOutputArgs).
+		"gbr": true, "bt709": true, "fcc": true, "bt470bg": true,
+		"smpte170m": true, "smpte240m": true, "ycgco": true,
+		"bt2020nc": true, "bt2020c": true, "smpte2085": true,
+		"chroma-derived-nc": true, "chroma-derived-c": true, "ictcp": true,
+		// Emitted by FFmpeg ≥7.2; accepted here because the probing ffprobe
+		// and the encoding ffmpeg are the same build.
+		"ipt-c2": true, "ycgco-re": true, "ycgco-ro": true,
+	}
+	validColorTransfers = map[string]bool{
+		"bt709": true, "bt470m": true, "bt470bg": true, "smpte170m": true,
+		"smpte240m": true, "linear": true, "log100": true, "log316": true,
+		"iec61966-2-4": true, "bt1361e": true, "iec61966-2-1": true,
+		"bt2020-10": true, "bt2020-12": true, "smpte2084": true,
+		"smpte428": true, "arib-std-b67": true,
+	}
+	validColorPrimaries = map[string]bool{
+		"bt709": true, "bt470m": true, "bt470bg": true, "smpte170m": true,
+		"smpte240m": true, "film": true, "bt2020": true, "smpte428": true,
+		"smpte431": true, "smpte432": true, "jedec-p22": true, "ebu3213": true,
+	}
+)
+
 func colorFilter(i MediaInfo) string {
 	p := []string{}
 	if i.ColorRange == "tv" {
@@ -238,13 +271,13 @@ func colorFilter(i MediaInfo) string {
 	} else if i.ColorRange == "pc" {
 		p = append(p, "range=full")
 	}
-	if i.ColorSpace != "" && i.ColorSpace != "unknown" {
+	if i.ColorSpace != "" && i.ColorSpace != "unknown" && validColorSpaces[strings.ToLower(i.ColorSpace)] {
 		p = append(p, "colorspace="+i.ColorSpace)
 	}
-	if i.ColorTransfer != "" && i.ColorTransfer != "unknown" {
+	if i.ColorTransfer != "" && i.ColorTransfer != "unknown" && validColorTransfers[strings.ToLower(i.ColorTransfer)] {
 		p = append(p, "color_trc="+i.ColorTransfer)
 	}
-	if i.ColorPrimaries != "" && i.ColorPrimaries != "unknown" {
+	if i.ColorPrimaries != "" && i.ColorPrimaries != "unknown" && validColorPrimaries[strings.ToLower(i.ColorPrimaries)] {
 		p = append(p, "color_primaries="+i.ColorPrimaries)
 	}
 	if len(p) == 0 {
@@ -270,13 +303,13 @@ func colorOutputArgs(i MediaInfo, preset string) []string {
 	// prores_ks rejects it outright). Keep GBR as input metadata via setparams,
 	// but do not claim an RGB matrix on a YUV encoded stream.
 	yuvOutput := strings.HasPrefix(preset, "xvid") || strings.HasPrefix(preset, "prores")
-	if !rgbToProRes && i.ColorSpace != "" && i.ColorSpace != "unknown" && !(yuvOutput && i.ColorSpace == "gbr") {
+	if !rgbToProRes && i.ColorSpace != "" && i.ColorSpace != "unknown" && validColorSpaces[strings.ToLower(i.ColorSpace)] && !(yuvOutput && strings.EqualFold(i.ColorSpace, "gbr")) {
 		a = append(a, "-colorspace", i.ColorSpace)
 	}
-	if i.ColorTransfer != "" && i.ColorTransfer != "unknown" {
+	if i.ColorTransfer != "" && i.ColorTransfer != "unknown" && validColorTransfers[strings.ToLower(i.ColorTransfer)] {
 		a = append(a, "-color_trc", i.ColorTransfer)
 	}
-	if i.ColorPrimaries != "" && i.ColorPrimaries != "unknown" {
+	if i.ColorPrimaries != "" && i.ColorPrimaries != "unknown" && validColorPrimaries[strings.ToLower(i.ColorPrimaries)] {
 		a = append(a, "-color_primaries", i.ColorPrimaries)
 	}
 	return a

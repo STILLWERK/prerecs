@@ -222,7 +222,15 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 	// count VOP start codes for genuinely live frame progress. FFmpeg wraps the
 	// exact packets into a clean AVI after the encode; no video re-encode occurs.
 	tmpVideo := out + ".video.tmp.m4v"
-	_ = os.Remove(tmpVideo)
+	if st, statErr := os.Lstat(tmpVideo); statErr == nil {
+		// A leftover regular file from an interrupted run is removed; a link
+		// or other non-regular inode at this predictable name is not — xvid
+		// would happily overwrite whatever it points at.
+		if !st.Mode().IsRegular() {
+			return nil, 0, fmt.Errorf("refusing to use non-regular temporary stream path %s", tmpVideo)
+		}
+		_ = os.Remove(tmpVideo)
+	}
 	defer os.Remove(tmpVideo)
 
 	progress(progressInfo{Percent: 0, TotalFrames: info.FrameCount, Stage: "ENCODE"})
@@ -252,14 +260,15 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 	for !finished {
 		select {
 		case <-ctx.Done():
-			waitErr = ctx.Err()
 			// CommandContext kills the child, but wait for the Wait goroutine
 			// to reap it so the .m4v handle is released before the deferred
 			// Remove — Windows cannot unlink a file a process still holds.
 			select {
-			case <-done:
+			case res := <-done:
+				waitErr = res
 			case <-time.After(5 * time.Second):
 				reapTimedOut = true
+				waitErr = ctx.Err()
 			}
 			finished = true
 		case err := <-done:
@@ -297,11 +306,8 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 			progress(progressInfo{Percent: pct, FPS: fps, Frame: strconv.FormatInt(frames, 10), TotalFrames: info.FrameCount, ETA: etaFromProgress(started, pct), Stage: "ENCODE"})
 		}
 	}
-	if ctx.Err() != nil {
-		if reapTimedOut {
-			return nil, 0, fmt.Errorf("%w (encoder did not exit within 5s of cancellation; %s may remain locked)", ctx.Err(), tmpVideo)
-		}
-		return nil, 0, ctx.Err()
+	if reapTimedOut {
+		return nil, 0, fmt.Errorf("%w (encoder did not exit within 5s of cancellation; %s may remain locked)", ctx.Err(), tmpVideo)
 	}
 	if errors.Is(waitErr, exec.ErrWaitDelay) {
 		// The encoder exited while a descendant held its pipes open. A clean
@@ -311,6 +317,14 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 		}
 	}
 	if waitErr != nil {
+		// A non-clean exit under an active cancellation is cancelled — whether
+		// it arrived through the ctx.Done arm or as a buffered "signal: killed"
+		// picked by the select. Deterministic on both arms; a nil Wait (the
+		// encoder beat the kill) instead falls through and is judged by the
+		// stream checks below, matching runFFmpeg's ordering.
+		if ctx.Err() != nil {
+			return nil, 0, ctx.Err()
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = strings.TrimSpace(stdout.String())

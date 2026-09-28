@@ -196,3 +196,37 @@ func TestRatStringSane(t *testing.T) {
 		}
 	}
 }
+
+// ratStringSane must bound big.Rat parsing: the exponent-aware parser can
+// materialize huge numerators from tiny inputs like 1e999999999.
+func FuzzRationalParsers(f *testing.F) {
+	for _, s := range []string{
+		"30000/1001", "1e999999999", "0/0", "-5", "1.5", "240/1", "", "N/A",
+		"1e2", "0.1", "1/1e100000", "1e-9999", "1.7976931348623157e308", "1e309",
+	} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		if !ratStringSane(s) {
+			if _, err := parseRat(s); err == nil {
+				t.Fatalf("parseRat accepted %q rejected by ratStringSane", s)
+			}
+			if s != "" && s != "0/0" && s != "N/A" {
+				if _, err := parseRatAllowZero(s); err == nil {
+					t.Fatalf("parseRatAllowZero accepted %q rejected by ratStringSane", s)
+				}
+			}
+			return
+		}
+		if r, err := parseRat(s); err == nil {
+			if r.Sign() <= 0 || math.IsInf(ratFloat(r), 0) || math.IsNaN(ratFloat(r)) {
+				t.Fatalf("parseRat(%q) produced non-positive/non-finite", s)
+			}
+		}
+		if r, err := parseRatAllowZero(s); err == nil && r != nil {
+			if math.IsInf(ratFloat(r), 0) || math.IsNaN(ratFloat(r)) {
+				t.Fatalf("parseRatAllowZero(%q) produced non-finite", s)
+			}
+		}
+	})
+}

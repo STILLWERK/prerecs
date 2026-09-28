@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -752,5 +753,159 @@ func TestProcessItemEncodeCancelRemovesReservedOutput(t *testing.T) {
 	}
 	if item.Output != "" && fileExists(item.Output) {
 		t.Fatalf("cancelled item left reserved output behind: %s", item.Output)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Batch orchestration seams (processItemFunc / batchWorkerCountFunc) make the
+// parallel path testable on machines too small to reach multiple workers.
+// ---------------------------------------------------------------------------
+
+func installBatchSeams(t *testing.T, workers int, fn func(context.Context, theme, *Engine, MediaInfo, ConvertOptions, itemReporter) ItemResult) {
+	t.Helper()
+	oldPI, oldWC := processItemFunc, batchWorkerCountFunc
+	t.Cleanup(func() { processItemFunc, batchWorkerCountFunc = oldPI, oldWC })
+	batchWorkerCountFunc = func(ConvertOptions, []MediaInfo) int { return workers }
+	processItemFunc = fn
+}
+
+// The parallel worker pool must deliver every item exactly once, in input
+// order, regardless of how interleaved the workers' completion order is.
+func TestRunBatchParallelOrderingAndCompletion(t *testing.T) {
+	const n = 7
+	var mu sync.Mutex
+	started := map[string]bool{}
+	installBatchSeams(t, 3, func(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts ConvertOptions, rep itemReporter) ItemResult {
+		mu.Lock()
+		started[info.Path] = true
+		mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+		return ItemResult{Source: info.Path, Status: "ok", Output: filepath.Join("out", filepath.Base(info.Path)+".avi")}
+	})
+	infos := make([]MediaInfo, 0, n)
+	for i := 0; i < n; i++ {
+		infos = append(infos, MediaInfo{Path: fmt.Sprintf("src%02d.avi", i)})
+	}
+	result := runBatch(context.Background(), theme{}, &Engine{}, infos, ConvertOptions{})
+	if result.Successes != n || len(result.Items) != n {
+		t.Fatalf("successes=%d items=%d", result.Successes, len(result.Items))
+	}
+	for i, it := range result.Items {
+		if it.Source != infos[i].Path {
+			t.Fatalf("item %d is %s, want %s — parallel results must stay input-ordered", i, it.Source, infos[i].Path)
+		}
+	}
+	if len(started) != n {
+		t.Fatalf("only %d/%d items ran", len(started), n)
+	}
+}
+
+// Cancelling mid-fanout must return promptly with the already-finished items
+// recorded and no hang on the jobs/done channels.
+func TestRunBatchParallelCancellation(t *testing.T) {
+	installBatchSeams(t, 4, func(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts ConvertOptions, rep itemReporter) ItemResult {
+		select {
+		case <-ctx.Done():
+			return ItemResult{Source: info.Path, Status: "cancelled"}
+		case <-time.After(150 * time.Millisecond):
+			return ItemResult{Source: info.Path, Status: "ok"}
+		}
+	})
+	infos := make([]MediaInfo, 0, 8)
+	for i := 0; i < 8; i++ {
+		infos = append(infos, MediaInfo{Path: fmt.Sprintf("src%02d.avi", i)})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	result := runBatch(ctx, theme{}, &Engine{}, infos, ConvertOptions{})
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Fatalf("cancelled batch did not return promptly: %s", elapsed)
+	}
+	// No fake can finish inside the 50ms deadline (each takes 150ms), and
+	// addBatchItem drops cancelled items — so the tally must be empty.
+	if len(result.Items) != 0 || result.Successes != 0 || result.Failures != 0 || result.Skipped != 0 {
+		t.Fatalf("cancelled run leaked items into the tally: %+v", result)
+	}
+}
+
+// A scanned source whose frame rate was never corroborated by a duration must
+// not have a fabricated duration installed: passthrough outputs carry real
+// timestamps, and comparing them against an invented expectation produces
+// false verification failures.
+func TestReconcileScannedInputDoesNotFabricateDuration(t *testing.T) {
+	rep, _ := captureReporter()
+
+	// Rate present but duration unknown: keep the rate, leave duration empty.
+	info := MediaInfo{FPS: "30/1", FPSFloat: 30, Duration: 0}
+	reconcileScannedInput(&info, 90, theme{}, rep)
+	if info.Duration != 0 {
+		t.Fatalf("uncorroborated rate manufactured duration %v", info.Duration)
+	}
+	if info.FPSFloat != 30 || info.FrameCount != 90 || !info.FrameCountExact {
+		t.Fatalf("scan results should be retained: %+v", info)
+	}
+
+	// Corroborated rate+duration: duration is refreshed against the count.
+	info = MediaInfo{FPS: "30/1", FPSFloat: 30, Duration: 3.0}
+	reconcileScannedInput(&info, 90, theme{}, rep)
+	if math.Abs(info.Duration-3.0) > 1e-9 {
+		t.Fatalf("corroborated duration became %v", info.Duration)
+	}
+
+	// Contradictory rate: both fields are impeached and cleared.
+	info = MediaInfo{FPS: "60/1", FPSFloat: 60, Duration: 3.0}
+	reconcileScannedInput(&info, 90, theme{}, rep)
+	if info.FPS != "" || info.FPSFloat != 0 || info.Duration != 0 {
+		t.Fatalf("impeached metadata survived: %+v", info)
+	}
+}
+
+// The Vulkan ProRes fast path must fall back to CPU prores_ks when the GPU
+// encode fails, keeping the reserved output name and producing a verified file.
+func TestProcessItemVulkanFallsBackToCPU(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim is not portable to Windows")
+	}
+	caps, enc, err := detectCapabilities()
+	if err != nil {
+		t.Skip(err)
+	}
+	if !enc["prores_ks"] || !enc["ffv1"] {
+		t.Skip("prores_ks or ffv1 unavailable")
+	}
+	td := t.TempDir()
+	src := filepath.Join(td, "src.mkv")
+	if b, err := exec.Command(caps.FFmpeg,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=64x64:rate=30",
+		"-frames:v", "30", "-c:v", "ffv1", "-an", src,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("source: %v %s", err, b)
+	}
+	// A shim that fails only the Vulkan encoder and delegates everything else
+	// to the real ffmpeg binary.
+	shim := filepath.Join(td, "ffmpeg")
+	script := "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = \"prores_ks_vulkan\" ]; then\n    echo 'no vulkan device' >&2\n    exit 1\n  fi\ndone\nexec '" + caps.FFmpeg + "' \"$@\"\n"
+	if err := os.WriteFile(shim, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{caps: caps, enc: enc}
+	e.caps.FFmpeg = shim
+	e.caps.HasProResVulkan = true
+	info, err := probeMedia(caps.FFprobe, src, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, lines := captureReporter()
+	item := processItem(context.Background(), theme{}, e, info, ConvertOptions{Preset: "prores_lt"}, rep)
+	if item.Status != "ok" {
+		t.Fatalf("status=%q message=%q lines=%v", item.Status, item.Message, *lines)
+	}
+	if !strings.Contains(item.Backend, "CPU prores_ks") {
+		t.Fatalf("backend=%q, want CPU prores_ks fallback", item.Backend)
+	}
+	if !fileExists(item.Output) {
+		t.Fatalf("verified output missing: %s", item.Output)
 	}
 }

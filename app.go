@@ -225,14 +225,22 @@ func resetInteractiveJob(c cliConfig) cliConfig {
 // Folder launchers are intentionally detached from conversion contexts: Start
 // returns immediately, and the opener must be allowed to outlive the job.
 func openFolder(path string) error {
+	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		return exec.Command("explorer.exe", path).Start()
+		cmd = exec.Command("explorer.exe", path)
 	case "darwin":
-		return exec.Command("open", path).Start()
+		cmd = exec.Command("open", path)
 	default:
-		return exec.Command("xdg-open", path).Start()
+		cmd = exec.Command("xdg-open", path)
 	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	// Reap the detached opener: without a Wait, each invocation leaves a
+	// zombie on Unix and an unreleased process handle on Windows.
+	go func() { _ = cmd.Wait() }()
+	return nil
 }
 
 func pauseIfDoubleClicked() {

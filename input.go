@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 )
@@ -88,7 +89,7 @@ func trimOuterQuotes(s string) string {
 }
 
 func expandInputs(items []string) ([]string, error) {
-	seen := map[string]bool{}
+	seen := map[string][]string{}
 	out := []string{}
 	for _, raw := range items {
 		p := trimOuterQuotes(strings.TrimSpace(raw))
@@ -124,21 +125,59 @@ func expandInputs(items []string) ([]string, error) {
 			}
 			sort.Strings(names)
 			for _, n := range names {
-				a, _ := filepath.Abs(n)
-				if !seen[a] {
-					seen[a] = true
-					out = append(out, a)
-				}
+				out = appendUniqueInput(out, seen, absOrSelf(n))
 			}
 			continue
 		}
-		a, _ := filepath.Abs(p)
-		if !seen[a] {
-			seen[a] = true
-			out = append(out, a)
-		}
+		out = appendUniqueInput(out, seen, absOrSelf(p))
 	}
 	return out, nil
+}
+
+// absOrSelf keeps the caller's spelling when filepath.Abs cannot resolve —
+// an ignored error would otherwise collapse distinct failures into "".
+func absOrSelf(p string) string {
+	a, err := filepath.Abs(p)
+	if err != nil {
+		return p
+	}
+	return a
+}
+
+// appendUniqueInput adds p unless a kept entry already refers to the same
+// filesystem object. The dedupe key alone is not decisive on Windows: NTFS
+// directories can opt into case sensitivity, where "MIXED.AVI" and
+// "mixed.avi" are distinct files that fold to one key.
+func appendUniqueInput(out []string, seen map[string][]string, p string) []string {
+	key := inputDedupeKey(p)
+	for _, prev := range seen[key] {
+		if sameInputFile(prev, p) {
+			return out
+		}
+	}
+	seen[key] = append(seen[key], p)
+	return append(out, p)
+}
+
+// sameInputFile confirms a key collision through the filesystem: identical
+// spellings, or paths that stat to the same object, are duplicates.
+func sameInputFile(a, b string) bool {
+	if a == b {
+		return true
+	}
+	sa, ea := os.Stat(a)
+	sb, eb := os.Stat(b)
+	return ea == nil && eb == nil && os.SameFile(sa, sb)
+}
+
+// inputDedupeKey matches the output-stem convention: NTFS is case-insensitive,
+// so differently-cased spellings of the same file must dedupe on Windows or
+// the same source would be enqueued twice and collide on output slots.
+func inputDedupeKey(p string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(p)
+	}
+	return p
 }
 
 // generatedOutputSuffixes are the canonical preset tokens PreRecs appends to
