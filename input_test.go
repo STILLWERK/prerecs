@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -122,4 +123,35 @@ func TestExpandInputsSkipsTempStream(t *testing.T) {
 	if len(got) != 1 || filepath.Base(got[0]) != "clip.avi" {
 		t.Fatalf("expandInputs=%v, want only clip.avi", got)
 	}
+}
+
+func TestInputDedupeKey(t *testing.T) {
+	a := filepath.Join("D:", "Clips", "MIXED.AVI")
+	b := filepath.Join("D:", "clips", "mixed.avi")
+	if runtime.GOOS == "windows" {
+		if inputDedupeKey(a) != inputDedupeKey(b) {
+			t.Fatalf("NTFS case-folded paths must dedupe: %q vs %q", a, b)
+		}
+	} else if inputDedupeKey(a) != a {
+		t.Fatalf("non-Windows dedupe key must keep the path verbatim")
+	}
+}
+
+func FuzzParsePathInput(f *testing.F) {
+	for _, s := range []string{
+		`"a b.avi" c.avi`, `a;b`, "a\tb", `""`, `'quoted'`, `x"y'z`,
+		`   `, `a  b`, `";"`, `unclosed "quote`, `'a' 'b'`, `a; ;b`,
+	} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		for _, p := range parsePathInput(s) {
+			if p == "" {
+				t.Fatalf("empty path from %q", s)
+			}
+			if p != strings.TrimSpace(p) {
+				t.Fatalf("untrimmed path %q from %q", p, s)
+			}
+		}
+	})
 }

@@ -40,7 +40,7 @@ func analyzeInputs(ffprobe string, paths []string, ui theme) ([]MediaInfo, int) 
 	inputFailures := 0
 	fmt.Println(ui.bold("ANALYZING") + ui.dim("  metadata only"))
 	for i, p := range paths {
-		fmt.Printf("  [%d/%d] %s ... ", i+1, len(paths), strictConsoleText(filepath.Base(p)))
+		fmt.Printf("  [%d/%d] %s ... ", i+1, len(paths), oneLine(filepath.Base(p)))
 		info, err := probeMedia(ffprobe, p, false)
 		if err != nil {
 			inputFailures++
@@ -241,7 +241,7 @@ func printPlan(ui theme, infos []MediaInfo, opts ConvertOptions) {
 	if opts.OutputDir == "" {
 		fmt.Println("  Output:  converted_prerecs beside each source")
 	} else {
-		fmt.Printf("  Output:  %s\n", strictConsoleText(opts.OutputDir))
+		fmt.Printf("  Output:  %s\n", oneLine(opts.OutputDir))
 	}
 	skipped := 0
 	if isXvidPreset(opts.Preset) && opts.SkipCompressed && !opts.ForceXvid {
@@ -379,7 +379,7 @@ func printBatchSummary(ui theme, result BatchResult, cancelled error) {
 			fmt.Println()
 			fmt.Printf("     %s\n", ui.dim(item.Backend))
 		case "skipped":
-			fmt.Printf("  %s %-28s  %s\n", ui.yellow("SKIP"), clipName(name, 28), strictConsoleText(item.Message))
+			fmt.Printf("  %s %-28s  %s\n", ui.yellow("SKIP"), clipName(name, 28), oneLine(item.Message))
 		case "failed":
 			fmt.Printf("  %s %-28s  %s\n", ui.red("FAIL"), clipName(name, 28), conciseError(item.Message, 70))
 		}
@@ -611,10 +611,18 @@ func strictConsoleText(s string) string {
 	return b.String()
 }
 
+// oneLine renders untrusted text for a single-line context: strictConsoleText
+// with newlines folded, so a hostile filename or probed string cannot forge
+// additional output lines (a fake "VERIFIED" line inside a table, for
+// instance). Multi-line error text keeps \n via strictConsoleText instead.
+func oneLine(s string) string {
+	return strings.ReplaceAll(strictConsoleText(s), "\n", " ")
+}
+
 // clipName shortens to n runes — byte-wise cutting could split a multibyte
 // rune mid-sequence, and fmt's %Ns padding counts runes too.
 func clipName(s string, n int) string {
-	s = strictConsoleText(s)
+	s = oneLine(s)
 	rs := []rune(s)
 	if len(rs) <= n {
 		return s

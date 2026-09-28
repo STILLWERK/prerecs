@@ -116,3 +116,63 @@ func TestMetadataFrameCountTrust(t *testing.T) {
 		}
 	}
 }
+
+// The ffprobe call must keep stdout and stderr in separate sinks: a non-fatal
+// error line merged into the JSON document used to fail the whole probe with a
+// bare unmarshal error.
+func TestProbeMediaContextErrorPaths(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fake executable is not portable to Windows")
+	}
+	dir := t.TempDir()
+	writeFake := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	jsonDoc := `{"streams":[{"codec_name":"h264","codec_type":"video","width":64,"height":64,"pix_fmt":"yuv420p","avg_frame_rate":"30/1","r_frame_rate":"30/1","duration":"1.0","nb_frames":"30"}],"format":{"duration":"1.0","size":"1024"}}`
+
+	// Non-fatal stderr noise alongside valid JSON must still parse.
+	noisy := writeFake("ffprobe-noisy", "#!/bin/sh\necho '[h264] could not find codec parameters' >&2\nprintf '%s' '"+jsonDoc+"'\n")
+	info, err := probeMediaContext(context.Background(), noisy, filepath.Join(dir, "in.mp4"), false)
+	if err != nil {
+		t.Fatalf("stderr noise corrupted the probe result: %v", err)
+	}
+	if info.Codec != "h264" || info.FrameCount != 30 {
+		t.Fatalf("probe result wrong: %+v", info)
+	}
+
+	// A nonzero exit must quote stderr — not an empty or merged message.
+	failing := writeFake("ffprobe-fail", "#!/bin/sh\necho 'moov atom not found' >&2\nexit 3\n")
+	_, err = probeMediaContext(context.Background(), failing, filepath.Join(dir, "in.mp4"), false)
+	if err == nil || !strings.Contains(err.Error(), "moov atom not found") {
+		t.Fatalf("stderr diagnostic lost: %v", err)
+	}
+
+	// A Start failure must surface the underlying error, not "ffprobe: ".
+	_, err = probeMediaContext(context.Background(), filepath.Join(dir, "missing-ffprobe"), "in.mp4", false)
+	if err == nil || !strings.Contains(err.Error(), "no such file") && !strings.Contains(err.Error(), "cannot find") {
+		t.Fatalf("start failure lost the underlying error: %v", err)
+	}
+
+	// Garbage stdout must be reported as unparsable output, not a bare
+	// encoding/json error with no context.
+	garbage := writeFake("ffprobe-garbage", "#!/bin/sh\nprintf 'not json'\n")
+	_, err = probeMediaContext(context.Background(), garbage, "in.mp4", false)
+	if err == nil || !strings.Contains(err.Error(), "unparsable") {
+		t.Fatalf("unparsable output not wrapped: %v", err)
+	}
+
+	// A NaN duration string must be clamped rather than poison downstream math.
+	nanDoc := strings.Replace(jsonDoc, `"duration":"1.0"`, `"duration":"nan"`, -1)
+	nanProbe := writeFake("ffprobe-nan", "#!/bin/sh\nprintf '%s' '"+nanDoc+"'\n")
+	info, err = probeMediaContext(context.Background(), nanProbe, "in.mp4", false)
+	if err != nil {
+		t.Fatalf("nan duration probe failed: %v", err)
+	}
+	if info.Duration != 0 {
+		t.Fatalf("NaN duration leaked into MediaInfo: %v", info.Duration)
+	}
+}

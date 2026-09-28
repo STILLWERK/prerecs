@@ -37,7 +37,7 @@ The interactive menu recommends ProRes 422 LT for general editing. SHARE is the 
 | **ProRes 422** (`prores`) | ProRes MOV | Quality step up from LT. |
 | **ProRes 422 HQ** (`hq`) | ProRes MOV | Maximum normal ProRes tier. |
 | **ProRes 4444** (`4444`) | ProRes MOV | RGB, 4:4:4, and alpha-capable sources. |
-| **MagicYUV Lossless** (`magicyuv`) | MagicYUV AVI | Fast lossless intermediate when the optional Windows codec/plugin is installed. |
+| **MagicYUV Lossless** (`magicyuv`, `lossless`) | MagicYUV AVI | Fast lossless intermediate when the optional Windows codec/plugin is installed. |
 | **Ut Video Lossless** (`utvideo`) | Ut Video AVI | Free lossless alternative exposed by FFmpeg. |
 
 ### SHARE / Xvid Q2

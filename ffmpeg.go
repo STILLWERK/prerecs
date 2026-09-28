@@ -323,9 +323,6 @@ func (e *Engine) runFFmpeg(ctx context.Context, args []string, expectedDur float
 	cmd.WaitDelay = childPipeWaitDelay
 	err := cmd.Run()
 	pw.flush()
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
 	if errors.Is(err, exec.ErrWaitDelay) {
 		if st := cmd.ProcessState; st != nil && st.ExitCode() == 0 {
 			// FFmpeg exited cleanly but a descendant kept its pipes open and
@@ -333,6 +330,15 @@ func (e *Engine) runFFmpeg(ctx context.Context, args []string, expectedDur float
 			// output verification, not by the wedged plumbing.
 			err = nil
 		}
+	}
+	if err == nil {
+		// The process finished cleanly. Checking ctx first would let a
+		// cancellation that landed between Run() and here discard a complete,
+		// valid output — the caller deletes it as "cancelled".
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 	if err != nil {
 		msg := strings.TrimSpace(stderr.String())

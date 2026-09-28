@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 	"unicode"
@@ -92,4 +93,37 @@ func TestExactFrameProgressUsesFramesAndWallClockFPS(t *testing.T) {
 	if got.TotalFrames != 100 {
 		t.Fatalf("total frames=%d", got.TotalFrames)
 	}
+}
+
+func TestOneLineFoldsNewlines(t *testing.T) {
+	got := oneLine("clip\nVERIFIED\nall good.avi")
+	if strings.Contains(got, "\n") {
+		t.Fatalf("oneLine leaked newline: %q", got)
+	}
+	if got := clipName("a\nb\x1b[31mc.avi", 25); strings.Contains(got, "\n") || strings.Contains(got, "\x1b") {
+		t.Fatalf("clipName leaked control text: %q", got)
+	}
+}
+
+func FuzzStrictConsoleText(f *testing.F) {
+	for _, s := range []string{"plain.avi", "\x1b[31mred\x1b[0m", "a\nb", "\x1b]0;title\x07", "\x00\x01\xff"} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		for _, r := range strictConsoleText(s) {
+			if r == '\x1b' || (!unicode.IsPrint(r) && r != '\n') {
+				t.Fatalf("strictConsoleText(%q) emitted non-print %q", s, r)
+			}
+		}
+		for _, r := range oneLine(s) {
+			if r == '\x1b' || r == '\n' || !unicode.IsPrint(r) {
+				t.Fatalf("oneLine(%q) emitted %q", s, r)
+			}
+		}
+		for _, r := range safeConsoleText(s) {
+			if r != '\x1b' && r != '\n' && !unicode.IsPrint(r) {
+				t.Fatalf("safeConsoleText(%q) emitted non-print %q", s, r)
+			}
+		}
+	})
 }

@@ -206,7 +206,7 @@ func collectOptions(cfg cliConfig, ui theme, e *Engine, infos []MediaInfo) (Conv
 				fmt.Println(ui.bold("SHARE SOURCE CHECK"))
 				fmt.Println(ui.yellow("  Some inputs are already distribution-compressed:"))
 				for _, in := range compressed {
-					fmt.Printf("    - %s (%s, %s)\n", strictConsoleText(filepath.Base(in.Path)), strictConsoleText(strings.ToUpper(in.Codec)), humanBytes(in.SizeBytes))
+					fmt.Printf("    - %s (%s, %s)\n", oneLine(filepath.Base(in.Path)), oneLine(strings.ToUpper(in.Codec)), humanBytes(in.SizeBytes))
 				}
 				fallbackPreset := recommendedProResPreset(infos)
 				fallbackLabel := "ProRes 422 LT"

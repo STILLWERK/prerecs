@@ -72,7 +72,7 @@ func incompatibleAudioCopies(preset string, infos []MediaInfo) []string {
 			if audioCopyCompatible(preset, a) {
 				continue
 			}
-			label := strictConsoleText(filepath.Base(in.Path)) + "=" + strictConsoleText(strings.ToUpper(a))
+			label := oneLine(filepath.Base(in.Path)) + "=" + oneLine(strings.ToUpper(a))
 			if !seen[label] {
 				seen[label] = true
 				bad = append(bad, label)
@@ -198,7 +198,7 @@ func xvidAvailableForInputs(caps Capabilities, infos []MediaInfo, skipCompressed
 		if caps.HasLibXvid {
 			continue
 		}
-		missing = append(missing, strictConsoleText(filepath.Base(in.Path)))
+		missing = append(missing, oneLine(filepath.Base(in.Path)))
 	}
 	return len(missing) == 0, missing
 }

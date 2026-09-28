@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 )
@@ -124,21 +125,43 @@ func expandInputs(items []string) ([]string, error) {
 			}
 			sort.Strings(names)
 			for _, n := range names {
-				a, _ := filepath.Abs(n)
-				if !seen[a] {
-					seen[a] = true
+				a := absOrSelf(n)
+				key := inputDedupeKey(a)
+				if !seen[key] {
+					seen[key] = true
 					out = append(out, a)
 				}
 			}
 			continue
 		}
-		a, _ := filepath.Abs(p)
-		if !seen[a] {
-			seen[a] = true
+		a := absOrSelf(p)
+		key := inputDedupeKey(a)
+		if !seen[key] {
+			seen[key] = true
 			out = append(out, a)
 		}
 	}
 	return out, nil
+}
+
+// absOrSelf keeps the caller's spelling when filepath.Abs cannot resolve —
+// an ignored error would otherwise collapse distinct failures into "".
+func absOrSelf(p string) string {
+	a, err := filepath.Abs(p)
+	if err != nil {
+		return p
+	}
+	return a
+}
+
+// inputDedupeKey matches the output-stem convention: NTFS is case-insensitive,
+// so differently-cased spellings of the same file must dedupe on Windows or
+// the same source would be enqueued twice and collide on output slots.
+func inputDedupeKey(p string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(p)
+	}
+	return p
 }
 
 // generatedOutputSuffixes are the canonical preset tokens PreRecs appends to

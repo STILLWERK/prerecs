@@ -213,6 +213,39 @@ func TestColorOutputArgsDropsGBRForYUVEncoders(t *testing.T) {
 	}
 }
 
+// The color whitelist must match the spellings ffprobe actually emits
+// (av_color_*_name), not AVOption aliases: ffprobe reports "iec61966-2-1" and
+// "bt2020-10" — sRGB and HDR sources must not silently lose their transfer
+// metadata, and invented spellings must not reach the filtergraph.
+func TestColorMetadataWhitelistUsesProbeSpellings(t *testing.T) {
+	in := MediaInfo{ColorSpace: "bt2020nc", ColorTransfer: "bt2020-10", ColorPrimaries: "bt2020"}
+	f := colorFilter(in)
+	for _, want := range []string{"colorspace=bt2020nc", "color_trc=bt2020-10", "color_primaries=bt2020"} {
+		if !strings.Contains(f, want) {
+			t.Fatalf("canonical ffprobe spelling dropped from filtergraph: %s missing %q", f, want)
+		}
+	}
+	joined := " " + strings.Join(colorOutputArgs(in, "prores_422"), " ") + " "
+	if !strings.Contains(joined, " -color_trc bt2020-10 ") {
+		t.Fatalf("canonical ffprobe spelling dropped from output args: %s", joined)
+	}
+
+	in = MediaInfo{ColorSpace: "bt709", ColorTransfer: "iec61966-2-1", ColorPrimaries: "bt709"}
+	f = colorFilter(in)
+	if !strings.Contains(f, "color_trc=iec61966-2-1") {
+		t.Fatalf("sRGB transfer dropped from filtergraph: %s", f)
+	}
+
+	// AVOption aliases ffprobe never emits must not pass through either.
+	in = MediaInfo{ColorTransfer: "bt2020_10", ColorPrimaries: "bt709"}
+	if strings.Contains(colorFilter(in), "color_trc") {
+		t.Fatalf("non-probe spelling reached filtergraph: %s", colorFilter(in))
+	}
+	if strings.Contains(strings.Join(colorOutputArgs(in, "prores_422"), " "), "bt2020_10") {
+		t.Fatal("non-probe spelling reached output args")
+	}
+}
+
 func TestBuildCPUProResRGBAlphaPreservesAlphaGraph(t *testing.T) {
 	e := &Engine{caps: Capabilities{}, enc: map[string]bool{"prores_ks": true}}
 	info := MediaInfo{

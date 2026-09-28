@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -223,5 +224,30 @@ func TestHasDuplicateOutputStems(t *testing.T) {
 	}
 	if hasDuplicateOutputStems("/out", []MediaInfo{mk("/a/one.avi"), mk("/b/two.avi")}) {
 		t.Fatal("distinct stems falsely detected")
+	}
+}
+
+// The reservation holds a name, not an inode: a swapped-in link must fail the
+// item before an encoder reopens the path and writes through it.
+func TestCheckReservedOutput(t *testing.T) {
+	td := t.TempDir()
+	reg := filepath.Join(td, "out.avi")
+	if err := os.WriteFile(reg, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkReservedOutput(reg); err != nil {
+		t.Fatalf("regular reservation rejected: %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		link := filepath.Join(td, "link.avi")
+		if err := os.Symlink(reg, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := checkReservedOutput(link); err == nil {
+			t.Fatal("symlink reservation must be rejected")
+		}
+	}
+	if err := checkReservedOutput(filepath.Join(td, "gone.avi")); err == nil {
+		t.Fatal("missing reservation must be rejected")
 	}
 }

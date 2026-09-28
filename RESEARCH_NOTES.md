@@ -169,7 +169,7 @@ The release now assigns one integer timestamp per captured frame in the target-r
 
 `settb=expr=1/target_fps,setpts=N,fps=target_fps`
 
-with `-fps_mode passthrough -enc_time_base filter`. A 30-frame FFV1 lossless regression at 30→300 fps produces exactly 30 output frames, exactly 0.100 s, exactly 300 fps, and all 30 decoded frame hashes match the source in order.
+with `-fps_mode passthrough -enc_time_base filter` (superseded in v1.0.5: `-enc_time_base filter` silently required FFmpeg 6.1 and is no longer emitted; the `settb`/`setpts`/`fps` chain produces the same constant-rate timestamps). A 30-frame FFV1 lossless regression at 30→300 fps produces exactly 30 output frames, exactly 0.100 s, exactly 300 fps, and all 30 decoded frame hashes match the source in order.
 
 On all four real masters, ProRes 422 LT totaled ~2.30 GiB versus ~2.79 GiB Lagarith and ~3.19 GiB ProRes 422. LT also decoded faster in the local FFmpeg null-sink test (~704–784 fps) than both standard 422 (~633–736 fps) and Lagarith (~360–479 fps). Standard 422 remains slightly cleaner by SSIM, but LT is the better default for the intended edit-ready/storage balance.
 

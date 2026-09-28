@@ -4,12 +4,92 @@ package main
 
 import (
 	"fmt"
+	"sync"
 	"syscall"
 	"unsafe"
 )
 
+// kernel32.dll is a KnownDLL and always resolves from System32, so loading it
+// through the normal search order is safe.
+var kernel32 = syscall.NewLazyDLL("kernel32.dll")
+
 var (
-	aviDLL                     = syscall.NewLazyDLL("avifil32.dll")
+	loadLibraryExW = kernel32.NewProc("LoadLibraryExW")
+	getProcAddress = kernel32.NewProc("GetProcAddress")
+)
+
+// systemDLL is a minimal stand-in for x/sys/windows.NewLazySystemDLL: the
+// stdlib offers only NewLazyDLL, which resolves through the full DLL search
+// order. avifil32 is not a KnownDLL, so that order would pick up a payload
+// avifil32.dll planted beside the executable or in the working directory.
+// Loading with LOAD_LIBRARY_SEARCH_SYSTEM32 restricts resolution to System32.
+type systemDLL struct {
+	name string
+	once sync.Once
+	h    uintptr
+	err  error
+}
+
+func (d *systemDLL) load() (uintptr, error) {
+	d.once.Do(func() {
+		name, err := syscall.UTF16PtrFromString(d.name)
+		if err != nil {
+			d.err = err
+			return
+		}
+		const loadLibrarySearchSystem32 = 0x00000800
+		h, _, e := loadLibraryExW.Call(uintptr(unsafe.Pointer(name)), 0, loadLibrarySearchSystem32)
+		if h == 0 {
+			if e != nil && e != syscall.Errno(0) {
+				d.err = e
+			} else {
+				d.err = fmt.Errorf("LoadLibraryExW failed to load %s", d.name)
+			}
+			return
+		}
+		d.h = h
+	})
+	return d.h, d.err
+}
+
+func (d *systemDLL) NewProc(name string) *systemProc { return &systemProc{dll: d, name: name} }
+
+type systemProc struct {
+	dll  *systemDLL
+	name string
+	once sync.Once
+	addr uintptr
+	err  error
+}
+
+// Call mirrors syscall.LazyProc.Call so the VfW call sites are unchanged.
+func (p *systemProc) Call(a ...uintptr) (r1, r2 uintptr, lastErr error) {
+	p.once.Do(func() {
+		h, err := p.dll.load()
+		if err != nil {
+			p.err = err
+			return
+		}
+		cname, err := syscall.BytePtrFromString(p.name)
+		if err != nil {
+			p.err = err
+			return
+		}
+		addr, _, _ := getProcAddress.Call(h, uintptr(unsafe.Pointer(cname)))
+		if addr == 0 {
+			p.err = fmt.Errorf("%s!%s not found", p.dll.name, p.name)
+			return
+		}
+		p.addr = addr
+	})
+	if p.err != nil {
+		return 0, 0, p.err
+	}
+	return syscall.SyscallN(p.addr, a...)
+}
+
+var (
+	aviDLL                     = &systemDLL{name: "avifil32.dll"}
 	procAVIFileInit            = aviDLL.NewProc("AVIFileInit")
 	procAVIFileExit            = aviDLL.NewProc("AVIFileExit")
 	procAVIFileOpenW           = aviDLL.NewProc("AVIFileOpenW")
@@ -31,6 +111,11 @@ const streamTypeVideo = uintptr(0x73646976) // 'vids'
 func vfwCanDecodeFrame(path string, frame int64) (bool, error) {
 	if frame < 0 {
 		return false, fmt.Errorf("invalid frame index %d", frame)
+	}
+	if _, err := aviDLL.load(); err != nil {
+		// The Call sites discard lastErr; without this a missing/blocked
+		// avifil32 would surface as "AVIFileOpenW failed: 0x00000000".
+		return false, err
 	}
 	p, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
