@@ -6,6 +6,8 @@ The v1.0.5 source passed formatting, the complete test suite, vet, race-enabled 
 
 Focused regressions cover the enforced FFmpeg >= 5.1 floor, the FFmpeg-6.1-free conform/timeline chain, compressed-source audio passthrough gating, encoder subprocesses surviving inherited stdout/stderr pipes (`WaitDelay`), tail-retained FFmpeg diagnostics, unterminated final progress lines, bounded per-item ffprobe deadlines, `--capture-fps`/`--strip-audio` precedence, preset-family output-name matching, and positive existing-output reuse.
 
+The floor was also verified by execution, not only documentation: `TestFFmpeg51EndToEndChain` drove a real johnvansickle FFmpeg 5.1.1 static build through the whole pipeline — a 30 -> 300 fps Xvid conform verified 30/30 frames, and a compressed H.264+AAC source verified through the ProRes passthrough path with both audio tracks intact (no `-enc_time_base` anywhere).
+
 ## v1.0.4 release gate
 
 The v1.0.4 source passed formatting, the complete test suite, vet, race-enabled tests, Windows-tagged vet, and a Windows amd64 CGO-disabled build. The built executable reports `PreRecs 1.0.4`.
