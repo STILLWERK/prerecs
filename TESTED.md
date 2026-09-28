@@ -310,7 +310,7 @@ A nontrivial YUVA gradient-alpha source exposed that using 16-bit ProRes alpha f
 
 For YUV+alpha through Vulkan ProRes 4444, source/output alpha-plane MD5 hashes are identical.
 
-For RGB+alpha, FFmpeg's direct `gbrap -> yuva444p10le` conversion modifies alpha before the encoder. The implementation therefore splits colour and alpha: RGB colour is converted independently to limited-range BT.709 YUV444 10-bit, the original alpha plane bypasses the colour conversion, and `alphamerge` recombines them before ProRes. The final Windows candidate produced identical source/output alpha-plane MD5 hashes on a nontrivial RGB gradient-alpha source and a normal 30/30-frame ProRes 4444 decode.
+For RGB+alpha, FFmpeg's direct `gbrap -> yuva444p10le` conversion modifies alpha before the encoder. The implementation therefore splits colour and alpha: RGB colour is converted independently to limited-range BT.709 YUV444 10-bit, the original alpha plane bypasses the colour conversion, and the merge step recombines them before ProRes — `alphamerge` for ≤8-bit sources (the final Windows candidate produced identical source/output alpha-plane MD5 hashes on a nontrivial RGB gradient-alpha source and a normal 30/30-frame ProRes 4444 decode), `mergeplanes` for >8-bit sources because `alphamerge` negotiation quantizes alpha to ~8-bit on every tested FFmpeg version (measured on a 13,818-level source: 80 surviving distinct levels via `alphamerge` vs 273 via `mergeplanes`, which is the ProRes alpha bitstream ceiling).
 
 ## Final candidate smoke
 
