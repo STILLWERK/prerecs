@@ -486,3 +486,47 @@ func TestNativeXvidRemuxFailureFails(t *testing.T) {
 		t.Fatalf("expected remux failure, got %v", err)
 	}
 }
+
+// xvid_encraw treats a mid-stream AVIStreamGetFrame failure as clean EOS and
+// exits 0 — a wedged VfW decode produces a short stream that only fails at
+// verifyOutput. That item must fall back to libxvid like every other native
+// failure, not die at VERIFY FAILED.
+func TestProcessItemNativeUnderproductionFallsBackToLibxvid(t *testing.T) {
+	e := nativeTestEngine(t)
+	td := t.TempDir()
+	es, frames := makeRealM4V(t, e.caps.FFmpeg, td, 20)
+	installFakeXvid(t, es, map[string]string{"PRERECS_FAKE_XVID_VOPS": "15"})
+
+	src := filepath.Join(td, "src.avi")
+	if b, err := exec.Command(e.caps.FFmpeg, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=64x64:rate=30",
+		"-frames:v", strconv.Itoa(frames), "-c:v", "ffv1", src).CombinedOutput(); err != nil {
+		t.Fatalf("ffv1 fixture: %v %s", err, b)
+	}
+	info, err := probeMedia(e.caps.FFprobe, src, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.FrameCountExact {
+		t.Fatal("ffv1 source should have a container-exact frame count")
+	}
+	rep, lines := captureReporter()
+	item := processItem(context.Background(), theme{}, e, info,
+		ConvertOptions{Preset: "xvid_compact", OutputDir: filepath.Join(td, "out"), StripAudio: true}, rep)
+	if item.Status != "ok" {
+		t.Fatalf("native underproduction did not recover: %q %q\n%s", item.Status, item.Message, strings.Join(*lines, "\n"))
+	}
+	if !strings.Contains(item.Backend, "libxvid") {
+		t.Fatalf("fallback did not go through libxvid: %q", item.Backend)
+	}
+	outInfo, err := probeMedia(e.caps.FFprobe, item.Output, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outInfo.FrameCount != int64(frames) {
+		t.Fatalf("fallback output has %d frames, want %d", outInfo.FrameCount, frames)
+	}
+	if !strings.Contains(strings.Join(*lines, "\n"), "re-encoding through FFmpeg libxvid") {
+		t.Fatalf("expected verify-reject fallback notice: %v", *lines)
+	}
+}

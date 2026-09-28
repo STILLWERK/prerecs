@@ -38,7 +38,7 @@ func TestFastProbeAndExactDecodeCount(t *testing.T) {
 		t.Fatal("fast probe should provide at least an estimated frame count")
 	}
 	e := &Engine{caps: caps, enc: enc}
-	count, err := e.countDecodedFrames(context.Background(), info, func(progressInfo) {})
+	count, _, err := e.countDecodedFrames(context.Background(), info, false, false, func(progressInfo) {})
 	if err != nil {
 		t.Fatal(err)
 	}

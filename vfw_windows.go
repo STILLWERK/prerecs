@@ -3,9 +3,11 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -103,12 +105,39 @@ var (
 
 const streamTypeVideo = uintptr(0x73646976) // 'vids'
 
-// vfwCanDecodeFrame asks the same legacy VfW/AVIFile stack used by xvid_encraw
-// whether a specific frame can actually be retrieved. Some OpenDML/Lagarith
-// AVIs advertise their full frame count but AVIStreamGetFrame cannot reach the
-// tail of the file; native Xvid then exits early with fewer frames. A cheap
-// last-frame probe lets PreRecs route those files directly to FFmpeg libxvid.
+// vfwProbeTimeout bounds the synchronous VfW frame probe. A wedged legacy
+// codec DLL is exactly the failure this preflight exists to catch — without a
+// bound, a blocked AVIStreamGetFrame would hang the worker goroutine forever
+// and swallow Ctrl+C for the whole batch. On timeout the caller treats the
+// probe as "cannot decode" and routes to FFmpeg libxvid; the leaked probe
+// goroutine stays parked on the wedged call without harming the process.
+var vfwProbeTimeout = 30 * time.Second
+
 func vfwCanDecodeFrame(path string, frame int64) (bool, error) {
+	type result struct {
+		ok  bool
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		ok, err := vfwCanDecodeFrameSync(path, frame)
+		ch <- result{ok, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.ok, r.err
+	case <-time.After(vfwProbeTimeout):
+		return false, errors.New("VfW frame probe timed out; using FFmpeg libxvid")
+	}
+}
+
+// vfwCanDecodeFrameSync asks the same legacy VfW/AVIFile stack used by
+// xvid_encraw whether a specific frame can actually be retrieved. Some
+// OpenDML/Lagarith AVIs advertise their full frame count but AVIStreamGetFrame
+// cannot reach the tail of the file; native Xvid then exits early with fewer
+// frames. A cheap last-frame probe lets PreRecs route those files directly to
+// FFmpeg libxvid.
+func vfwCanDecodeFrameSync(path string, frame int64) (bool, error) {
 	if frame < 0 {
 		return false, fmt.Errorf("invalid frame index %d", frame)
 	}

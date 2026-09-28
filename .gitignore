@@ -29,8 +29,9 @@ converted_prerecs/
 *.mpeg
 *.m2ts
 *.ts
-*.m4v.video.tmp
-*.m4v.video.tmp.*
+# Native Xvid intermediate streams (name is `<out>.video.tmp.m4v`)
+*.video.tmp.m4v
+*.video.tmp.*
 
 # Local configuration, credentials, and environment files
 .env

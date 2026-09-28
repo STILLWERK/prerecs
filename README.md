@@ -1,6 +1,6 @@
 # PreRecs
 
-PreRecs is a Windows console application for preparing high-frame-rate game captures and other prerequisite video for editing workflows. The current source version is **v1.0.6**; v1.0.0 through v1.0.4 remain frozen.
+PreRecs is a Windows console application for preparing high-frame-rate game captures and other prerequisite video for editing workflows. The current source version is **v1.0.7**; v1.0.0 through v1.0.4 remain frozen.
 
 It has two complementary jobs:
 
@@ -155,7 +155,7 @@ All FFmpeg decode stages (source scan, conversion input, and output verification
 
 FFmpeg and native Xvid diagnostics are drained continuously and bounded to the final 32 KiB of output, where the decisive error in a long log lives. Metadata probes and capability commands are time-bounded, and encoder pipes are closed on a bound after process exit so a wedged tool or a descendant inheriting subprocess pipes cannot block the workflow indefinitely.
 
-Verification checks the exact decoded frame count, frame rate, normalized duration, dimensions, requested codec/tag, expected Xvid or lossless pixel format, audio presence and track count, and the copied audio codec when audio is retained. A mismatch fails the job.
+Verification checks the exact decoded frame count, frame rate, normalized duration, dimensions, requested codec/tag, expected Xvid or lossless pixel format, audio presence and track count, and the copied audio codec when audio is retained — retained audio is decoded, not just name-checked. A mismatch fails the job.
 
 When an expected frame rate or duration is known, missing output timing metadata is itself a verification failure rather than a reason to skip that check.
 
@@ -163,7 +163,7 @@ ProRes verification also checks the encoded profile and pixel format: LT/422/HQ 
 
 When the compressed-source warning offers switching away from Xvid, alpha-bearing batches switch to ProRes 4444; batches without alpha continue to use ProRes 422 LT.
 
-When a matching output already exists, PreRecs decodes and verifies it first. A current valid output is reused. A stale, truncated, wrong-codec, or otherwise invalid pre-existing output is preserved and the new conversion receives the next numbered filename — including sparse numbered slots, so `clip_preset_2.avi` can be reused even when the base name is free. An output produced by the *current* run that fails probe, decode, or verification checks is removed rather than left behind under a normal-looking filename.
+When a matching output already exists, PreRecs decodes and verifies it first. A current valid output is reused — but only when its embedded `prerecs1` provenance tag (a content hash of the source plus a hash of the job options, written into the container comment) matches the current source and settings, so a same-stem file from another folder or container can never adopt a foreign output. A stale, truncated, wrong-codec, provenance-mismatched, or otherwise invalid pre-existing output is preserved and the new conversion receives the next numbered filename — including sparse numbered slots, so `clip_preset_2.avi` can be reused even when the base name is free. An output produced by the *current* run that fails probe, decode, or verification checks is removed rather than left behind under a normal-looking filename.
 
 Output allocation atomically reserves the final target to prevent parallel same-stem collisions. An abrupt process termination can therefore leave a zero-byte placeholder; the next run preserves/rejects that invalid candidate and safely chooses a numbered replacement.
 
@@ -190,7 +190,7 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
   go build -trimpath -ldflags='-s -w' -o PreRecs.exe .
 ```
 
-Run the resulting executable on Windows and confirm it reports `PreRecs 1.0.6`.
+Run the resulting executable on Windows and confirm it reports `PreRecs 1.0.7`.
 
 On Windows, `build_windows.ps1` runs the unit tests and vet before producing `PreRecs.exe`. The GitHub Actions CI also checks formatting, tests, vet, race tests, and a Windows amd64 CGO-disabled build. Tags beginning with `v` use the release workflow to build a Windows ZIP and SHA-256 checksum file.
 

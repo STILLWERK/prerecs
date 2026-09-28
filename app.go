@@ -44,6 +44,10 @@ func runApplication() {
 	printHeader(ui, caps, cfg.noNativeXvid)
 
 	jobArgs := args
+	// sawFailure records that this session already printed an error — a later
+	// quiet EOF exit must still report nonzero, or a script that forgets
+	// --yes sees success for zero work after its bad argument.
+	sawFailure := false
 	for {
 		paths, err := gatherInputs(jobArgs, ui)
 		if err != nil {
@@ -52,9 +56,13 @@ func runApplication() {
 					fmt.Fprintln(os.Stderr, ui.red("Error: ")+"no input paths given and stdin reached EOF")
 					os.Exit(code)
 				}
+				if sawFailure {
+					os.Exit(1)
+				}
 				return
 			}
 			fmt.Fprintln(os.Stderr, ui.red("Error: ")+strictConsoleText(err.Error()))
+			sawFailure = true
 			if cfg.yes {
 				os.Exit(1)
 			}
@@ -66,10 +74,16 @@ func runApplication() {
 			if code := missingInputExitCode(cfg); code != 0 {
 				os.Exit(code)
 			}
+			if sawFailure {
+				os.Exit(1)
+			}
 			return
 		}
 
 		infos, inputFailures := analyzeInputs(caps.FFprobe, paths, ui)
+		if inputFailures > 0 {
+			sawFailure = true
+		}
 		if len(infos) == 0 {
 			fmt.Fprintln(os.Stderr, ui.red("No readable video files."))
 			if cfg.yes {
@@ -92,12 +106,21 @@ func runApplication() {
 					fmt.Fprintln(os.Stderr, ui.red("Error: ")+"required input missing and stdin reached EOF")
 					os.Exit(code)
 				}
+				if sawFailure {
+					os.Exit(1)
+				}
 				return
 			}
 			fmt.Fprintln(os.Stderr, ui.red("Error: ")+strictConsoleText(err.Error()))
+			sawFailure = true
 			if cfg.yes {
 				os.Exit(1)
 			}
+			// Options errors that came from flags (--timescale, --preset,
+			// audio incompat, ...) are session state: leaving cfg untouched
+			// would re-hit the identical error every iteration. Reset the
+			// job-scoped flags so the next pass prompts its way around them.
+			cfg = resetInteractiveJob(cfg)
 			jobArgs = nil
 			continue
 		}
@@ -106,12 +129,18 @@ func runApplication() {
 		if !cfg.yes {
 			start, err := askYesNo("Start conversion?", true)
 			if err != nil {
+				if sawFailure {
+					os.Exit(1)
+				}
 				return
 			}
 			if !start {
 				fmt.Println(ui.dim("Cancelled."))
 				again, err := askYesNo("Start a new job?", true)
 				if err != nil || !again {
+					if sawFailure {
+						os.Exit(1)
+					}
 					return
 				}
 				jobArgs = nil
@@ -126,6 +155,9 @@ func runApplication() {
 		cancelled := ctx.Err()
 		stop()
 		printBatchSummary(ui, result, cancelled)
+		if result.Failures > 0 || result.InputFailures > 0 {
+			sawFailure = true
+		}
 
 		if cfg.yes {
 			os.Exit(headlessExitCode(result, cancelled))
@@ -139,6 +171,9 @@ func runApplication() {
 			fmt.Println("  3. Exit")
 			choice, err := askChoice("Choose", []string{"1", "2", "3"}, "1")
 			if err != nil {
+				if sawFailure {
+					os.Exit(1)
+				}
 				return
 			}
 			switch choice {
@@ -154,6 +189,9 @@ func runApplication() {
 					fmt.Println(ui.yellow("  Could not open folder: ") + strictConsoleText(err.Error()))
 				}
 			case "3":
+				if sawFailure {
+					os.Exit(1)
+				}
 				return
 			}
 		}

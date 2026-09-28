@@ -22,6 +22,20 @@ jobs:
           go-version: '1.26.x'
           cache-dependency-path: go.mod
 
+      # The release tag must not publish a build the CI gate would reject —
+      # run the same checks here before packaging. Native commands do not trip
+      # pwsh's error action, so each gate checks its exit code explicitly.
+      - name: Release gate (gofmt, vet, tests)
+        shell: pwsh
+        run: |
+          $fmt = gofmt -l .
+          if ($fmt) { throw "gofmt: unformatted files:`n$fmt" }
+          if ($LASTEXITCODE -ne 0) { throw "gofmt failed (exit $LASTEXITCODE)" }
+          go vet ./...
+          if ($LASTEXITCODE -ne 0) { throw "go vet failed (exit $LASTEXITCODE)" }
+          go test -count=1 ./...
+          if ($LASTEXITCODE -ne 0) { throw "go test failed (exit $LASTEXITCODE)" }
+
       - name: Build, package, and checksum
         shell: pwsh
         run: |

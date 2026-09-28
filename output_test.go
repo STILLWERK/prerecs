@@ -251,3 +251,43 @@ func TestCheckReservedOutput(t *testing.T) {
 		t.Fatal("missing reservation must be rejected")
 	}
 }
+
+// A fully-failed batch that created the output dir must sweep it so the run
+// leaves no stray empty folder behind while reporting "no output folder".
+func TestRemoveEmptyCreatedDirs(t *testing.T) {
+	dirExists := func(p string) bool {
+		st, err := os.Stat(p)
+		return err == nil && st.IsDir()
+	}
+	td := t.TempDir()
+	created := filepath.Join(td, "newly-created")
+	if err := os.MkdirAll(created, 0755); err != nil {
+		t.Fatal(err)
+	}
+	createdOutDirs.Store(created, true)
+	// A pre-existing dir (not created by this run) must survive the sweep.
+	preexisting := filepath.Join(td, "preexisting")
+	if err := os.MkdirAll(preexisting, 0755); err != nil {
+		t.Fatal(err)
+	}
+	removeEmptyCreatedDirs()
+	if dirExists(created) {
+		t.Fatal("empty created dir was not swept")
+	}
+	if !dirExists(preexisting) {
+		t.Fatal("pre-existing dir was removed")
+	}
+	// A created dir that gained content must survive.
+	kept := filepath.Join(td, "kept")
+	if err := os.MkdirAll(kept, 0755); err != nil {
+		t.Fatal(err)
+	}
+	createdOutDirs.Store(kept, true)
+	if err := os.WriteFile(filepath.Join(kept, "f.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	removeEmptyCreatedDirs()
+	if !dirExists(kept) {
+		t.Fatal("non-empty created dir was removed")
+	}
+}

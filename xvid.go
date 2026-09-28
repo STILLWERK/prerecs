@@ -17,6 +17,21 @@ import (
 	"time"
 )
 
+// setLibxvidBackend names the FFmpeg-side Xvid backend for reporting whenever
+// the native encraw path is bypassed or abandoned mid-item.
+func setLibxvidBackend(item *ItemResult, preset string) {
+	switch preset {
+	case "xvid_max_q2":
+		item.Backend = "FFmpeg libxvid Share fallback (strict Q2 full RD/B0)"
+	case "xvid_efficient_q2":
+		item.Backend = "FFmpeg libxvid Efficient fallback (strict Q2 full RD/B0; native B-Q3 unavailable)"
+	case "xvid_compact":
+		item.Backend = "FFmpeg libxvid Fast fallback (B0)"
+	default:
+		item.Backend = "FFmpeg libxvid fallback"
+	}
+}
+
 func isXvidPreset(p string) bool {
 	return p == "xvid_compact" || p == "xvid_max_q2" || p == "xvid_efficient_q2" || p == "xvid_small" || p == "xvid_max"
 }
@@ -63,6 +78,13 @@ func formatFPSFloat(r *big.Rat) string {
 
 func nativeXvidEligible(info MediaInfo) bool {
 	if strings.ToLower(filepath.Ext(info.Path)) != ".avi" {
+		return false
+	}
+	// Alpha cannot survive Xvid's YUV-only pipeline, and RGB sources take a
+	// different colour matrix through encraw's internal conversion (BT.601
+	// fixed) than the explicit BT.709 chain libxvid gets — both belong to the
+	// FFmpeg path where the conversion is controlled.
+	if info.HasAlpha || isRGBPixelFormat(info.PixelFormat) || strings.EqualFold(info.ColorSpace, "gbr") {
 		return false
 	}
 	return sourceClass(info) == "lossless"
@@ -347,14 +369,15 @@ func (e *Engine) runNativeXvid(ctx context.Context, info MediaInfo, req ConvertO
 	needAudio := len(info.Audio) > 0 && !req.StripAudio && !req.Conform
 	remux := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-r", ratString(target), "-f", "m4v", "-i", tmpVideo}
 	if needAudio {
-		remux = append(remux, "-i", info.Path, "-map", "0:v:0", "-map", "1:a?")
+		remux = append(remux, "-i", info.Path, "-map", "0:V:0", "-map", "1:a?")
 	} else {
-		remux = append(remux, "-map", "0:v:0")
+		remux = append(remux, "-map", "0:V:0")
 	}
 	remux = append(remux, "-c:v", "copy", "-vtag", "XVID")
 	if needAudio {
 		remux = append(remux, "-c:a", "copy")
 	}
+	remux = append(remux, provenanceArgs(info, req)...)
 	remux = append(remux, "-progress", "pipe:1", "-stats_period", "0.25", "-nostats", out)
 	if err := e.runFFmpeg(ctx, remux, expectedDur, func(p progressInfo) {
 		p.Stage = "WRAP"

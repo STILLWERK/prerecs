@@ -16,9 +16,19 @@ func TestParsePathInput(t *testing.T) {
 	if len(got) != 2 || got[0] != `C:\A B\one.mp4` || got[1] != `D:\two.mov` {
 		t.Fatalf("got %#v", got)
 	}
+	// `;` and `'` are legal filename characters — they must not be treated
+	// as path separators or quote syntax and silently split/corrupt a name.
 	got = parsePathInput(`a.mp4;b.mov`)
-	if len(got) != 2 {
-		t.Fatalf("semicolon parse %#v", got)
+	if len(got) != 1 || got[0] != `a.mp4;b.mov` {
+		t.Fatalf("semicolon-in-name split %#v", got)
+	}
+	got = parsePathInput(`it's.avi`)
+	if len(got) != 1 || got[0] != `it's.avi` {
+		t.Fatalf("apostrophe-in-name mangled %#v", got)
+	}
+	got = parsePathInput(`semi;colon.avi`)
+	if len(got) != 1 || got[0] != `semi;colon.avi` {
+		t.Fatalf("semicolon-in-name split %#v", got)
 	}
 }
 

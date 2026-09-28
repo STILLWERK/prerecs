@@ -28,6 +28,21 @@ type MediaInfo struct {
 	Chroma          string
 	// Audio holds the codec name of each audio stream, in stream order.
 	Audio []string
+	// ProvenanceTag is the container's embedded provenance comment, if any.
+	// On reuse candidates it is matched against the source's content
+	// signature and the job signature; a missing or foreign tag disqualifies
+	// adoption.
+	ProvenanceTag string
+	// TimestampsBroken marks video timestamps that were proven unusable by
+	// the exact decode scan (duplicate/non-advancing PTS or no stats at
+	// all). Healthy timing — including variable frame rate — is preserved
+	// through passthrough instead of being flattened to constant rate.
+	TimestampsBroken bool
+	// ImpeachedFPS is the container's declared frame rate after consistency
+	// checks cleared it — unusable for normal verification, but when packet
+	// timestamps are proven destroyed it is the only surviving statement of
+	// intended rate, so the timeline rebuild may fall back to it.
+	ImpeachedFPS string
 }
 
 type Capabilities struct {
@@ -43,6 +58,11 @@ type Capabilities struct {
 	HasNativeXvid   bool
 	XvidEncRaw      string
 	MagicInstalled  bool
+	// HasVfrdet gates the timestamp-health observation on the decode scan: a
+	// --disable-everything build without the filter would fail every compressed
+	// input at SCAN, so without it broken-timing repair silently degrades to
+	// passthrough rather than crashing.
+	HasVfrdet bool
 }
 
 type ConvertOptions struct {

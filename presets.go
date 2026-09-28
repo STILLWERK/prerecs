@@ -50,16 +50,43 @@ func recommendedProResPreset(infos []MediaInfo) string {
 	return "prores_lt"
 }
 
+// Audio stream-copy allowlists, measured directly against the FFmpeg muxers
+// (every entry below was encoded+muxed successfully; pcm_dvd, pcm_bluray,
+// unsigned 16/24/32, *_planar, s64be, dts, opus, gsm, cook, atrac3 and the
+// like all fail at header write). An earlier pcm_* prefix check let the
+// unsupported variants ride through and die late with a cryptic mux error.
+var (
+	aviCopyableAudio = map[string]bool{
+		"pcm_s16le": true, "pcm_s24le": true, "pcm_s32le": true, "pcm_s64le": true,
+		"pcm_f32le": true, "pcm_f64le": true, "pcm_u8": true,
+		"pcm_alaw": true, "pcm_mulaw": true,
+		"mp3": true, "mp2": true, "ac3": true, "eac3": true,
+		"wmav1": true, "wmav2": true, "flac": true,
+		"adpcm_ima_wav": true, "adpcm_ms": true,
+	}
+	movCopyableAudio = map[string]bool{
+		"pcm_s16le": true, "pcm_s24le": true, "pcm_s32le": true, "pcm_s64le": true,
+		"pcm_f32le": true, "pcm_f64le": true, "pcm_u8": true,
+		"pcm_alaw": true, "pcm_mulaw": true,
+		// BE variants and signed-8 have MOV fourccs but no AVI WAV tag.
+		"pcm_s8": true, "pcm_s16be": true, "pcm_s24be": true, "pcm_s32be": true,
+		"pcm_f32be": true, "pcm_f64be": true,
+		"aac": true, "alac": true, "mp3": true, "mp2": true,
+		"ac3": true, "eac3": true, "wmav1": true, "wmav2": true,
+		"adpcm_ima_qt": true, "adpcm_ima_wav": true, "adpcm_ms": true,
+	}
+)
+
 func audioCopyCompatible(preset, codec string) bool {
 	c := strings.ToLower(strings.TrimSpace(codec))
 	if c == "" {
 		return false
 	}
 	if strings.HasPrefix(preset, "xvid") || preset == "magicyuv_lossless" || preset == "utvideo_lossless" {
-		return strings.HasPrefix(c, "pcm_") || c == "mp3" || c == "mp2"
+		return aviCopyableAudio[c]
 	}
 	if strings.HasPrefix(preset, "prores") {
-		return strings.HasPrefix(c, "pcm_") || c == "aac" || c == "alac" || c == "mp3" || c == "ac3" || c == "eac3"
+		return movCopyableAudio[c]
 	}
 	return false
 }
@@ -126,9 +153,13 @@ func validatePresetInputs(preset string, infos []MediaInfo) error {
 		}
 		return nil
 	case "prores_4444":
+		return nil
+	case "xvid_compact", "xvid_max_q2", "xvid_efficient_q2", "xvid_small", "xvid_max":
+		// Xvid carries no alpha channel and -pix_fmt silently discards it —
+		// same hard rejection the non-4444 ProRes presets apply.
 		for _, in := range infos {
-			if isGrayAlphaPixelFormat(in.PixelFormat) && in.BitDepth > 8 {
-				return fmt.Errorf("%s: %s gray+alpha is not safely supported by the ProRes 4444 path; use an RGB/RGBA or supported YUVA source", filepath.Base(in.Path), in.PixelFormat)
+			if in.HasAlpha {
+				return fmt.Errorf("%s: source contains alpha and Xvid output cannot preserve it; use ProRes 4444 to keep alpha", filepath.Base(in.Path))
 			}
 		}
 		return nil

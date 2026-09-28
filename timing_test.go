@@ -230,3 +230,17 @@ func FuzzRationalParsers(f *testing.F) {
 		}
 	})
 }
+
+// A timescale that collapses the target rate below 1 fps must be refused at
+// option validation — the previous floor only rejected absurdly high rates.
+func TestConformFPSFloor(t *testing.T) {
+	info := MediaInfo{FPS: "30/1", FPSFloat: 30, Duration: 2, FrameCount: 60}
+	_, _, _, err := expectedTiming(info, ConvertOptions{Conform: true, Timescale: "10000/1"})
+	if err == nil || !strings.Contains(err.Error(), "unreasonably low") {
+		t.Fatalf("0.003 fps target accepted: %v", err)
+	}
+	_, _, _, err = expectedTiming(info, ConvertOptions{Conform: true, Timescale: "1/2"})
+	if err != nil {
+		t.Fatalf("60 fps target should be accepted: %v", err)
+	}
+}

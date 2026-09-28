@@ -142,7 +142,7 @@ func TestCorruptSourceNeverVerifies(t *testing.T) {
 		t.Fatalf("ffprobe should still read the corrupt container: %v", err)
 	}
 	e := &Engine{caps: caps, enc: enc}
-	if _, err := e.countDecodedFrames(context.Background(), info, func(progressInfo) {}); err == nil {
+	if _, _, err := e.countDecodedFrames(context.Background(), info, false, false, func(progressInfo) {}); err == nil {
 		t.Fatal("strict decode scan accepted a corrupt source")
 	}
 
