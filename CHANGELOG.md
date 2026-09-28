@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — Security and correctness hardening patch
+## v1.0.6 — Security and correctness hardening patch
 
 - `avifil32.dll` is now loaded with `LOAD_LIBRARY_SEARCH_SYSTEM32` only: it is not a KnownDLL, so the default Windows DLL search order could pick up a payload library planted beside the executable or in the working directory on the first VfW call.
 - FFprobe's stdout and stderr are captured separately — a non-fatal diagnostic line can no longer corrupt the JSON document and reject a valid file — and the JSON capture is bounded to 16 MiB. Probe failures now name the tool and file instead of returning a bare `invalid character`/`ffprobe:` error, and a clean ffprobe exit with a descendant-held pipe (WaitDelay) is treated as the success it is.
