@@ -236,6 +236,15 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 					}
 				}
 				if len(problems) == 0 {
+					// srcSig was computed before the candidate was probed and
+					// decoded; a source swapped mid-evaluation must not inherit
+					// the decision — the adopted output would then belong to
+					// content that no longer exists. Re-checking costs one hash
+					// on the adoption path only.
+					if sourceSignature(info.Path) != srcSig {
+						rep.line(ui.yellow("Source changed while checking existing output; not adopting it."))
+						break
+					}
 					item.Output = cand
 					item.OutputInfo = outInfo
 					item.Status = "skipped"

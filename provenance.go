@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"sync"
 )
 
 // Output reuse is only safe when a candidate can prove it was produced from
@@ -28,35 +27,23 @@ const provenancePrefix = "prerecs1"
 // full byte stream. A sampled (head/middle/tail) hash left same-size edits in
 // the unhashed gaps undetectable — and for raw/uncompressed masters, which
 // share size by construction for equal resolution+duration, that blind spot
-// could adopt a stale output as "same source". The full pass is one extra
-// sequential read per job — cheaper than the decode scans the batch already
-// runs. Results are memoized per (path,size,mtime): the several call sites in
-// a single job hash an unchanged file once, while a mid-run modification
-// changes the key and is caught on the next call. A read failure yields ""
+// could adopt a stale output as "same source". Every call reads the current
+// bytes deliberately: the encode-args and post-verify call sites are the
+// freshness checks that catch a source swapped mid-run, and a size/mtime
+// memoization key would miss exactly the timestamp-preserving swap they exist
+// to detect. The full pass is a sequential read — cheaper than the decode
+// scans the batch already runs on the same file. A read failure yields ""
 // and the caller never adopts an output under that signature.
-type sourceSigEntry struct {
-	size    int64
-	modNano int64
-	sig     string
-}
-
-var sourceSigCache sync.Map // path -> sourceSigEntry
-
 func sourceSignature(path string) string {
-	st, err := os.Stat(path)
-	if err != nil || !st.Mode().IsRegular() {
-		return ""
-	}
-	if v, ok := sourceSigCache.Load(path); ok {
-		if e := v.(sourceSigEntry); e.size == st.Size() && e.modNano == st.ModTime().UnixNano() {
-			return e.sig
-		}
-	}
 	f, err := os.Open(path)
 	if err != nil {
 		return ""
 	}
 	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || !st.Mode().IsRegular() {
+		return ""
+	}
 	h := sha256.New()
 	var sizeBuf [8]byte
 	binary.LittleEndian.PutUint64(sizeBuf[:], uint64(st.Size()))
@@ -64,9 +51,7 @@ func sourceSignature(path string) string {
 	if _, err := io.CopyBuffer(h, f, make([]byte, 1<<20)); err != nil {
 		return ""
 	}
-	sig := hex.EncodeToString(h.Sum(nil))
-	sourceSigCache.Store(path, sourceSigEntry{size: st.Size(), modNano: st.ModTime().UnixNano(), sig: sig})
-	return sig
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // jobSignature captures every option that changes the encoded payload, so a
