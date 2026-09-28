@@ -46,12 +46,26 @@ func outputCandidates(src, custom, preset string) ([]string, string, error) {
 		ext = ".avi"
 	}
 	stem := strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
-	// List the directory once so sparse numbered outputs are discovered for
-	// reuse even when earlier slots are missing (e.g. only clip_p_2.avi exists).
 	prefix := stem + "_" + preset
-	entries, err := os.ReadDir(base)
+	existing, taken, err := scanOutputSlots(base, prefix, ext)
 	if err != nil {
 		return nil, "", err
+	}
+	reserved, err := reserveOutputSlot(base, prefix, ext, taken)
+	if err != nil {
+		return existing, "", err
+	}
+	return existing, reserved, nil
+}
+
+// scanOutputSlots lists base once and returns the pre-existing output paths
+// matching prefix/ext, sorted by slot number, plus the set of claimed slots.
+// Sparse numbered outputs are discovered for reuse even when earlier slots
+// are missing (e.g. only clip_p_2.avi exists).
+func scanOutputSlots(base, prefix, ext string) ([]string, map[int]bool, error) {
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil, nil, err
 	}
 	taken := map[int]bool{}
 	type candidate struct {
@@ -96,16 +110,21 @@ func outputCandidates(src, custom, preset string) ([]string, string, error) {
 		taken[n] = true
 		found = append(found, candidate{n: n, path: filepath.Join(base, name)})
 	}
-	// found holds candidates discovered by the directory scan, sorted by slot
-	// number. Paths claimed by losing an O_EXCL race below are another run's
-	// active reservation — their contents are still in flux, so they must
-	// never be offered for reuse.
 	sort.Slice(found, func(i, j int) bool { return found[i].n < found[j].n })
 	existing := make([]string, 0, len(found))
 	for _, c := range found {
 		existing = append(existing, c.path)
 	}
-	// Reserve the lowest free slot with O_EXCL so parallel runs stay atomic.
+	return existing, taken, nil
+}
+
+// reserveOutputSlot claims the lowest free slot with O_EXCL so parallel runs
+// stay atomic. A slot that reports os.ErrExist was claimed by another run
+// between the scan and this reservation: that path is the winner's active
+// reservation and its contents are still in flux, so it stays out of the
+// reuse list — the reuse check could otherwise verify a file the owner later
+// deletes on its own verification failure.
+func reserveOutputSlot(base, prefix, ext string, taken map[int]bool) (string, error) {
 	for n := 1; n <= len(taken)+1 && n < 100000; n++ {
 		if taken[n] {
 			continue
@@ -122,21 +141,19 @@ func outputCandidates(src, custom, preset string) ([]string, string, error) {
 		if err == nil {
 			if closeErr := reservation.Close(); closeErr != nil {
 				_ = os.Remove(p)
-				return existing, "", closeErr
+				return "", closeErr
 			}
-			return existing, p, nil
+			return p, nil
 		}
 		if errors.Is(err, os.ErrExist) {
 			// A concurrent run claimed this slot between the directory scan
-			// and the reservation. Keep its in-flight reservation out of the
-			// reuse list — the reuse check could otherwise verify a file the
-			// owner later deletes on its own verification failure.
+			// and the reservation.
 			taken[n] = true
 			continue
 		}
-		return existing, "", fmt.Errorf("reserve output %s: %w", p, err)
+		return "", fmt.Errorf("reserve output %s: %w", p, err)
 	}
-	return existing, "", errors.New("could not choose unused output filename")
+	return "", errors.New("could not choose unused output filename")
 }
 
 func releaseOutputReservation(path string) error {
