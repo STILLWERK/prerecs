@@ -38,6 +38,32 @@ func TestSourceSignatureDistinguishesContent(t *testing.T) {
 	}
 }
 
+// Same-size files that differ only outside the old head/middle/tail samples
+// must still produce different signatures — raw/uncompressed masters share
+// size by construction for equal resolution+duration, so an unsampled-region
+// edit would otherwise adopt a stale output as "same source".
+func TestSourceSignatureDistinguishesUnsampledRegion(t *testing.T) {
+	td := t.TempDir()
+	data := make([]byte, 6<<20)
+	for i := range data {
+		data[i] = byte(i * 31)
+	}
+	a := filepath.Join(td, "a.bin")
+	b := filepath.Join(td, "b.bin")
+	if err := os.WriteFile(a, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	// 1.5 MiB sits between the former head (0–1 MiB) and middle (2.5–3.5 MiB)
+	// sample windows; the tail sample is untouched as well.
+	data[1<<20+512<<10] ^= 0xFF
+	if err := os.WriteFile(b, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if sourceSignature(a) == sourceSignature(b) {
+		t.Fatal("edit inside the unsampled region produced a matching signature")
+	}
+}
+
 func TestProvenanceMatchesRequiresBothHalves(t *testing.T) {
 	opts := ConvertOptions{Preset: "prores_lt", StripAudio: true}
 	src := "0123456789abcdef"

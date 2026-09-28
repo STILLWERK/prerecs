@@ -129,12 +129,18 @@ func runApplication() {
 		if !cfg.yes {
 			start, err := askYesNo("Start conversion?", true)
 			if err != nil {
+				if sawFailure {
+					os.Exit(1)
+				}
 				return
 			}
 			if !start {
 				fmt.Println(ui.dim("Cancelled."))
 				again, err := askYesNo("Start a new job?", true)
 				if err != nil || !again {
+					if sawFailure {
+						os.Exit(1)
+					}
 					return
 				}
 				jobArgs = nil
@@ -165,6 +171,9 @@ func runApplication() {
 			fmt.Println("  3. Exit")
 			choice, err := askChoice("Choose", []string{"1", "2", "3"}, "1")
 			if err != nil {
+				if sawFailure {
+					os.Exit(1)
+				}
 				return
 			}
 			switch choice {
@@ -180,6 +189,9 @@ func runApplication() {
 					fmt.Println(ui.yellow("  Could not open folder: ") + strictConsoleText(err.Error()))
 				}
 			case "3":
+				if sawFailure {
+					os.Exit(1)
+				}
 				return
 			}
 		}

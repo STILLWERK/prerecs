@@ -85,6 +85,20 @@ func TestDeriveBitDepthCommonPixelFormats(t *testing.T) {
 		"y216le":    16,
 		"y416le":    16,
 		"ayuv64le":  16,
+		// Float formats carry no digits; they must still classify as >8-bit
+		// (and must not be swallowed by the generic gbrp/gray/ya prefixes).
+		"gbrpf32le":  32,
+		"gbrpf32be":  32,
+		"gbrapf32le": 32,
+		"gbrapf32be": 32,
+		"grayf32le":  32,
+		"grayf32be":  32,
+		"rgbf32le":   32,
+		"rgbf32be":   32,
+		"rgbaf32le":  32,
+		"rgbaf32be":  32,
+		"yaf32le":    32,
+		"yaf32be":    32,
 	}
 	for pixFmt, want := range cases {
 		if got := deriveBitDepth(pixFmt); got != want {
@@ -441,12 +455,18 @@ func TestChromaSemiPlanarAndPacked(t *testing.T) {
 	}
 }
 
-func TestHasAlphaV410(t *testing.T) {
-	if !hasAlpha("v410") {
-		t.Fatal("v410 carries alpha on FFmpeg ≤7.x builds")
+func TestHasAlphaPackedV(t *testing.T) {
+	// v410 is packed 10-bit 4:4:4 with 2 padding bits (the alpha counterpart
+	// is y410); vuyx/v30x/xv30/xv36 carry X padding, never alpha.
+	for _, p := range []string{"v410", "vuyx", "v30xle", "xv30le", "xv36le"} {
+		if hasAlpha(p) {
+			t.Fatalf("%s has padding bits, not alpha", p)
+		}
 	}
-	if hasAlpha("vuyx") {
-		t.Fatal("vuyx has padding, not alpha")
+	for _, p := range []string{"v408", "vuya", "uyva", "y410le", "yaf32le", "yaf32be", "gbrapf32le"} {
+		if !hasAlpha(p) {
+			t.Fatalf("%s carries alpha", p)
+		}
 	}
 }
 

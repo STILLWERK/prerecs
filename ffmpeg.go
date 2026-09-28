@@ -494,19 +494,20 @@ func brokenTimestamps(st *timingStats, frames int64, refDurSec float64) bool {
 		// the very case the rebuild exists for.
 		return true
 	}
-	if st.HasDeltas {
+	if st.HasDeltas && st.MinDelta <= 0 {
 		// Delta range only exists when cadence varied; a non-positive minimum
 		// is duplicated or non-monotonic PTS, which playback cannot express.
-		return st.MinDelta <= 0
+		return true
 	}
-	// Uniform cadence reports no delta range at all, so a stream whose frames
-	// all share one PTS (or whose container header claims a duration the
-	// packet timestamps collapse far below) is invisible to the delta check —
-	// catch it by comparing the decoded presentation spread against the claimed
-	// duration. The reference is a minimum over surviving metadata claims, and
-	// the collapse must be extreme (8×): a merely-stale rate claim — the exact
-	// garbage this path exists to clean up — cannot fabricate a "collapsed"
-	// verdict and retime a healthy stream.
+	// A stream whose frames all share one PTS (or whose packet timestamps
+	// collapse far below any surviving metadata claim) need not report a
+	// delta range — uniform-zero PTS produces none at all — so the collapse
+	// check must also cover stats that did vary: positive-but-tiny deltas
+	// over a seconds-long clip are just as destroyed. The reference is a
+	// minimum over surviving metadata claims, and the collapse must be
+	// extreme (8×): a merely-stale rate claim — the exact garbage this path
+	// exists to clean up — cannot fabricate a "collapsed" verdict and retime
+	// a healthy stream.
 	if frames > 1 && refDurSec > 0 && st.LastOutSec > 0 && st.LastOutSec*8 <= refDurSec {
 		return true
 	}

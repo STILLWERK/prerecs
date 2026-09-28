@@ -4,10 +4,10 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"errors"
 	"io"
 	"os"
 	"strings"
+	"sync"
 )
 
 // Output reuse is only safe when a candidate can prove it was produced from
@@ -24,41 +24,49 @@ import (
 
 const provenancePrefix = "prerecs1"
 
-// sourceSignature fingerprints file content cheaply: size plus a head/middle/
-// tail sample. Outputs embed it so reuse decisions verify provenance instead
-// of hoping identical metadata implies identical content. For files above 3 MB
-// the unhashed mid-section gaps are the known blind-spot bound — two same-size
-// sources differing only there collide; the full decode + metadata checks
-// still gate adoption. A read failure yields "" and the caller never adopts
-// an output under that signature.
+// sourceSignature fingerprints file content: SHA-256 over the size and the
+// full byte stream. A sampled (head/middle/tail) hash left same-size edits in
+// the unhashed gaps undetectable — and for raw/uncompressed masters, which
+// share size by construction for equal resolution+duration, that blind spot
+// could adopt a stale output as "same source". The full pass is one extra
+// sequential read per job — cheaper than the decode scans the batch already
+// runs. Results are memoized per (path,size,mtime): the several call sites in
+// a single job hash an unchanged file once, while a mid-run modification
+// changes the key and is caught on the next call. A read failure yields ""
+// and the caller never adopts an output under that signature.
+type sourceSigEntry struct {
+	size    int64
+	modNano int64
+	sig     string
+}
+
+var sourceSigCache sync.Map // path -> sourceSigEntry
+
 func sourceSignature(path string) string {
+	st, err := os.Stat(path)
+	if err != nil || !st.Mode().IsRegular() {
+		return ""
+	}
+	if v, ok := sourceSigCache.Load(path); ok {
+		if e := v.(sourceSigEntry); e.size == st.Size() && e.modNano == st.ModTime().UnixNano() {
+			return e.sig
+		}
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return ""
 	}
 	defer f.Close()
-	st, err := f.Stat()
-	if err != nil || !st.Mode().IsRegular() {
-		return ""
-	}
 	h := sha256.New()
 	var sizeBuf [8]byte
 	binary.LittleEndian.PutUint64(sizeBuf[:], uint64(st.Size()))
 	h.Write(sizeBuf[:])
-	const chunk = 1 << 20
-	buf := make([]byte, chunk)
-	for _, off := range []int64{0, st.Size()/2 - chunk/2, st.Size() - chunk} {
-		if off < 0 {
-			continue
-		}
-		// ReadAt returns io.EOF with a short read — files smaller than the
-		// chunk, and every tail read, land here. Treating EOF as failure would
-		// silently drop the sample and collapse the signature to size-only.
-		if n, err := f.ReadAt(buf, off); n > 0 && (err == nil || errors.Is(err, io.EOF)) {
-			h.Write(buf[:n])
-		}
+	if _, err := io.CopyBuffer(h, f, make([]byte, 1<<20)); err != nil {
+		return ""
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	sig := hex.EncodeToString(h.Sum(nil))
+	sourceSigCache.Store(path, sourceSigEntry{size: st.Size(), modNano: st.ModTime().UnixNano(), sig: sig})
+	return sig
 }
 
 // jobSignature captures every option that changes the encoded payload, so a

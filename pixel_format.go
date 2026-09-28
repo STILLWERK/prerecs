@@ -12,6 +12,16 @@ func deriveBitDepth(p string) int {
 		return 0
 	}
 
+	// Float planar formats (EXR/HDR decodes) report no numeric depth in the
+	// name. They must be recognized before the generic planar prefix loop:
+	// gbrpf32le matches "gbrp" first and would otherwise return 0, dropping
+	// float sources into the silent 8-bit conversion path.
+	for _, pixFmt := range []string{"gbrpf32le", "gbrpf32be", "gbrapf32le", "gbrapf32be", "grayf32le", "grayf32be", "rgbf32le", "rgbf32be", "rgbaf32le", "rgbaf32be", "yaf32le", "yaf32be"} {
+		if low == pixFmt {
+			return 32
+		}
+	}
+
 	for _, prefix := range []string{
 		"yuva420p", "yuva422p", "yuva444p",
 		"yuv420p", "yuv422p", "yuv444p", "yuv440p", "yuv411p", "yuv410p",
@@ -79,14 +89,6 @@ func deriveBitDepth(p string) int {
 			return 16
 		}
 	}
-	// Float planar formats (EXR/HDR decodes) report no numeric depth in the
-	// name; without this they collapse to BitDepth 0 and the conversion pins
-	// silently crush them through the 8-bit path.
-	for _, pixFmt := range []string{"gbrpf32le", "gbrpf32be", "gbrapf32le", "gbrapf32be", "grayf32le", "grayf32be", "rgbf32le", "rgbf32be", "rgbaf32le", "rgbaf32be", "yaf32le", "yaf32be"} {
-		if low == pixFmt {
-			return 32
-		}
-	}
 	// These descriptors always carry an endian suffix in ffprobe output
 	// (p210le/be, x2rgb10le/be, ...); the bare enum name never appears.
 	for _, prefix := range []string{"p010", "p210", "p410", "nv20", "v30x", "xv30", "x2rgb10", "x2bgr10", "y210", "y410"} {
@@ -114,10 +116,10 @@ func validPackedSuffix(suffix string) bool {
 func hasAlpha(p string) bool {
 	low := strings.ToLower(p)
 	// Packed/palette formats whose pixdesc sets AV_PIX_FMT_FLAG_ALPHA. The
-	// padded siblings (vuyx, v30x, xv30, xv36) carry X bits, not alpha.
-	// v410 is FFmpeg ≤7.x's packed 10-bit YUVA (the enum was dropped in 8).
+	// padded siblings (vuyx, v30x, xv30, xv36, v410) carry X bits, not alpha;
+	// their alpha-bearing counterparts are v408/vuya/y410.
 	switch low {
-	case "v408", "vuya", "uyva", "pal8", "v410":
+	case "v408", "vuya", "uyva", "pal8":
 		return true
 	}
 	for _, prefix := range []string{"rgba", "bgra", "argb", "abgr", "yuva", "ayuv", "gbraf", "y410", "y412", "y416"} {
@@ -130,7 +132,7 @@ func hasAlpha(p string) bool {
 
 func isGrayAlphaPixelFormat(p string) bool {
 	low := strings.ToLower(strings.TrimSpace(p))
-	return strings.HasPrefix(low, "ya8") || strings.HasPrefix(low, "ya16")
+	return strings.HasPrefix(low, "ya8") || strings.HasPrefix(low, "ya16") || strings.HasPrefix(low, "yaf32")
 }
 
 func isRGBPixelFormat(p string) bool {

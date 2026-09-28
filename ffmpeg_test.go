@@ -735,6 +735,19 @@ func TestParseTimingStats(t *testing.T) {
 	if !brokenTimestamps(extreme, 60, 2.0) {
 		t.Fatal("10× collapsed spread should be detected as destroyed timing")
 	}
+	// Positive-but-tiny varying deltas are the same collapse class as
+	// uniform-zero PTS: alternating 1–2 ms presentation over a clip whose
+	// claims imply seconds must not pass as healthy VFR.
+	fluttered := &timingStats{Reported: true, HasDeltas: true, MinDelta: 1, MaxDelta: 2, LastOutSec: 0.2}
+	if !brokenTimestamps(fluttered, 60, 2.0) {
+		t.Fatal("positive-but-collapsed delta variance escaped the spread check")
+	}
+	// A genuine VFR stream (varying positive deltas spanning the claimed
+	// duration) is healthy and must be preserved.
+	trueVFR := &timingStats{Reported: true, HasDeltas: true, MinDelta: 16, MaxDelta: 33, LastOutSec: 1.97}
+	if brokenTimestamps(trueVFR, 60, 2.0) {
+		t.Fatal("genuine VFR cadence classified as collapsed")
+	}
 }
 
 // timingReference picks the minimum-implied duration over surviving metadata
