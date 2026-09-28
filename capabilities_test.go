@@ -82,3 +82,48 @@ func TestCapabilityCommandOutputTimeout(t *testing.T) {
 		t.Fatalf("command was not bounded by the timeout: %v", elapsed)
 	}
 }
+
+// -fps_mode first exists in FFmpeg 5.1 — the floor must reject anything older
+// at startup instead of failing per-command mid-batch.
+func TestFFmpegVersionFloor(t *testing.T) {
+	for _, tc := range []struct {
+		line string
+		ok   bool
+	}{
+		{"ffmpeg version 8.0.1-3ubuntu2", true},
+		{"ffmpeg version 7.1-full_build-www.gyan.dev", true},
+		{"ffmpeg version 6.1.1", true},
+		{"ffmpeg version 5.1", true},
+		{"ffmpeg version 5.1.2 Copyright (c)", true},
+		{"ffmpeg version 5.0", false},
+		{"ffmpeg version 5.0.3", false},
+		{"ffmpeg version 4.4.2", false},
+		{"ffmpeg version 3.4.11", false},
+		// Snapshot/master builds carry no dotted version: treated as modern,
+		// real failures surface if that assumption is ever wrong.
+		{"ffmpeg version N-110521-gd15a1b63d0", true},
+		{"ffmpeg version git-2023-11-01-abcdef", true},
+		{"garbage without a version", true},
+		{"", true},
+	} {
+		if got := ffmpegVersionOK(tc.line); got != tc.ok {
+			t.Errorf("ffmpegVersionOK(%q)=%v, want %v", tc.line, got, tc.ok)
+		}
+	}
+}
+
+// stderr merges into CombinedOutput, so warnings can precede the version
+// headline; the scan must skip noise instead of adopting it as the version.
+func TestFFmpegVersionLineSkipsLeadingNoise(t *testing.T) {
+	out := []byte("some driver warning on stderr\nffmpeg version 7.1-3ubuntu5\nbuilt with gcc 13\n")
+	if got := ffmpegVersionLine(out); got != "ffmpeg version 7.1-3ubuntu5" {
+		t.Fatalf("version line = %q", got)
+	}
+	if got := ffmpegVersionLine([]byte("  ffmpeg version N-110000-gabc  \nconfig: --enable-x")); got != "ffmpeg version N-110000-gabc" {
+		t.Fatalf("snapshot version line = %q", got)
+	}
+	// No headline at all: fall back to the first line for diagnostics.
+	if got := ffmpegVersionLine([]byte("total garbage\nmore")); got != "total garbage" {
+		t.Fatalf("fallback = %q", got)
+	}
+}

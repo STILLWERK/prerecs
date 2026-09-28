@@ -454,3 +454,69 @@ func TestAskLineWhitespaceThenEOF(t *testing.T) {
 		t.Fatalf("blank line should yield default: v=%q err=%v", v, err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Flag precedence: explicit options must not be silently dropped (#5, #6)
+// ---------------------------------------------------------------------------
+
+// --capture-fps only matters for a conform job; with --yes there is no TIMING
+// prompt to rescue it, so the flag must fail fast instead of being ignored.
+func TestCaptureFPSWithoutTimescaleFailsUnderYes(t *testing.T) {
+	e := &Engine{caps: Capabilities{HasProRes: true}, enc: map[string]bool{"prores_ks": true}}
+	infos := []MediaInfo{{Path: "clip.mp4", Codec: "h264"}}
+	_, err := collectOptions(cliConfig{preset: "edit", captureFPS: "30", yes: true}, theme{}, e, infos)
+	if err == nil || !strings.Contains(err.Error(), "--capture-fps") || !strings.Contains(err.Error(), "--timescale") {
+		t.Fatalf("lone --capture-fps under --yes did not fail fast: %v", err)
+	}
+}
+
+// In the interactive conform flow the flag-provided value seeds the prompt
+// default: pressing Enter must keep it, not discard it.
+func TestCaptureFPSFlagSeedsInteractiveDefault(t *testing.T) {
+	old := stdinReader
+	defer func() { stdinReader = old }()
+	stdinReader = bufio.NewReader(strings.NewReader("y\n\n0.1\n"))
+	e := &Engine{caps: Capabilities{HasProRes: true}, enc: map[string]bool{"prores_ks": true}}
+	infos := []MediaInfo{{Path: "clip.mp4", Codec: "h264", FPS: "30/1", FPSFloat: 30}}
+	opts, err := collectOptions(cliConfig{preset: "edit", captureFPS: "30", outputDir: t.TempDir()}, theme{}, e, infos)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.Conform || opts.CaptureFPS != "30" || opts.Timescale != "0.1" {
+		t.Fatalf("conform opts=%+v, want capture 30 / timescale 0.1", opts)
+	}
+}
+
+// An explicit --strip-audio must not be undone by pressing Enter on the
+// keep-audio default: the flag locks the decision without re-asking.
+func TestStripAudioFlagSkipsPrompt(t *testing.T) {
+	old := stdinReader
+	defer func() { stdinReader = old }()
+	stdinReader = bufio.NewReader(strings.NewReader("n\n1\n"))
+	e := &Engine{caps: Capabilities{HasProRes: true}, enc: map[string]bool{"prores_ks": true}}
+	infos := []MediaInfo{{Path: "clip.mov", Codec: "prores", Audio: []string{"aac"}, PixelFormat: "yuv422p10le", BitDepth: 10, Chroma: "4:2:2"}}
+	opts, err := collectOptions(cliConfig{preset: "edit", stripAudio: true, outputDir: t.TempDir()}, theme{}, e, infos)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.StripAudio {
+		t.Fatal("--strip-audio was overwritten by the audio menu")
+	}
+}
+
+// Without the flag the menu still governs: choosing strip sets it, choosing
+// keep clears it.
+func TestStripAudioMenuStillGovernsWithoutFlag(t *testing.T) {
+	old := stdinReader
+	defer func() { stdinReader = old }()
+	e := &Engine{caps: Capabilities{HasProRes: true}, enc: map[string]bool{"prores_ks": true}}
+	infos := []MediaInfo{{Path: "clip.mov", Codec: "prores", Audio: []string{"aac"}, PixelFormat: "yuv422p10le", BitDepth: 10, Chroma: "4:2:2"}}
+	stdinReader = bufio.NewReader(strings.NewReader("n\n2\n"))
+	opts, err := collectOptions(cliConfig{preset: "edit", outputDir: t.TempDir()}, theme{}, e, infos)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.StripAudio {
+		t.Fatal("menu choice 'strip audio' did not apply")
+	}
+}

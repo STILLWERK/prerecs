@@ -1,6 +1,6 @@
 # PreRecs
 
-PreRecs is a Windows console application for preparing high-frame-rate game captures and other prerequisite video for editing workflows. The current source version is **v1.0.4**; v1.0.0 through v1.0.3 remain frozen.
+PreRecs is a Windows console application for preparing high-frame-rate game captures and other prerequisite video for editing workflows. The current source version is **v1.0.5**; v1.0.0 through v1.0.4 remain frozen.
 
 It has two complementary jobs:
 
@@ -71,7 +71,7 @@ PreRecs is a Windows console application. Each GitHub release publishes a versio
 
 Required:
 
-1. `ffmpeg.exe` and `ffprobe.exe` from a Windows FFmpeg 5.x or newer build;
+1. `ffmpeg.exe` and `ffprobe.exe` from a Windows FFmpeg 5.1 or newer build (the version is checked at startup);
 2. an FFmpeg build with the encoder needed by the selected preset. In particular, Xvid fallback requires `libxvid`, ProRes requires `prores_ks`, and Ut Video requires `utvideo`.
 
 Put FFmpeg in one of these locations:
@@ -153,7 +153,7 @@ The workflow is intentionally staged:
 
 All FFmpeg decode stages (source scan, conversion input, and output verification) run with strict decoder-error handling (`-xerror -err_detect explode`). FFmpeg can otherwise log decode errors yet still exit 0 after silently dropping frames; a bitstream-corrupt source now fails loudly instead of producing a verified truncated output.
 
-FFmpeg diagnostics are drained continuously with bounded capture, and native Xvid retains only the final 32 KiB of each output stream. Metadata probes and capability commands are time-bounded so a wedged tool or inherited subprocess pipe cannot block the workflow indefinitely.
+FFmpeg and native Xvid diagnostics are drained continuously and bounded to the final 32 KiB of output, where the decisive error in a long log lives. Metadata probes and capability commands are time-bounded, and encoder pipes are closed on a bound after process exit so a wedged tool or a descendant inheriting subprocess pipes cannot block the workflow indefinitely.
 
 Verification checks the exact decoded frame count, frame rate, normalized duration, dimensions, requested codec/tag, expected Xvid or lossless pixel format, audio presence and track count, and the copied audio codec when audio is retained. A mismatch fails the job.
 
@@ -205,8 +205,9 @@ On Windows, `build_windows.ps1` runs the unit tests and vet before producing `Pr
 - Lagarith is supported as an input when FFmpeg can decode it, but the tested FFmpeg builds do not provide a Lagarith encoder.
 - Intermediates can be much larger than compressed downloads. Transcoding cannot restore detail already lost by a distribution codec.
 - Timing conforming strips audio by design. Normal-timing audio is stream-copied only when the destination container is known to accept the tested codec.
+- A compressed source gets a clean constant-rate video timeline once its decode scan supplies the exact frame count — but only when no audio is carried. Stream-copied audio keeps the source timeline, so audio-bearing compressed inputs keep passthrough timing for both streams instead of drifting out of sync.
 - Vulkan ProRes is an experimental fast path. It is probed at startup with a bounded (10-second) probe and automatically falls back to CPU `prores_ks` when the driver, probe, or runtime encode fails.
-- Metadata probes are bounded to 30 seconds, while FFmpeg capability commands use a 10-second timeout. Batch probes also honor cancellation immediately; detached folder launchers intentionally outlive conversion contexts.
+- Metadata probes are bounded to 30 seconds — including the per-item existing-output and post-encode probes — while FFmpeg capability commands use a 10-second timeout. Batch probes also honor cancellation immediately; detached folder launchers intentionally outlive conversion contexts.
 - Only the first video stream of each input is processed (`-map 0:v:0`); additional video streams are not converted.
 - Folder inputs are scanned non-recursively: only files directly inside the folder are taken.
 - Directory scans skip filenames that exactly match PreRecs' own generated output naming (`stem_<preset>.avi|mov`, `stem_<preset>_<n>.ext`) so a later run does not re-ingest its own results when the output directory overlaps a scanned folder. A file that deliberately shares the exact generated name can still be passed explicitly.

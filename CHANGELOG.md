@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.0.5 — Compatibility and lifecycle patch
+
+- The documented FFmpeg floor is now enforced at startup: PreRecs requires FFmpeg 5.1 or newer (`-fps_mode` does not exist in 5.0) and rejects older builds once, instead of failing mid-batch. Snapshot/git builds without a dotted release number are checked for `-fps_mode` support directly. `-enc_time_base filter`, which silently required FFmpeg 6.1, is no longer emitted — the `settb`/`setpts`/`fps` chain already produces the constant-rate timestamps it pinned, so FFmpeg 5.1–6.0 now work everywhere.
+- FFmpeg and native-Xvid processes can no longer hang the batch when a wrapper script or a surviving descendant holds their stdout/stderr pipes open after exit: post-exit pipe closure is bounded (5 s), and a clean process exit is judged by the produced output rather than the wedged plumbing.
+- Compressed-source timeline normalization no longer rebuilds video timestamps while audio is stream-copied — copied audio keeps the source timeline and would drift out of sync or trip a false duration-mismatch rejection. Audio-bearing compressed inputs keep passthrough timing for both streams; stripped or audio-less sources still get the clean constant-rate rebuild.
+- Per-item existing-output and post-encode metadata probes now share the documented 30-second bound, and a probe timeout is reported as a failure/rejection rather than masquerading as cancellation.
+- `--capture-fps` without `--timescale` fails fast under `--yes` instead of being silently ignored, and it seeds the interactive conform prompt as the default instead of being overwritten. An explicit `--strip-audio` now locks the choice instead of letting the audio menu's "keep" default undo it.
+- FFmpeg stderr diagnostics retain the trailing 32 KiB — where the decisive error in a long log lives — matching the native-Xvid convention, instead of keeping the first 32 KiB and dropping the ending.
+- Pre-existing outputs that win a reservation race now land in the sorted reuse list, reserved placeholders get normal file permissions, generated-output name matching respects each preset family's real extension (`.avi` vs `.mov`), and `clipName`/`shortFFmpeg` no longer cut multibyte runes in half.
+- `--preset` help lists the canonical `xvid-q3`/`xvid-q1` names alongside the others, and the MagicYUV-missing error names Ut Video as the free alternative.
+
 ## v1.0.4 — Maintainability and process-hardening patch
 
 - Split the former monolithic `main.go` into responsibility-focused files for application wiring, CLI/input handling, presets, capability detection, media probing, FFmpeg execution, native Xvid, pixel formats, output reservations, verification, batch orchestration, and terminal reporting. The tests now follow the same structure; encoder tuning and normal conversion behavior are unchanged.

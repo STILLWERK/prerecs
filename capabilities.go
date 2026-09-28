@@ -2,12 +2,16 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -76,6 +80,42 @@ func findXvidEncRaw() string {
 	return ""
 }
 
+// The encode and decode-scan paths rely on -fps_mode, which first appeared in
+// FFmpeg 5.1. Anything older fails per-command instead of here at startup.
+const (
+	ffmpegMinMajor = 5
+	ffmpegMinMinor = 1
+)
+
+var ffmpegVersionPattern = regexp.MustCompile(`(?i)^ffmpeg version (?:n)?([0-9]+)\.([0-9]+)`)
+
+// ffmpegVersionOK reports whether a `ffmpeg -version` headline meets the
+// minimum version. It only answers for lines that carry a dotted release
+// number; snapshot builds ("N-110521-g..." or "git-...") have none and return
+// true so the caller can fall back to probing -fps_mode support directly.
+func ffmpegVersionOK(line string) bool {
+	m := ffmpegVersionPattern.FindStringSubmatch(line)
+	if m == nil {
+		return true
+	}
+	major, _ := strconv.Atoi(m[1])
+	minor, _ := strconv.Atoi(m[2])
+	return major > ffmpegMinMajor || (major == ffmpegMinMajor && minor >= ffmpegMinMinor)
+}
+
+// ffmpegVersionLine finds the "ffmpeg version" headline in -version output.
+// stderr noise merges into CombinedOutput, so a driver/font warning can
+// precede it — taking the first line blindly would let garbage become both
+// the reported version and the floor check's input.
+func ffmpegVersionLine(out []byte) string {
+	for _, line := range strings.Split(string(out), "\n") {
+		if l := strings.TrimSpace(line); strings.HasPrefix(strings.ToLower(l), "ffmpeg version") {
+			return l
+		}
+	}
+	return strings.Split(strings.TrimSpace(string(out)), "\n")[0]
+}
+
 var capabilityProbeTimeout = 10 * time.Second
 
 func capabilityCommandOutput(name string, args ...string) ([]byte, error) {
@@ -99,7 +139,22 @@ func detectCapabilities() (Capabilities, map[string]bool, error) {
 	if err != nil {
 		return Capabilities{}, nil, err
 	}
-	versionLine := strings.Split(strings.TrimSpace(string(out)), "\n")[0]
+	versionLine := ffmpegVersionLine(out)
+	if !ffmpegVersionOK(versionLine) {
+		return Capabilities{}, nil, fmt.Errorf("%s — PreRecs requires FFmpeg 5.1 or newer", versionLine)
+	}
+	if ffmpegVersionPattern.FindStringSubmatch(versionLine) == nil {
+		// Snapshot/git builds carry no dotted release number to compare — and
+		// ancient snapshots predate 5.1 — so verify the option the floor
+		// actually protects instead of trusting the unparseable line.
+		help, err := capabilityCommandOutput(ffmpeg, "-hide_banner", "-h", "full")
+		if err != nil {
+			return Capabilities{}, nil, fmt.Errorf("cannot determine FFmpeg version (%s) and the -h probe failed: %w", versionLine, err)
+		}
+		if !bytes.Contains(help, []byte("fps_mode")) {
+			return Capabilities{}, nil, fmt.Errorf("%s — PreRecs requires FFmpeg 5.1 or newer", versionLine)
+		}
+	}
 	encOut, err := capabilityCommandOutput(ffmpeg, "-hide_banner", "-encoders")
 	if err != nil {
 		return Capabilities{}, nil, err

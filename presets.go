@@ -158,10 +158,10 @@ func presetEncoderAvailable(caps Capabilities, enc map[string]bool, preset strin
 		}
 	case preset == "magicyuv_lossless":
 		if !enc["magicyuv"] {
-			return errors.New("the MagicYUV preset needs FFmpeg's magicyuv encoder, which this build does not include")
+			return errors.New("the MagicYUV preset needs FFmpeg's magicyuv encoder, which this build does not include; --preset utvideo is a free lossless alternative")
 		}
 		if !caps.MagicInstalled {
-			return errors.New("the MagicYUV preset needs a MagicYUV system/plugin installation, which was not detected")
+			return errors.New("the MagicYUV preset needs a MagicYUV system/plugin installation, which was not detected; --preset utvideo is a free lossless alternative")
 		}
 	case preset == "utvideo_lossless":
 		if !enc["utvideo"] {

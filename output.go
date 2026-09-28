@@ -96,10 +96,15 @@ func outputCandidates(src, custom, preset string) ([]string, string, error) {
 		taken[n] = true
 		found = append(found, candidate{n: n, path: filepath.Join(base, name)})
 	}
-	sort.Slice(found, func(i, j int) bool { return found[i].n < found[j].n })
-	existing := make([]string, 0, len(found))
-	for _, c := range found {
-		existing = append(existing, c.path)
+	// found holds every discovered candidate — from the directory scan and
+	// from races lost to O_EXCL below — sorted by slot number when returned.
+	existing := func() []string {
+		sort.Slice(found, func(i, j int) bool { return found[i].n < found[j].n })
+		paths := make([]string, 0, len(found))
+		for _, c := range found {
+			paths = append(paths, c.path)
+		}
+		return paths
 	}
 	// Reserve the lowest free slot with O_EXCL so parallel runs stay atomic.
 	for n := 1; n <= len(taken)+1 && n < 100000; n++ {
@@ -111,22 +116,24 @@ func outputCandidates(src, custom, preset string) ([]string, string, error) {
 			name = fmt.Sprintf("%s_%d%s", prefix, n, ext)
 		}
 		p := filepath.Join(base, name)
-		reservation, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		reservation, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
 		if err == nil {
 			if closeErr := reservation.Close(); closeErr != nil {
 				_ = os.Remove(p)
-				return existing, "", closeErr
+				return existing(), "", closeErr
 			}
-			return existing, p, nil
+			return existing(), p, nil
 		}
 		if errors.Is(err, os.ErrExist) {
-			existing = append(existing, p)
+			// A concurrent run claimed this slot between the directory scan
+			// and the reservation — it is an existing candidate too.
+			found = append(found, candidate{n: n, path: p})
 			taken[n] = true
 			continue
 		}
-		return existing, "", fmt.Errorf("reserve output %s: %w", p, err)
+		return existing(), "", fmt.Errorf("reserve output %s: %w", p, err)
 	}
-	return existing, "", errors.New("could not choose unused output filename")
+	return existing(), "", errors.New("could not choose unused output filename")
 }
 
 func releaseOutputReservation(path string) error {

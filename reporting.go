@@ -90,8 +90,9 @@ func printHeader(ui theme, caps Capabilities, noNativeXvid bool) {
 }
 
 func shortFFmpeg(v string) string {
-	if len(v) > 100 {
-		return v[:100] + "..."
+	rs := []rune(v)
+	if len(rs) > 100 {
+		return string(rs[:100]) + "..."
 	}
 	return v
 }
@@ -610,15 +611,18 @@ func strictConsoleText(s string) string {
 	return b.String()
 }
 
+// clipName shortens to n runes — byte-wise cutting could split a multibyte
+// rune mid-sequence, and fmt's %Ns padding counts runes too.
 func clipName(s string, n int) string {
 	s = strictConsoleText(s)
-	if len(s) <= n {
+	rs := []rune(s)
+	if len(rs) <= n {
 		return s
 	}
 	if n <= 3 {
-		return s[:n]
+		return string(rs[:n])
 	}
-	return s[:n-3] + "..."
+	return string(rs[:n-3]) + "..."
 }
 
 func conciseError(s string, n int) string {

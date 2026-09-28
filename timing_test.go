@@ -42,8 +42,9 @@ func TestConformFiltersPreserveEveryFrame(t *testing.T) {
 	filter := strings.Join(conformVideoFilters(big.NewRat(300, 1)), ",")
 	if b, err := exec.Command(caps.FFmpeg,
 		"-hide_banner", "-loglevel", "error", "-y", "-i", src,
+		// Same chain buildCommand emits on FFmpeg >= 5.1 — no -enc_time_base.
 		"-map", "0:v:0", "-vf", filter,
-		"-fps_mode", "passthrough", "-enc_time_base", "filter",
+		"-fps_mode", "passthrough",
 		"-c:v", "ffv1", out,
 	).CombinedOutput(); err != nil {
 		t.Fatalf("conform: %v %s", err, b)

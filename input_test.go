@@ -67,6 +67,10 @@ func TestIsGeneratedOutputName(t *testing.T) {
 		"clip_utvideo_lossless_10.avi":  true,
 		"CLIP_PRORES_LT.MOV":            true, // extension is case-insensitive
 		"clip_prores_lt_extra.mov":      false,
+		"clip_xvid_compact.mov":         false, // Xvid presets only emit .avi
+		"clip_xvid_compact_3.mov":       false,
+		"clip_prores_lt.avi":            false, // ProRes presets only emit .mov
+		"clip_utvideo_lossless.mov":     false,
 		"clip_xvid_compact_abc.avi":     false,
 		"clip_xvid_compact_7.bak":       false,
 		"myxvid_compact.avi":            false, // no underscore boundary
