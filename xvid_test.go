@@ -457,7 +457,10 @@ func TestNativeXvidSurvivesDescendantHeldPipes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("clean exit behind wedged pipes must succeed: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 20*time.Second {
+	// The bound must sit below the orphan's 5 s pipe hold: without WaitDelay,
+	// Wait would block until the descendant exits — 20 s of slack could not
+	// tell that regression from a pass.
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
 		t.Fatalf("wedged descendant pipes were not bounded: %s", elapsed)
 	}
 	if !fileExists(out) {
