@@ -76,6 +76,17 @@ const maxProbeJSONBytes = 16 << 20
 // the duration treated as absent rather than trusted for verification math.
 const maxPlausibleDuration = 100 * 365.25 * 24 * 3600
 
+// plausibleDuration returns the reported duration, or 0 when it is unusable:
+// NaN, negative, infinite, or absurdly large values (a claimed 1e300 s would
+// guarantee a spurious verification mismatch on an honest encode) are all
+// impeached as corrupt metadata.
+func plausibleDuration(v float64) float64 {
+	if !(v > 0 && v <= maxPlausibleDuration) {
+		return 0
+	}
+	return v
+}
+
 // cappedBuffer accumulates a stream up to a byte ceiling, then discards the
 // rest while flagging truncation. stdout of a probe is consumed as a whole
 // document, so unlike boundedTailWriter it cannot just keep the tail — a
@@ -154,18 +165,12 @@ func probeMediaContext(ctx context.Context, ffprobe, path string, countFrames bo
 		return MediaInfo{}, errors.New("no video stream found")
 	}
 	sv := doc.Streams[vi]
-	dur := parseFloat(sv.Duration)
-	// !(dur > 0) also rejects NaN and negatives, so a corrupt stream-level
-	// duration cannot shadow a valid format-level one.
-	if !(dur > 0) {
-		dur = parseFloat(doc.Format.Duration)
-	}
-	// A malformed or hostile container can report NaN, Inf, or absurd finite
-	// durations; they must not reach the frame estimate or the verification
-	// comparison below (a claimed 1e300 s would guarantee a spurious mismatch
-	// on an honest encode). Treat anything unusable as absent.
-	if !(dur > 0 && dur <= maxPlausibleDuration) {
-		dur = 0
+	// A corrupt stream-level duration must not shadow a valid format-level
+	// one: both levels pass through the same impeachment before the duration
+	// is trusted for the frame estimate or the verification math below.
+	dur := plausibleDuration(parseFloat(sv.Duration))
+	if dur == 0 {
+		dur = plausibleDuration(parseFloat(doc.Format.Duration))
 	}
 	frames := parseInt64(sv.NBFrames)
 	// Compressed community files frequently carry stale AVI/container frame

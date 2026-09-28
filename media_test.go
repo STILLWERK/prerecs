@@ -175,4 +175,16 @@ func TestProbeMediaContextErrorPaths(t *testing.T) {
 	if info.Duration != 0 {
 		t.Fatalf("NaN duration leaked into MediaInfo: %v", info.Duration)
 	}
+
+	// An implausible stream-level duration must fall back to the format-level
+	// one, not zero out and discard usable metadata.
+	fallbackDoc := `{"streams":[{"codec_name":"h264","codec_type":"video","width":64,"height":64,"pix_fmt":"yuv420p","avg_frame_rate":"30/1","r_frame_rate":"30/1","duration":"1e300","nb_frames":"30"}],"format":{"duration":"2.5","size":"1024"}}`
+	fallbackProbe := writeFake("ffprobe-fallback", "#!/bin/sh\nprintf '%s' '"+fallbackDoc+"'\n")
+	info, err = probeMediaContext(context.Background(), fallbackProbe, "in.mp4", false)
+	if err != nil {
+		t.Fatalf("fallback duration probe failed: %v", err)
+	}
+	if info.Duration != 2.5 {
+		t.Fatalf("implausible stream duration shadowed format duration: %v", info.Duration)
+	}
 }
