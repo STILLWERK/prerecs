@@ -275,7 +275,7 @@ func proresRGBConversionFilters(info MediaInfo, preset string) []string {
 		// Gray+alpha has no colour planes for the RGB conversion branch, but its
 		// alpha plane still must bypass the gray-to-YUV conversion unchanged.
 		return []string{
-			"split=2[c][a];[c]format=" + proresPlanarPin(info, false) + ",format=" + proresColorPixFmt(info) + "[cX];[a]alphaextract,format=" + proresPlanarPin(info, true) + "[aX];[cX][aX]alphamerge",
+			"split=2[c][a];[c]format=" + proresPlanarPin(info, false) + ",format=" + proresColorPixFmt(info) + "[cX];[a]alphaextract,format=" + proresPlanarPin(info, true) + "[aX];[cX][aX]" + alphaMergeFilter(info, proresPixelFormat(info, preset)),
 		}
 	}
 	if !(isRGBPixelFormat(info.PixelFormat) || strings.EqualFold(info.ColorSpace, "gbr")) {
@@ -287,13 +287,25 @@ func proresRGBConversionFilters(info MediaInfo, preset string) []string {
 		// A direct gbrap -> yuva444p10le conversion rescales 8-bit alpha values,
 		// which breaks ProRes 4444's lossless-alpha guarantee. Convert only the
 		// colour planes, carry alpha separately, then merge it back immediately
-		// before the encoder. With -alpha_bits 8 an 8-bit alpha source round-trips
-		// byte-for-byte through both prores_ks and prores_ks_vulkan.
+		// before the encoder. With -alpha_bits 8 an 8-bit alpha source
+		// round-trips byte-for-byte through both prores_ks and prores_ks_vulkan.
 		return []string{
-			"split=2[c][a];[c]format=" + proresPlanarPin(info, false) + ",scale=out_color_matrix=bt709:out_range=tv,format=" + proresColorPixFmt(info) + "[cX];[a]alphaextract,format=" + proresPlanarPin(info, true) + "[aX];[cX][aX]alphamerge",
+			"split=2[c][a];[c]format=" + proresPlanarPin(info, false) + ",scale=out_color_matrix=bt709:out_range=tv,format=" + proresColorPixFmt(info) + "[cX];[a]alphaextract,format=" + proresPlanarPin(info, true) + "[aX];[cX][aX]" + alphaMergeFilter(info, pix),
 		}
 	}
 	return []string{"format=" + proresPlanarPin(info, false), "scale=out_color_matrix=bt709:out_range=tv", "format=" + pix}
+}
+
+// alphaMergeFilter reattaches the detached alpha plane. alphamerge keeps the
+// 8-bit path byte-exact; for >8-bit sources its format negotiation quantizes
+// the alpha channel to 8-bit even on FFmpeg 8, so the planes are merged
+// directly — a 16-bit gray plane into yuva444p12le keeps the bitstream's
+// 12-bit alpha ceiling instead of being crushed.
+func alphaMergeFilter(info MediaInfo, pix string) string {
+	if info.BitDepth > 8 {
+		return "mergeplanes=0x00010210:" + pix
+	}
+	return "alphamerge"
 }
 
 // xvidRGBConversionFilters mirrors the ProRes RGB path for Xvid presets: Xvid

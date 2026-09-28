@@ -361,8 +361,11 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 				// ffmpeg -y overwrites the placeholder/partial output itself.
 				// The file at `out` is now libxvid-produced — mark native as
 				// rejected so a later verify failure doesn't waste a redundant
-				// identical libxvid encode.
+				// identical libxvid encode, and clear usedNative: the impeached-
+				// rate rejection below applies only while `out` actually carries
+				// a native `-r`-stamped file, which this output is not.
 				nativeVerifyRejected = true
+				usedNative = false
 				setLibxvidBackend(&item, opts.Preset)
 				var args []string
 				args, expectedFPS, expectedDur, err = e.buildCommand(info, opts, out)
@@ -588,7 +591,8 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 	// survive as a VERIFIED result (a later run could adopt it for the wrong
 	// source). A simply-absent tag is the muxer/drop case: keep the file, but
 	// warn once since future runs can never reuse it.
-	want := provenanceComment(sourceSignature(info.Path), jobSignature(opts))
+	postSig, postJob := sourceSignature(info.Path), jobSignature(opts)
+	want := provenanceComment(postSig, postJob)
 	got := strings.TrimSpace(outInfo.ProvenanceTag)
 	// Only our own tag proves a content mismatch: ffmpeg copies input global
 	// metadata by default, so an output may legitimately carry the source's
@@ -602,7 +606,7 @@ func processItem(ctx context.Context, ui theme, e *Engine, info MediaInfo, opts 
 		rep.line("- " + item.Message)
 		return item
 	}
-	if !provenanceMatches(sourceSignature(info.Path), jobSignature(opts), outInfo) {
+	if !provenanceMatches(postSig, postJob, outInfo) {
 		rep.line(ui.yellow("WARNING: output did not retain the provenance tag; future runs cannot reuse it."))
 	}
 

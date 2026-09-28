@@ -488,6 +488,11 @@ func TestProResRGBConversionHighBitDepthPins(t *testing.T) {
 	if got := proresAlphaBits(info); got != 16 {
 		t.Fatalf("alpha_bits=%d, want 16", got)
 	}
+	// >8-bit alpha merges with mergeplanes: alphamerge quantizes the alpha
+	// channel to 8-bit on every tested FFmpeg version, defeating the pins.
+	if !strings.Contains(joined, "mergeplanes=0x00010210:yuva444p12le") {
+		t.Fatalf("16-bit alpha chain must use mergeplanes into yuva444p12le: %v", filters)
+	}
 
 	// 8-bit sources keep the classic 10-bit pins.
 	info8 := MediaInfo{PixelFormat: "rgba", BitDepth: 8, HasAlpha: true}
