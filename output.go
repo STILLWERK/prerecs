@@ -96,15 +96,14 @@ func outputCandidates(src, custom, preset string) ([]string, string, error) {
 		taken[n] = true
 		found = append(found, candidate{n: n, path: filepath.Join(base, name)})
 	}
-	// found holds every discovered candidate — from the directory scan and
-	// from races lost to O_EXCL below — sorted by slot number when returned.
-	existing := func() []string {
-		sort.Slice(found, func(i, j int) bool { return found[i].n < found[j].n })
-		paths := make([]string, 0, len(found))
-		for _, c := range found {
-			paths = append(paths, c.path)
-		}
-		return paths
+	// found holds candidates discovered by the directory scan, sorted by slot
+	// number. Paths claimed by losing an O_EXCL race below are another run's
+	// active reservation — their contents are still in flux, so they must
+	// never be offered for reuse.
+	sort.Slice(found, func(i, j int) bool { return found[i].n < found[j].n })
+	existing := make([]string, 0, len(found))
+	for _, c := range found {
+		existing = append(existing, c.path)
 	}
 	// Reserve the lowest free slot with O_EXCL so parallel runs stay atomic.
 	for n := 1; n <= len(taken)+1 && n < 100000; n++ {
@@ -123,20 +122,21 @@ func outputCandidates(src, custom, preset string) ([]string, string, error) {
 		if err == nil {
 			if closeErr := reservation.Close(); closeErr != nil {
 				_ = os.Remove(p)
-				return existing(), "", closeErr
+				return existing, "", closeErr
 			}
-			return existing(), p, nil
+			return existing, p, nil
 		}
 		if errors.Is(err, os.ErrExist) {
 			// A concurrent run claimed this slot between the directory scan
-			// and the reservation — it is an existing candidate too.
-			found = append(found, candidate{n: n, path: p})
+			// and the reservation. Keep its in-flight reservation out of the
+			// reuse list — the reuse check could otherwise verify a file the
+			// owner later deletes on its own verification failure.
 			taken[n] = true
 			continue
 		}
-		return existing(), "", fmt.Errorf("reserve output %s: %w", p, err)
+		return existing, "", fmt.Errorf("reserve output %s: %w", p, err)
 	}
-	return existing(), "", errors.New("could not choose unused output filename")
+	return existing, "", errors.New("could not choose unused output filename")
 }
 
 func releaseOutputReservation(path string) error {
